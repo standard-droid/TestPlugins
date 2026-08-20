@@ -1,0 +1,8 @@
+{
+  "name": "backup",
+  "description": "test",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/standard-droid/TestPlugins/refs/heads/builds/plugins.json"
+  ]
+}
