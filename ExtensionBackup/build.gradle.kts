@@ -1,4 +1,4 @@
-version = 1
+version = 2
 
 cloudstream {
     description = "Copies your installed .cs3 extensions to shared storage for backup"
