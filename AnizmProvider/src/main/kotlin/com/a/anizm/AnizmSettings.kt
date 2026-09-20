@@ -4,15 +4,13 @@ import android.app.AlertDialog
 import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Typeface
+import android.text.InputType
 import android.util.TypedValue
-import android.view.View
-import android.widget.AdapterView
-import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.Spinner
 import android.widget.TextView
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -60,8 +58,6 @@ class AnizmSettings(private val prefs: SharedPreferences) {
             SourceGroup(OTHER, "Other players (LuluStream, Sistenn, FireStream…)", emptyList()),
         )
 
-        private val TARGET_CHOICES = listOf(1, 2, 3, 5)
-        private val MIN_QUALITY_CHOICES = listOf(0 to "Any", 720 to "720p", 1080 to "1080p")
 
         fun showDialog(context: Context, settings: AnizmSettings) {
             val dp = { v: Int -> TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), context.resources.displayMetrics).toInt() }
@@ -137,28 +133,34 @@ class AnizmSettings(private val prefs: SharedPreferences) {
                 setPadding(dp(32), 0, 0, 0)
             }
             targetRow.addView(TextView(context).apply { text = "Working sources needed: " })
-            val spinner = Spinner(context).apply {
-                adapter = ArrayAdapter(context, android.R.layout.simple_spinner_dropdown_item, TARGET_CHOICES.map { it.toString() })
-                setSelection(TARGET_CHOICES.indexOf(settings.lazyTargetSources).coerceAtLeast(0))
+            // Typed in, not picked from a list: any number works, and it is one click on a TV remote.
+            val targetField = EditText(context).apply {
+                inputType = InputType.TYPE_CLASS_NUMBER
+                setText(settings.lazyTargetSources.toString())
+                width = dp(90)
+                setSelectAllOnFocus(true)
             }
-            targetRow.addView(spinner)
+            targetRow.addView(targetField)
             root.addView(targetRow)
             note("Fewer = fewer requests to the site and faster start, but fewer choices in the source list. Turn lazy loading off to always list every source.")
             val minQRow = LinearLayout(context).apply {
                 orientation = LinearLayout.HORIZONTAL
                 setPadding(dp(32), 0, 0, 0)
             }
-            minQRow.addView(TextView(context).apply { text = "Only count sources of at least: " })
-            val minQSpinner = Spinner(context).apply {
-                adapter = ArrayAdapter(context, android.R.layout.simple_spinner_dropdown_item, MIN_QUALITY_CHOICES.map { it.second })
-                setSelection(MIN_QUALITY_CHOICES.indexOfFirst { it.first == settings.lazyMinQuality }.coerceAtLeast(0))
+            minQRow.addView(TextView(context).apply { text = "Minimum height that counts: " })
+            val minQField = EditText(context).apply {
+                inputType = InputType.TYPE_CLASS_NUMBER
+                setText(settings.lazyMinQuality.toString())
+                width = dp(90)
+                setSelectAllOnFocus(true)
             }
-            minQRow.addView(minQSpinner)
+            minQRow.addView(minQField)
+            minQRow.addView(TextView(context).apply { text = " p  (0 = any)" })
             root.addView(minQRow)
             note("Lower-quality sources are still listed, they just don't stop the search. If nothing reaches this quality, everything that was found is kept.")
             fun syncTargetRow() {
                 val on = lazyBox.isChecked
-                spinner.isEnabled = on; minQSpinner.isEnabled = on
+                targetField.isEnabled = on; minQField.isEnabled = on
                 targetRow.alpha = if (on) 1f else 0.4f; minQRow.alpha = targetRow.alpha
             }
             syncTargetRow()
@@ -203,8 +205,10 @@ class AnizmSettings(private val prefs: SharedPreferences) {
                     e.putString("src_order", order.joinToString(","))
                     e.putBoolean("try_disabled_last_resort", lastResortBox.isChecked)
                     e.putBoolean("lazy_resolve", lazyBox.isChecked)
-                    e.putInt("lazy_target", TARGET_CHOICES.getOrElse(spinner.selectedItemPosition) { 2 })
-                    e.putInt("lazy_min_quality", MIN_QUALITY_CHOICES.getOrElse(minQSpinner.selectedItemPosition) { 1080 to "" }.first)
+                    // Blank or nonsense falls back to the current value rather than to 0, which
+                    // would make lazy loading stop before anything had been found.
+                    e.putInt("lazy_target", targetField.text.toString().trim().toIntOrNull()?.coerceIn(1, 99) ?: settings.lazyTargetSources)
+                    e.putInt("lazy_min_quality", minQField.text.toString().trim().toIntOrNull()?.coerceIn(0, 4320) ?: settings.lazyMinQuality)
                     e.putBoolean("estimate_sizes", sizeBox.isChecked)
                     e.putBoolean("browser_sniff", sniffBox.isChecked)
                     e.apply()

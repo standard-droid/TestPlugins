@@ -1,6 +1,7 @@
 package com.a.anizm
 
 import android.os.Looper
+import android.view.View
 import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -79,7 +80,15 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     private val ua: String by lazy {
         val fromSystem = try {
             val ctx = com.lagradost.cloudstream3.CloudStreamApp.context
-            if (ctx != null) WebSettings.getDefaultUserAgent(ctx)?.replace("; wv", "")?.replace(" wv)", ")") else null
+            // v18: also drop the two tokens only a WebView carries — "; wv" and "Version/4.0" —
+            // and the device's Build/… tag. Real Chrome on Android sends neither, and the log
+            // showed we were still announcing "Version/4.0 Chrome/153" (i.e. "I am a WebView").
+            if (ctx != null) WebSettings.getDefaultUserAgent(ctx)
+                ?.replace("; wv", "")?.replace(" wv)", ")")
+                ?.replace(Regex(""" Build/[^);]+"""), "")
+                ?.replace(Regex("""Version/\d+\.\d+ """), "")
+                ?.replace(Regex("""\s+"""), " ")?.trim()
+            else null
         } catch (_: Throwable) { null }
         val resolved = fromSystem?.takeIf { it.contains("Chrome/") && it.contains("Android") }
             ?: "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Mobile Safari/537.36"
@@ -1090,6 +1099,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // made "reload links" look like it did nothing. That one re-scrapes everything:
         // episode page, translator lists, every player lookup, and Aincrad's signed URL.
         val callNow = System.currentTimeMillis()
+        sniffSpentThisLoad = 0L
         val sinceLast = lastLoadAt[data]?.let { callNow - it } ?: Long.MAX_VALUE
         lastLoadAt[data] = callNow
         if (lastLoadAt.size > 50) lastLoadAt.entries.removeAll { callNow - it.value > reloadWindowMs }
@@ -1284,36 +1294,100 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     private val sniffCache = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
     private val sniffCacheTtlMs = 20 * 60 * 1000L
 
+    // v18: the click script walks shadow roots. Vidstack (the player Sistenn uses) puts its
+    // play button inside a shadow DOM, so the old plain querySelector never found it — and
+    // players that use load="visible" only start hls.js once the element is on screen, which
+    // in a zero-sized offscreen WebView never happens. Hence startLoading() below and the
+    // explicit layout() in the sniffer.
     private val playClickJs = """
         (function(){
-          try {
-            var p = document.querySelector('media-player');
-            if (p && p.play) { try { p.play(); } catch(e) {} }
-            var sels = ['button[aria-label*="Play" i]','.vds-play-button','button.play','[data-play]','button'];
-            for (var i=0;i<sels.length;i++) {
-              var b = document.querySelector(sels[i]);
-              if (b) { b.click(); break; }
+          var did = [], clicks = 0;
+          function looksLikePlay(el) {
+            var lbl = '';
+            try { lbl = (el.getAttribute('aria-label') || el.getAttribute('title') || '') + ' ' +
+                        (typeof el.className === 'string' ? el.className : ''); } catch(e) {}
+            return /(^|[^a-z])play|vds-play|play-button|btn-play|plyr__control/i.test(lbl);
+          }
+          function walk(root, depth) {
+            if (!root || depth > 6) return;
+            var els;
+            try { els = root.querySelectorAll('*'); } catch(e) { return; }
+            for (var i = 0; i < els.length; i++) {
+              var el = els[i];
+              var tag = el.tagName;
+              if (tag === 'VIDEO') {
+                try { el.muted = true; el.preload = 'auto'; el.autoplay = true; } catch(e) {}
+                try { var r = el.play(); if (r && r.catch) r.catch(function(){}); did.push('video.play'); } catch(e) {}
+              } else if (tag === 'MEDIA-PLAYER' || tag === 'MEDIA-PROVIDER') {
+                try { if (el.startLoading) { el.startLoading(); did.push('startLoading'); } } catch(e) {}
+                try { if (el.startLoadingPoster) el.startLoadingPoster(); } catch(e) {}
+                try { el.muted = true; } catch(e) {}
+                try { if (el.play) { var q = el.play(); if (q && q.catch) q.catch(function(){}); did.push('player.play'); } } catch(e) {}
+              } else if (clicks < 3 && looksLikePlay(el)) {
+                try { el.click(); clicks++; did.push('click'); } catch(e) {}
+              }
+              if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
             }
-            var v = document.querySelector('video');
-            if (v && v.play) { try { v.play(); } catch(e) {} }
-          } catch(e) {}
+          }
+          try { walk(document, 0); } catch(e) { return 'err:' + e; }
+          return did.length ? did.join(',') : 'nothing';
         })()
     """.trimIndent()
 
-    private suspend fun sniffHlsViaWebView(pageUrl: String, referer: String, budgetMs: Long = 15_000L): String? =
+    // A host that times out twice in a row is parked: otherwise three Sistenn entries on one
+    // episode cost three full budgets (~70s) before the episode finishes loading.
+    private val sniffHostFails = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val sniffHostBlockedUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val sniffHostCooldownMs = 15 * 60 * 1000L
+    // Whole-episode cap. Three Sistenn entries on one episode must not turn into three full
+    // budgets of waiting before the link list appears.
+    @Volatile private var sniffSpentThisLoad = 0L
+    private val sniffBudgetPerLoadMs = 45_000L
+
+    private fun sniffHostOnCooldown(url: String): Boolean {
+        val host = try { java.net.URI(url).host ?: return false } catch (_: Exception) { return false }
+        val until = sniffHostBlockedUntil[host] ?: return false
+        return System.currentTimeMillis() < until
+    }
+
+    private fun noteSniffResult(url: String, ok: Boolean) {
+        val host = try { java.net.URI(url).host ?: return } catch (_: Exception) { return }
+        if (ok) { sniffHostFails.remove(host); sniffHostBlockedUntil.remove(host); return }
+        val fails = (sniffHostFails[host] ?: 0) + 1
+        sniffHostFails[host] = fails
+        if (fails >= 2) {
+            sniffHostBlockedUntil[host] = System.currentTimeMillis() + sniffHostCooldownMs
+            log("sniff: $host parked for 15 min after $fails failures")
+        }
+    }
+
+    private suspend fun sniffHlsViaWebView(pageUrl: String, referer: String, budgetMs: Long = 24_000L): String? =
         suspendCancellableCoroutine { cont ->
             val handler = android.os.Handler(Looper.getMainLooper())
             handler.post {
                 val ctx = try { com.lagradost.cloudstream3.CloudStreamApp.context } catch (_: Throwable) { null }
                 if (ctx == null) { log("sniff: no context"); if (cont.isActive) cont.resume(null); return@post }
                 var done = false
+                // Anything that could plausibly be the stream request, kept so a timeout says
+                // *why* it failed instead of just "timeout".
+                val seen = java.util.Collections.synchronizedList(mutableListOf<String>())
                 val wv = WebView(ctx).apply {
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
                     settings.mediaPlaybackRequiresUserGesture = false // lets play() work without a real tap
                     settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    settings.loadWithOverviewMode = true
+                    settings.useWideViewPort = true
                     if (settings.userAgentString != ua) settings.userAgentString = ua
                 }
+                // Give the offscreen WebView a real viewport. Without this it is 0x0, so
+                // IntersectionObserver never fires and a lazy player never loads its source.
+                try {
+                    wv.measure(
+                        View.MeasureSpec.makeMeasureSpec(1280, View.MeasureSpec.EXACTLY),
+                        View.MeasureSpec.makeMeasureSpec(720, View.MeasureSpec.EXACTLY))
+                    wv.layout(0, 0, 1280, 720)
+                } catch (_: Throwable) {}
                 CookieManager.getInstance().setAcceptCookie(true)
                 CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
@@ -1321,39 +1395,63 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                     if (done) return
                     done = true
                     handler.removeCallbacksAndMessages(null)
-                    try { wv.stopLoading(); wv.destroy() } catch (_: Exception) {}
+                    try { wv.stopLoading(); wv.loadUrl("about:blank"); wv.destroy() } catch (_: Exception) {}
                     if (cont.isActive) cont.resume(result)
                 }
                 cont.invokeOnCancellation { handler.post { finish(null) } }
-                handler.postDelayed({ log("sniff: timeout for ${pageUrl.substringBefore('#')}"); finish(null) }, budgetMs)
+                handler.postDelayed({
+                    val tail = synchronized(seen) { seen.takeLast(8).joinToString(" | ") }
+                    log("sniff: timeout for ${pageUrl.substringBefore('#')}; saw ${seen.size} candidate requests${if (tail.isEmpty()) "" else ": $tail"}")
+                    finish(null)
+                }, budgetMs)
+
+                fun poke(view: WebView?, tag: String) {
+                    if (done) return
+                    try {
+                        view?.evaluateJavascript(playClickJs) { r ->
+                            val v = r?.trim('"') ?: ""
+                            if (!done && v.isNotEmpty() && v != "nothing") log("sniff: $tag -> $v")
+                        }
+                    } catch (_: Exception) {}
+                }
 
                 wv.webViewClient = object : WebViewClient() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val url = request?.url?.toString() ?: return null
                         val host = request.url?.host ?: ""
                         if (adHostKeywords.any { host.contains(it, ignoreCase = true) }) return emptyResponse()
-                        // The master playlist, whatever path it lives under.
-                        if (url.contains(".m3u8", ignoreCase = true) || url.contains("/master.", ignoreCase = true)) {
+                        // The master playlist, whatever path it lives under. Some of these
+                        // players serve it as .txt or with no extension at all.
+                        val u = url.lowercase()
+                        val isPlaylist = u.contains(".m3u8") || u.contains("/master.") || u.contains("playlist.txt") ||
+                            (u.contains("/hlsmod/") && u.contains("/tt/"))
+                        if (isPlaylist) {
                             log("sniff: found ${url.substringBefore('?').takeLast(60)}")
                             handler.post { finish(url) }
                             return emptyResponse()
                         }
                         // Media segments mean we missed the playlist — nothing useful to take.
-                        if (url.contains(".ts?", ignoreCase = true) || url.endsWith(".ts")) return emptyResponse()
+                        if (u.contains(".ts?") || u.endsWith(".ts")) return emptyResponse()
+                        // Diagnostics only: the handful of requests that could have been it.
+                        if (u.contains("/api/") || u.contains("video") || u.contains(".mp4") || u.contains("stream"))
+                            if (seen.size < 40) seen.add(url.substringBefore('?').takeLast(70))
                         return null
                     }
 
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
                         if (done) return
-                        // The app wires its play button after load; try a few times.
-                        for (delay in listOf(300L, 1_200L, 2_500L, 4_500L)) {
-                            handler.postDelayed({ if (!done) try { view?.evaluateJavascript(playClickJs, null) } catch (_: Exception) {} }, delay)
-                        }
+                        log("sniff: page ready")
+                        poke(view, "poke@ready")
                     }
                 }
                 log("sniff: loading ${pageUrl.substringBefore('#')}")
                 wv.loadUrl(pageUrl, mapOf("Referer" to referer))
+                // Fixed timeline, not tied to onPageFinished: with ad scripts in the page that
+                // callback can arrive after the whole budget has run out.
+                for (delay in listOf(1_500L, 3_000L, 5_000L, 7_500L, 10_000L, 13_000L, 17_000L, 21_000L)) {
+                    handler.postDelayed({ poke(wv, "poke@${delay / 1000}s") }, delay)
+                }
             }
         }
 
@@ -1398,9 +1496,19 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             if (!found && settings.browserSniff) {
                 val cached = sniffCache[exUrl]?.takeIf { System.currentTimeMillis() - it.second < sniffCacheTtlMs }?.first
                 if (cached != null) log("step4: reusing sniffed playlist for $label")
-                val sniffed = cached ?: try { sniffGate.withPermit { sniffHlsViaWebView(exUrl, "$mainUrl/") } }
+                val overBudget = sniffSpentThisLoad >= sniffBudgetPerLoadMs
+                val skip = cached == null && (sniffHostOnCooldown(exUrl) || overBudget)
+                if (skip) log("step4: skipping sniff for $label (${if (overBudget) "episode sniff budget spent" else "host on cooldown"})")
+                val sniffed = cached ?: if (skip) null else try {
+                    val t0 = System.currentTimeMillis()
+                    sniffGate.withPermit { sniffHlsViaWebView(exUrl, "$mainUrl/") }
+                        .also {
+                            sniffSpentThisLoad += System.currentTimeMillis() - t0
+                            noteSniffResult(exUrl, it != null)
+                        }
+                }
                 catch (e: kotlinx.coroutines.CancellationException) { throw e }
-                catch (e: Exception) { log("step4: sniff failed: ${e.message}"); null }
+                catch (e: Exception) { log("step4: sniff failed: ${e.message}"); noteSniffResult(exUrl, false); null }
                 if (sniffed != null) {
                     sniffCache[exUrl] = sniffed to System.currentTimeMillis()
                     if (sniffCache.size > 60) {
