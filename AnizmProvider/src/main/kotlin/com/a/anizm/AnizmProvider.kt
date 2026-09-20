@@ -124,9 +124,6 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // Lazy waves grow: 3 sources, then 6, then 12… so an old episode where only one
     // obscure source still works doesn't crawl through it 3 at a time.
     private val lazyFirstWaveSize = 3
-    // "Try Google Drive in the first batch": at most this many Drive sources get pulled
-    // forward. They run one at a time (gdriveGate), so each one adds a few seconds.
-    private val gdriveFirstWaveMax = 2
 
     // 4.0: the size estimate's extra requests (see sampleRendition). User setting.
     private val estimateHlsSizes get() = settings.estimateSizes
@@ -1000,7 +997,16 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // ── Load links ────────────────────────────────────────────────────────────
     // 4.0: split in two — fetchSourceList() (episode page + translator XHRs, now cached
     // briefly) and the resolve/dispatch part below.
-    private suspend fun fetchSourceList(data: String): List<VidInfo>? {
+    // v15: CloudStream can have two loadLinks calls for the same episode in flight at once
+    // (seen in a real log: a reload and the app's own call, ~1s apart). Without this both
+    // downloaded the ~300KB episode page and every translator list separately. The second
+    // one now waits for the first and reads its result from the cache.
+    private val sourceListLocks = java.util.concurrent.ConcurrentHashMap<String, Mutex>()
+
+    private suspend fun fetchSourceList(data: String): List<VidInfo>? =
+        sourceListLocks.getOrPut(data) { Mutex() }.withLock { fetchSourceListLocked(data) }
+
+    private suspend fun fetchSourceListLocked(data: String): List<VidInfo>? {
         sourceListCache[data]?.let { (list, t) ->
             if (System.currentTimeMillis() - t < sourceListTtlMs) { log("loadLinks: source list cache hit (${list.size})"); return list }
         }
@@ -1103,7 +1109,6 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         val target = settings.lazyTargetSources
         val lastResort = settings.tryDisabledAsLastResort
         val minQuality = settings.lazyMinQuality
-        val gdriveFirst = settings.gdriveInFirstWave
         // A source only counts toward the lazy target if its best link reaches minQuality.
         // Unknown quality never counts (unless minQuality is "Any"): we can't tell a 480p
         // mystery link from a 1080p one, and stopping on it is exactly the failure this avoids.
@@ -1121,7 +1126,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         enabledIds.firstOrNull()?.let { lastProbeTarget = it to data }
         val enabledSet = enabledIds.toHashSet()
         val disabledIds = ordered(listed.map { it.numId }.filter { it !in enabledSet })
-        log("loadLinks: ${enabledIds.size} enabled, ${disabledIds.size} disabled by settings; lazy=$lazy target=$target minQ=$minQuality gdriveFirst=$gdriveFirst lastResort=$lastResort")
+        log("loadLinks: ${enabledIds.size} enabled, ${disabledIds.size} disabled by settings; lazy=$lazy target=$target minQ=$minQuality lastResort=$lastResort")
 
         val embedMap = java.util.concurrent.ConcurrentHashMap<String, String>()
         val found = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -1142,23 +1147,13 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // Growing waves: 3, 6, 12, … When the first waves come up empty (typical for old
         // episodes where most hosts are dead), the remaining sources are tried in bigger
         // batches instead of crawling 3 at a time. Non-lazy = everything in one wave.
-        fun isGDrive(id: String) = byNumId[id]!!.any { settings.groupOf(it.name).key == "gdrive" }
+        // v19: the source list in settings is the only thing that decides the order now.
+        // (A "pull Google Drive into the first batch" option used to override it.)
         fun waves(ids: List<String>): List<List<String>> {
             if (!lazy) return if (ids.isEmpty()) emptyList() else listOf(ids)
             val out = ArrayList<List<String>>()
-            var rest = ids
-            if (gdriveFirst) {
-                // First wave = the usual first few + up to gdriveFirstWaveMax Drive sources
-                // pulled forward from wherever they'd normally be.
-                val head = ids.take(lazyFirstWaveSize)
-                val drives = ids.drop(lazyFirstWaveSize).filter { isGDrive(it) }.take(gdriveFirstWaveMax)
-                val first = head + drives
-                if (first.isNotEmpty()) out += first
-                val firstSet = first.toHashSet()
-                rest = ids.filter { it !in firstSet }
-            }
-            var i = 0; var size = if (out.isEmpty()) lazyFirstWaveSize else lazyFirstWaveSize * 2
-            while (i < rest.size) { out += rest.subList(i, minOf(i + size, rest.size)); i += size; size *= 2 }
+            var i = 0; var size = lazyFirstWaveSize
+            while (i < ids.size) { out += ids.subList(i, minOf(i + size, ids.size)); i += size; size *= 2 }
             return out
         }
 
@@ -1260,6 +1255,108 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         return found.get()
     }
 
+    // ── Browser-assisted HLS sniffing (v16) ──────────────────────────────────
+    // For players CloudStream has no extractor for. Investigated on the live site
+    // (2026-09-20) with Sistenn as the example: sistenn.uns.bio / anizm.rpmvid.com are a
+    // Vue app that asks /api/v1/video?id=…&w=…&h=…&r=anizm.net for an AES blob and decrypts
+    // it with a key the page builds at runtime (window.__pk, rotating — not in the HTML, not
+    // a cookie). Re-implementing that would break on their next deploy, so instead the page
+    // is loaded in a hidden WebView, told to play, and the .m3u8 it then requests is taken.
+    //
+    // Worth the trouble: the stream is a MUXED master (720p ~1.34 Mbps, 1080p ~2.59 Mbps),
+    // so unlike Aincrad it splits into per-quality entries and CloudStream can download it.
+    // The playlist itself needs no cookies and no Referer (verified), so once sniffed the
+    // link works on its own.
+    // v17: only the popunder/redirect domains found in their own page script are blocked.
+    // Analytics and the IMA ads SDK are deliberately let through: the bundle contains
+    // "Please disable AdBlock to watch this video", so blocking the ad machinery is the one
+    // thing likely to make the page refuse to produce a stream at all.
+    private val adHostKeywords = listOf(
+        "aphacicfable", "prahmnatured", "brigadedelegatesandbox", "gigglemagnetismunaired",
+        "cacklegrievingtank", "attirecideryeah", "popads", "propeller", "popcash")
+
+    // One sniff at a time. Each one is a full page load with JavaScript; five at once (the
+    // step4 limit) would mean five live WebViews with ad scripts running — the kind of thing
+    // that makes a TV box stutter or get killed for memory.
+    private val sniffGate = Semaphore(1)
+    // Sniffed playlists are reused for 20 min: the URL carries its own ?v= stamp and the page
+    // load is by far the most expensive thing this extension does.
+    private val sniffCache = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
+    private val sniffCacheTtlMs = 20 * 60 * 1000L
+
+    private val playClickJs = """
+        (function(){
+          try {
+            var p = document.querySelector('media-player');
+            if (p && p.play) { try { p.play(); } catch(e) {} }
+            var sels = ['button[aria-label*="Play" i]','.vds-play-button','button.play','[data-play]','button'];
+            for (var i=0;i<sels.length;i++) {
+              var b = document.querySelector(sels[i]);
+              if (b) { b.click(); break; }
+            }
+            var v = document.querySelector('video');
+            if (v && v.play) { try { v.play(); } catch(e) {} }
+          } catch(e) {}
+        })()
+    """.trimIndent()
+
+    private suspend fun sniffHlsViaWebView(pageUrl: String, referer: String, budgetMs: Long = 15_000L): String? =
+        suspendCancellableCoroutine { cont ->
+            val handler = android.os.Handler(Looper.getMainLooper())
+            handler.post {
+                val ctx = try { com.lagradost.cloudstream3.CloudStreamApp.context } catch (_: Throwable) { null }
+                if (ctx == null) { log("sniff: no context"); if (cont.isActive) cont.resume(null); return@post }
+                var done = false
+                val wv = WebView(ctx).apply {
+                    settings.javaScriptEnabled = true
+                    settings.domStorageEnabled = true
+                    settings.mediaPlaybackRequiresUserGesture = false // lets play() work without a real tap
+                    settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    if (settings.userAgentString != ua) settings.userAgentString = ua
+                }
+                CookieManager.getInstance().setAcceptCookie(true)
+                CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+
+                fun finish(result: String?) {
+                    if (done) return
+                    done = true
+                    handler.removeCallbacksAndMessages(null)
+                    try { wv.stopLoading(); wv.destroy() } catch (_: Exception) {}
+                    if (cont.isActive) cont.resume(result)
+                }
+                cont.invokeOnCancellation { handler.post { finish(null) } }
+                handler.postDelayed({ log("sniff: timeout for ${pageUrl.substringBefore('#')}"); finish(null) }, budgetMs)
+
+                wv.webViewClient = object : WebViewClient() {
+                    override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                        val url = request?.url?.toString() ?: return null
+                        val host = request.url?.host ?: ""
+                        if (adHostKeywords.any { host.contains(it, ignoreCase = true) }) return emptyResponse()
+                        // The master playlist, whatever path it lives under.
+                        if (url.contains(".m3u8", ignoreCase = true) || url.contains("/master.", ignoreCase = true)) {
+                            log("sniff: found ${url.substringBefore('?').takeLast(60)}")
+                            handler.post { finish(url) }
+                            return emptyResponse()
+                        }
+                        // Media segments mean we missed the playlist — nothing useful to take.
+                        if (url.contains(".ts?", ignoreCase = true) || url.endsWith(".ts")) return emptyResponse()
+                        return null
+                    }
+
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        super.onPageFinished(view, url)
+                        if (done) return
+                        // The app wires its play button after load; try a few times.
+                        for (delay in listOf(300L, 1_200L, 2_500L, 4_500L)) {
+                            handler.postDelayed({ if (!done) try { view?.evaluateJavascript(playClickJs, null) } catch (_: Exception) {} }, delay)
+                        }
+                    }
+                }
+                log("sniff: loading ${pageUrl.substringBefore('#')}")
+                wv.loadUrl(pageUrl, mapOf("Referer" to referer))
+            }
+        }
+
     // One source's worth of step4 work: ex:/ap:/gd: embed -> an actual playable link via
     // callback(). Pulled out of loadLinks so it can be launched concurrently per-source as
     // each numId resolves, instead of running sequentially after every numId is done.
@@ -1295,6 +1392,43 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 }
             } catch (e: kotlinx.coroutines.CancellationException) { throw e }
             catch (e: Exception) { log("step4: loadExtractor failed: ${e.message}") }
+
+            // v16: CloudStream had no extractor for this host (or it produced nothing).
+            // Load the player page in a hidden WebView and take the playlist it requests.
+            if (!found && settings.browserSniff) {
+                val cached = sniffCache[exUrl]?.takeIf { System.currentTimeMillis() - it.second < sniffCacheTtlMs }?.first
+                if (cached != null) log("step4: reusing sniffed playlist for $label")
+                val sniffed = cached ?: try { sniffGate.withPermit { sniffHlsViaWebView(exUrl, "$mainUrl/") } }
+                catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (e: Exception) { log("step4: sniff failed: ${e.message}"); null }
+                if (sniffed != null) {
+                    sniffCache[exUrl] = sniffed to System.currentTimeMillis()
+                    if (sniffCache.size > 60) {
+                        val now = System.currentTimeMillis()
+                        sniffCache.entries.removeAll { now - it.value.second > sniffCacheTtlMs }
+                    }
+                    val sniffHeaders = mapOf("User-Agent" to ua, "Referer" to exUrl.substringBefore('#'))
+                    val body = try { app.get(sniffed, headers = sniffHeaders, timeout = 10L).text }
+                    catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                    catch (e: Exception) { log("step4: sniffed playlist fetch failed: ${e.message}"); "" }
+                    val cleanLabel = cleanDisplayName(label)
+                    if (body.trimStart().startsWith("#EXTM3U")) {
+                        val variants = parseVariants(body, sniffed)
+                        found = if (variants.isNotEmpty())
+                            emitVariants(variants, cleanLabel, exUrl, sniffHeaders, callback, "sniff", "sn:${sniffed.substringBefore('?').takeLast(40)}")
+                        else {
+                            callback(newExtractorLink(source = cleanLabel, name = cleanLabel, url = sniffed, type = ExtractorLinkType.M3U8) {
+                                quality = Qualities.Unknown.value; referer = exUrl; headers = sniffHeaders })
+                            true
+                        }
+                    } else {
+                        // Not a playlist we can read — hand it over as-is and let the player try.
+                        callback(newExtractorLink(source = cleanLabel, name = cleanLabel, url = sniffed, type = ExtractorLinkType.M3U8) {
+                            quality = Qualities.Unknown.value; referer = exUrl; headers = sniffHeaders })
+                        found = true
+                    }
+                }
+            }
             return found
         }
 
