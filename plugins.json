@@ -23,7 +23,7 @@
     },
     {
         "iconUrl": "https://anizm.net/favicon.ico",
-        "fileHash": "sha256-68c40592e66bec0a9630d3b05e59b5f31ff330bacf08472c5ac34e0cd339dc91",
+        "fileHash": "sha256-2c90a3a36cfd108a9837db3c73ce24a0f19ec8a7f6dcbbdd280096c658b729e1",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/standard-droid/TestPlugins",
         "fileSize": 185478,
@@ -37,7 +37,7 @@
             "AnimeMovie",
             "OVA"
         ],
-        "version": 18,
+        "version": 19,
         "internalName": "AnizmProvider",
         "description": "Anizm (anizm.net) - T\u00fcrk\u00e7e altyaz\u0131l\u0131 anime",
         "url": "https://raw.githubusercontent.com/standard-droid/TestPlugins/builds/AnizmProvider.cs3",
