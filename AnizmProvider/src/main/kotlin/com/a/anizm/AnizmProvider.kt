@@ -1349,6 +1349,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         "googleadservices.com", "adservice.google", "googletagservices.com")
     // v27: headers the page's own player used for the stream, keyed by master URL.
     private val sniffedHeaders = java.util.concurrent.ConcurrentHashMap<String, Map<String, String>>()
+    // v29: the exact variant/segment addresses the page's player requested, keyed by master URL.
+    private val sniffedVariantUrls = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val sniffedSegmentUrls = java.util.concurrent.ConcurrentHashMap<String, String>()
     private val droppedCaptureHeaders = setOf("range", "accept-encoding", "host", "connection", "content-length", "if-none-match", "if-modified-since")
     private fun cleanCapturedHeaders(h: Map<String, String>): Map<String, String> =
         h.filterKeys { it.lowercase() !in droppedCaptureHeaders }
@@ -1600,6 +1603,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 // v27: the master playlist, once seen. The page is then left running until its
                 // player asks for a variant playlist, so we can copy exactly what it sent.
                 val masterRef = java.util.concurrent.atomic.AtomicReference<String?>(null)
+                // v29: the first variant the player opened, then wait for its first segment.
+                val variantRef = java.util.concurrent.atomic.AtomicReference<String?>(null)
                 val act = currentActivity()
                 val wv = WebView(act ?: ctx).apply {
                     settings.javaScriptEnabled = true
@@ -1715,10 +1720,23 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         val m0 = masterRef.get()
                         if (m0 != null && url != m0 && host.isNotEmpty() && host == (try { java.net.URI(m0).host } catch (_: Exception) { null })) {
                             val kept = cleanCapturedHeaders(request.requestHeaders ?: emptyMap())
-                            sniffedHeaders[m0] = kept
-                            log("sniff: player opened ${url.substringBefore('?').takeLast(50)} with headers: " +
-                                kept.entries.joinToString("; ") { "${it.key}=${it.value.take(60)}" })
-                            handler.post { finish(m0) }
+                            // v29: v28's log had every header set refused on the variant playlist
+                            // 200ms after the page's player opened the same one, while the master
+                            // from the same host was fine. Headers aren't it, so log the FULL
+                            // addresses (v27/v28 cut them at '?') — a token in the query is the
+                            // likely difference — and wait for the first segment too.
+                            if (variantRef.compareAndSet(null, url)) {
+                                sniffedHeaders[m0] = kept
+                                sniffedVariantUrls[m0] = url
+                                log("sniff: player opened variant ${url.take(260)}")
+                                log("sniff:   with headers: " + kept.entries.joinToString("; ") { "${it.key}=${it.value.take(60)}" })
+                                handler.postDelayed({ if (!done) { log("sniff: no segment request within 4s"); finish(m0) } }, 4_000L)
+                            } else if (!url.substringBefore('?').lowercase().let { it.endsWith(".m3u8") || it.endsWith(".txt") }) {
+                                sniffedSegmentUrls[m0] = url
+                                log("sniff: player fetched segment ${url.take(260)}")
+                                if (kept != sniffedHeaders[m0]) log("sniff:   segment headers: " + kept.entries.joinToString("; ") { "${it.key}=${it.value.take(60)}" })
+                                handler.post { finish(m0) }
+                            } else log("sniff: player opened another playlist ${url.take(200)}")
                             return null
                         }
                         // v26: the v25 log's real stream was …/v4/nc9/<id>/cf-master.1789396075.txt,
@@ -1748,7 +1766,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                             val reqHeaders = request.requestHeaders ?: emptyMap()
                             if (master == null) {
                                 masterRef.set(url)
-                                log("sniff: found ${url.substringBefore('?').takeLast(60)} — waiting for the player to open a variant")
+                                log("sniff: found ${url.take(260)} — waiting for the player to open a variant")
                                 sniffedHeaders[url] = cleanCapturedHeaders(reqHeaders)
                                 handler.postDelayed({ if (!done) { log("sniff: no variant request within 5s, using master headers"); finish(url) } }, 5_000L)
                                 return null
@@ -1985,7 +2003,21 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                     catch (e: Exception) { log("step4: sniffed playlist fetch failed: ${e.message}"); "" }
                     val cleanLabel = cleanDisplayName(label)
                     if (body.trimStart().startsWith("#EXTM3U")) {
-                        val variants = parseVariants(body, sniffed)
+                        var variants = parseVariants(body, sniffed)
+                        // v29: if the page's player asked for its variant with a query string that
+                        // the master's own variant lines don't carry, the page's script added it —
+                        // most likely an access token. Put the same query on every variant.
+                        sniffedVariantUrls[sniffed]?.let { pv ->
+                            val q = pv.substringAfter('?', "")
+                            val sameFile = variants.firstOrNull { it.url.substringBefore('?') == pv.substringBefore('?') }
+                            log("sniff: master lists ${variants.joinToString { it.url.substringAfterLast('/').take(80) }}; player used ${pv.substringAfterLast('/').take(120)}" +
+                                (if (sameFile == null) " (not one of the listed variants)" else ""))
+                            if (q.isNotEmpty() && variants.none { it.url.contains('?') }) {
+                                variants = variants.map { it.copy(url = it.url + "?" + q) }
+                                log("sniff: copied the player's query onto the variants: ?${q.take(120)}")
+                            }
+                        }
+                        sniffedSegmentUrls[sniffed]?.let { log("sniff: player's first segment was ${it.substringAfterLast('/').take(160)}") }
                         log("sniff: master has ${variants.size} variant(s): ${variants.joinToString(", ") { "${it.height}p/${(it.bandwidth ?: 0) / 1000}k" }}")
                         // v28: the link's referer used to be exUrl — with its #fragment. CloudStream
                         // sends that as the Referer header, which no browser ever does, and the
