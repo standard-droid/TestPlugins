@@ -1347,7 +1347,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     private val imaHostKeywords = listOf(
         "imasdk.googleapis.com", "2mdn.net", "doubleclick.net", "googlesyndication.com",
         "googleadservices.com", "adservice.google", "googletagservices.com")
-    @Volatile private var sniffBlockAdsNext = true
+    private val playlistFileRe = Regex("""(master|playlist|index)[^/]*\.(m3u8|txt)$""")
     private fun notFoundResponse() = WebResourceResponse("text/plain", "utf-8", 404, "Not Found",
         mapOf("Access-Control-Allow-Origin" to "*"), ByteArrayInputStream(emptyBytes))
 
@@ -1442,7 +1442,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 try {
                   var st = el.state || {};
                   var s = String((st.source && st.source.src) || el.src || '');
-                  if (/\.m3u8|\/hlsmod\//i.test(s)) found = s;
+                  // v26: also "cf-master.<stamp>.txt" (rpmvid's real playlist, v25 log).
+                  if (/\.m3u8|\/hlsmod\/|master[^\/?]*\.txt/i.test(s)) found = s;
                 } catch(e) {}
                 try { if (el.startLoading) { el.startLoading(); did.push('startLoading'); } } catch(e) {}
                 try { if (el.startLoadingPoster) el.startLoadingPoster(); } catch(e) {}
@@ -1566,7 +1567,10 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 // *why* it failed instead of just "timeout".
                 val seen = java.util.Collections.synchronizedList(mutableListOf<String>())
                 val decoysSeen = java.util.concurrent.atomic.AtomicInteger(0)
-                val blockAds = sniffBlockAdsNext
+                // v26: always block the ad stack. The v25 log settled it: the ads-blocked run
+                // (with real taps) got the stream, the ads-allowed run never did. Alternating
+                // wasted every other attempt.
+                val blockAds = true
                 val adsBlocked = java.util.concurrent.atomic.AtomicInteger(0)
                 // v22: capped diagnostic lines per sniff (console errors, failed requests,
                 // TLS refusals), so the next log says what the page tripped over.
@@ -1635,7 +1639,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                     try { attachedTo?.removeView(wv) } catch (_: Throwable) {}
                     try { wv.stopLoading(); wv.loadUrl("about:blank"); wv.destroy() } catch (_: Exception) {}
                     // Alternate the ad mode after a failure; keep whatever worked.
-                    if (result == null) sniffBlockAdsNext = !blockAds
+                    // v26: no alternating any more (see blockAds).
                     if (cont.isActive) cont.resume(result)
                 }
                 cont.invokeOnCancellation { handler.post { finish(null) } }
@@ -1689,7 +1693,12 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         // The master playlist, whatever path it lives under. Some of these
                         // players serve it as .txt or with no extension at all.
                         val u = url.lowercase()
+                        // v26: the v25 log's real stream was …/v4/nc9/<id>/cf-master.1789396075.txt,
+                        // which none of the old patterns matched — the player played it while the
+                        // sniffer waited for its timeout. Match any master/playlist/index file
+                        // ending .m3u8 or .txt, whatever prefix or stamp it carries.
                         val isPlaylist = u.contains(".m3u8") || u.contains("/master.") || u.contains("playlist.txt") ||
+                            playlistFileRe.containsMatchIn(u.substringBefore('?').substringAfterLast('/')) ||
                             (u.contains("/hlsmod/") && u.contains("/tt/"))
                         if (isPlaylist) {
                             // v20: Sistenn's player attaches a placeholder source (…/preload.m3u8 on
