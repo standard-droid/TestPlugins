@@ -414,6 +414,15 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         CookieManager.getInstance().getCookie(mainUrl)?.takeIf { it.isNotBlank() }
     } catch (_: Throwable) { null }
 
+    /**
+     * v19: cookies the hidden WebView picked up for one specific host. A sniffed stream often
+     * lives behind the same session the page set up; ExoPlayer gets its own cookie jar, so
+     * anything the player needs has to be copied onto the link's headers by hand.
+     */
+    private fun cookiesFor(url: String): String? = try {
+        CookieManager.getInstance().getCookie(url)?.takeIf { it.isNotBlank() }
+    } catch (_: Throwable) { null }
+
     // One-shot self-test, run the first time a direct lookup is refused. It replays the same
     // request a few different ways and logs what each one gets back, so a single logcat shows
     // whether the block is about the path, the headers, the missing cookies or the client
@@ -1285,6 +1294,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         "aphacicfable", "prahmnatured", "brigadedelegatesandbox", "gigglemagnetismunaired",
         "cacklegrievingtank", "attirecideryeah", "popads", "propeller", "popcash")
 
+    /** Placeholder playlists a player attaches before it has the real source. */
+    private val decoyPlaylistNames = listOf("preload", "blank", "dummy", "placeholder", "empty", "init")
+
     // One sniff at a time. Each one is a full page load with JavaScript; five at once (the
     // step4 limit) would mean five live WebViews with ad scripts running — the kind of thing
     // that makes a TV box stutter or get killed for memory.
@@ -1292,7 +1304,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // Sniffed playlists are reused for 20 min: the URL carries its own ?v= stamp and the page
     // load is by far the most expensive thing this extension does.
     private val sniffCache = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
-    private val sniffCacheTtlMs = 20 * 60 * 1000L
+    // v19: 20 min -> 5. These URLs carry a short-lived token (?v=…); a reused one still
+    // resolves to a link in the list but can be dead by the time the user presses play.
+    private val sniffCacheTtlMs = 5 * 60 * 1000L
 
     // v18: the click script walks shadow roots. Vidstack (the player Sistenn uses) puts its
     // play button inside a shadow DOM, so the old plain querySelector never found it — and
@@ -1371,6 +1385,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 // Anything that could plausibly be the stream request, kept so a timeout says
                 // *why* it failed instead of just "timeout".
                 val seen = java.util.Collections.synchronizedList(mutableListOf<String>())
+                val decoysSeen = java.util.concurrent.atomic.AtomicInteger(0)
                 val wv = WebView(ctx).apply {
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
@@ -1426,6 +1441,17 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         val isPlaylist = u.contains(".m3u8") || u.contains("/master.") || u.contains("playlist.txt") ||
                             (u.contains("/hlsmod/") && u.contains("/tt/"))
                         if (isPlaylist) {
+                            // v20: Sistenn's player attaches a placeholder source (…/preload.m3u8 on
+                            // the page's own host) the moment it initialises, and only asks the API
+                            // for the real stream afterwards. v18 took that first hit and killed the
+                            // page 1.6s in, so the link in the list was a 404. Let the decoy through
+                            // untouched (blocking it makes the player give up) and keep listening.
+                            val file = u.substringBefore('?').substringAfterLast('/')
+                            val decoy = decoyPlaylistNames.any { file.startsWith(it) }
+                            if (decoy) {
+                                if (decoysSeen.incrementAndGet() == 1) log("sniff: ignoring placeholder $file, waiting for the real one")
+                                return null
+                            }
                             log("sniff: found ${url.substringBefore('?').takeLast(60)}")
                             handler.post { finish(url) }
                             return emptyResponse()
@@ -1515,25 +1541,38 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         val now = System.currentTimeMillis()
                         sniffCache.entries.removeAll { now - it.value.second > sniffCacheTtlMs }
                     }
-                    val sniffHeaders = mapOf("User-Agent" to ua, "Referer" to exUrl.substringBefore('#'))
+                    // v19: the player gets its own HTTP stack, so everything the page had must
+                    // be spelled out on the link — UA, Referer, Origin, and any cookie the
+                    // stream host handed the hidden WebView.
+                    val pageUrl = exUrl.substringBefore('#')
+                    val origin = try { java.net.URI(pageUrl).let { "${it.scheme}://${it.host}" } } catch (_: Exception) { pageUrl }
+                    val sniffHeaders = mutableMapOf("User-Agent" to ua, "Referer" to pageUrl, "Origin" to origin).also { h ->
+                        (cookiesFor(sniffed) ?: cookiesFor(pageUrl))?.let { h["Cookie"] = it }
+                    }.toMap()
+                    log("sniff: link headers = UA + Referer $origin${if (sniffHeaders.containsKey("Cookie")) " + cookies" else ""}")
                     val body = try { app.get(sniffed, headers = sniffHeaders, timeout = 10L).text }
                     catch (e: kotlinx.coroutines.CancellationException) { throw e }
                     catch (e: Exception) { log("step4: sniffed playlist fetch failed: ${e.message}"); "" }
                     val cleanLabel = cleanDisplayName(label)
                     if (body.trimStart().startsWith("#EXTM3U")) {
                         val variants = parseVariants(body, sniffed)
+                        log("sniff: master has ${variants.size} variant(s): ${variants.joinToString(", ") { "${it.height}p/${(it.bandwidth ?: 0) / 1000}k" }}")
+                        variants.firstOrNull()?.let { probeFirstSegment(it.url, sniffHeaders) }
                         found = if (variants.isNotEmpty())
-                            emitVariants(variants, cleanLabel, exUrl, sniffHeaders, callback, "sniff", "sn:${sniffed.substringBefore('?').takeLast(40)}")
+                            emitVariants(variants, cleanLabel, exUrl, sniffHeaders, callback, "sniff",
+                                "sn:${sniffed.substringBefore('?').takeLast(40)}", allowDeclaredFallback = true)
                         else {
                             callback(newExtractorLink(source = cleanLabel, name = cleanLabel, url = sniffed, type = ExtractorLinkType.M3U8) {
                                 quality = Qualities.Unknown.value; referer = exUrl; headers = sniffHeaders })
                             true
                         }
                     } else {
-                        // Not a playlist we can read — hand it over as-is and let the player try.
-                        callback(newExtractorLink(source = cleanLabel, name = cleanLabel, url = sniffed, type = ExtractorLinkType.M3U8) {
-                            quality = Qualities.Unknown.value; referer = exUrl; headers = sniffHeaders })
-                        found = true
+                        // v20: this used to hand the URL to the player anyway. That is how a dead
+                        // link ended up in the list — ExoPlayer got a 404 and the episode looked
+                        // broken. If we cannot read it as a playlist ourselves, neither can the
+                        // player, so drop it and let the next source have its turn.
+                        log("sniff: ${sniffed.substringBefore('?').takeLast(50)} is not a playlist (${body.take(40).replace('\n', ' ')}) — discarding")
+                        sniffCache.remove(exUrl)
                     }
                 }
             }
@@ -1691,10 +1730,11 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     private suspend fun emitVariants(
         variants: List<Variant>, cleanLabel: String, referer: String, headers: Map<String, String>,
         callback: (ExtractorLink) -> Unit, tag: String, sizeKey: String,
+        allowDeclaredFallback: Boolean = false,
     ): Boolean {
         val sizes = if (estimateHlsSizes) {
             cachedSizes(sizeKey)
-                ?: (withTimeoutOrNull(sizeEstimateBudgetMs) { estimateVariantSizes(variants, headers) } ?: emptyMap())
+                ?: (withTimeoutOrNull(sizeEstimateBudgetMs) { estimateVariantSizes(variants, headers, allowDeclaredFallback) } ?: emptyMap())
                     .also { storeSizes(sizeKey, it) }
         } else emptyMap()
         val any = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -1860,12 +1900,74 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         return bytes.toLong()
     }
 
+    /**
+     * v19: last-resort size from the playlist's own BANDWIDTH x duration, used only where the
+     * CDN won't answer ranged segment requests (Sistenn's proxy is one) and only when the
+     * caller opts in. Deliberately NOT used for Aincrad: its BANDWIDTH is a fixed nominal
+     * ladder and this arithmetic overstates it by ~2x. Sistenn declares near-measured rates
+     * (720p ~1.34 Mbps, 1080p ~2.59 Mbps), so here it lands close.
+     */
+    private suspend fun declaredSizes(variants: List<Variant>, headers: Map<String, String>): Map<Int, Long> {
+        val top = variants.firstOrNull() ?: return emptyMap()
+        if (variants.none { (it.bandwidth ?: 0) > 0 }) return emptyMap()
+        val dur = playlistDurationSec(top.url, headers) ?: return emptyMap()
+        if (dur <= 0) return emptyMap()
+        val out = variants.mapNotNull { v ->
+            val bw = v.bandwidth?.takeIf { it > 0 } ?: return@mapNotNull null
+            v.height to (bw / 8.0 * dur).toLong()
+        }.toMap()
+        log("size: segments not measurable, using declared bitrate x ${(dur / 60).toInt()} min -> " +
+            out.entries.sortedByDescending { it.key }.joinToString(", ") { "${it.key}p ~${it.value / 1_048_576}MB" })
+        return out
+    }
+
+    /** Total runtime of a media playlist, from its EXTINF lines. One request. */
+    private suspend fun playlistDurationSec(url: String, headers: Map<String, String>): Double? {
+        val text = try { app.get(url, headers = headers, timeout = 8L).text }
+            catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (_: Exception) { return null }
+        if (!text.trimStart().startsWith("#EXTM3U")) return null
+        val total = text.lineSequence().filter { it.startsWith("#EXTINF:") }
+            .mapNotNull { extinfRe.find(it)?.groupValues?.get(1)?.toDoubleOrNull() }.sum()
+        return total.takeIf { it > 0 }
+    }
+
+    /**
+     * v19 diagnostic: fetch a variant playlist and ask its first segment for one byte. When a
+     * sniffed link appears in the list but won't play, this one log line says whether the
+     * segments are reachable with the headers we attach (and therefore whether the problem is
+     * the link, the headers, or the player).
+     */
+    private suspend fun probeFirstSegment(variantUrl: String, headers: Map<String, String>) {
+        try {
+            val pl = app.get(variantUrl, headers = headers, timeout = 8L)
+            val text = pl.text
+            if (!text.trimStart().startsWith("#EXTM3U")) { log("sniff: variant playlist not readable (code ${pl.code})"); return }
+            if (text.contains("#EXT-X-KEY")) {
+                val m = Regex("""#EXT-X-KEY:[^\n]*""").find(text)?.value?.take(120)
+                log("sniff: playlist is ENCRYPTED -> $m")
+            }
+            val first = text.lineSequence().map { it.trim() }
+                .firstOrNull { it.isNotEmpty() && !it.startsWith("#") } ?: run { log("sniff: no segments in variant playlist"); return }
+            val segUrl = try { java.net.URI(variantUrl).resolve(first).toString() } catch (_: Exception) { first }
+            val r = app.get(segUrl, headers = headers + mapOf("Range" to "bytes=0-0"), timeout = 8L)
+            val len = r.headers["Content-Range"] ?: r.headers["Content-Length"] ?: "?"
+            val ct = r.headers["Content-Type"] ?: "?"
+            try { r.okhttpResponse.close() } catch (_: Exception) {}
+            log("sniff: first segment ${segUrl.substringBefore('?').takeLast(50)} -> ${r.code}, $ct, $len")
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Exception) { log("sniff: segment probe failed: ${e.message}") }
+    }
+
     // Muxed masters: sample only the top variant, then scale the others by their BANDWIDTH
     // relative to it. The ladder is nominal, so this is rougher for lower rungs than for
     // the top one, but it doesn't multiply the request count by the number of variants.
-    private suspend fun estimateVariantSizes(variants: List<Variant>, headers: Map<String, String>): Map<Int, Long> {
+    private suspend fun estimateVariantSizes(
+        variants: List<Variant>, headers: Map<String, String>, allowDeclaredFallback: Boolean = false,
+    ): Map<Int, Long> {
         val top = variants.firstOrNull() ?: return emptyMap()
-        val s = sampleVideoChecked(top, headers) ?: return emptyMap()
+        val s = sampleVideoChecked(top, headers)
+            ?: return if (allowDeclaredFallback) declaredSizes(variants, headers) else emptyMap()
         val out = java.util.concurrent.ConcurrentHashMap<Int, Long>()
         out[top.height] = (s.bytesPerSec * s.durationSec).toLong()
         log("size: ${top.height}p ≈ ${out[top.height]!! / 1_048_576}MB (${(s.bytesPerSec * 8 / 1000).toLong()} kbps measured vs ${(top.bandwidth ?: 0) / 1000} kbps declared, ${(s.durationSec / 60).toInt()} min)")
