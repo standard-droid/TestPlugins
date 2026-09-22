@@ -1347,6 +1347,19 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     private val imaHostKeywords = listOf(
         "imasdk.googleapis.com", "2mdn.net", "doubleclick.net", "googlesyndication.com",
         "googleadservices.com", "adservice.google", "googletagservices.com")
+    // v27: headers the page's own player used for the stream, keyed by master URL.
+    private val sniffedHeaders = java.util.concurrent.ConcurrentHashMap<String, Map<String, String>>()
+    private val droppedCaptureHeaders = setOf("range", "accept-encoding", "host", "connection", "content-length", "if-none-match", "if-modified-since")
+    private fun cleanCapturedHeaders(h: Map<String, String>): Map<String, String> =
+        h.filterKeys { it.lowercase() !in droppedCaptureHeaders }
+    private val muteJs = """
+        (function(){
+          function m(root, d){ if (!root || d > 6) return; var els; try { els = root.querySelectorAll('video,audio,media-player'); } catch(e){ return; }
+            for (var i=0;i<els.length;i++){ try { els[i].muted = true; els[i].volume = 0; } catch(e){} }
+            try { var all = root.querySelectorAll('*'); for (var j=0;j<all.length;j++) if (all[j].shadowRoot) m(all[j].shadowRoot, d+1); } catch(e){} }
+          m(document, 0);
+        })()
+    """.trimIndent()
     private val playlistFileRe = Regex("""(master|playlist|index)[^/]*\.(m3u8|txt)$""")
     private fun notFoundResponse() = WebResourceResponse("text/plain", "utf-8", 404, "Not Found",
         mapOf("Access-Control-Allow-Origin" to "*"), ByteArrayInputStream(emptyBytes))
@@ -1584,6 +1597,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 var tapAgain: (() -> Unit)? = null
                 val pageHost = try { java.net.URI(pageUrl).host ?: "" } catch (_: Exception) { "" }
                 val navsBlocked = java.util.concurrent.atomic.AtomicInteger(0)
+                // v27: the master playlist, once seen. The page is then left running until its
+                // player asks for a variant playlist, so we can copy exactly what it sent.
+                val masterRef = java.util.concurrent.atomic.AtomicReference<String?>(null)
                 val act = currentActivity()
                 val wv = WebView(act ?: ctx).apply {
                     settings.javaScriptEnabled = true
@@ -1667,7 +1683,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                             if (v.startsWith("src:")) {
                                 val src = v.removePrefix("src:")
                                 val file = src.lowercase().substringBefore('?').substringAfterLast('/')
-                                if (src.startsWith("http") && decoyPlaylistNames.none { file.startsWith(it) }) {
+                                if (src.startsWith("http") && decoyPlaylistNames.none { file.startsWith(it) } && masterRef.get() == null) {
                                     log("sniff: player holds ${src.substringBefore('?').takeLast(60)}")
                                     finish(src)
                                     return@evaluateJavascript
@@ -1693,6 +1709,18 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         // The master playlist, whatever path it lives under. Some of these
                         // players serve it as .txt or with no extension at all.
                         val u = url.lowercase()
+                        // v27: after the master, the first other request to the stream's host
+                        // (variant playlist, whatever it is called — or a segment) is what the
+                        // player sends for media. Its headers are the ones the link needs.
+                        val m0 = masterRef.get()
+                        if (m0 != null && url != m0 && host.isNotEmpty() && host == (try { java.net.URI(m0).host } catch (_: Exception) { null })) {
+                            val kept = cleanCapturedHeaders(request.requestHeaders ?: emptyMap())
+                            sniffedHeaders[m0] = kept
+                            log("sniff: player opened ${url.substringBefore('?').takeLast(50)} with headers: " +
+                                kept.entries.joinToString("; ") { "${it.key}=${it.value.take(60)}" })
+                            handler.post { finish(m0) }
+                            return null
+                        }
                         // v26: the v25 log's real stream was …/v4/nc9/<id>/cf-master.1789396075.txt,
                         // which none of the old patterns matched — the player played it while the
                         // sniffer waited for its timeout. Match any master/playlist/index file
@@ -1712,9 +1740,27 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                                 if (decoysSeen.incrementAndGet() == 1) log("sniff: ignoring placeholder $file, waiting for the real one")
                                 return null
                             }
-                            log("sniff: found ${url.substringBefore('?').takeLast(60)}")
-                            handler.post { finish(url) }
-                            return emptyResponse()
+                            // v27: the v26 log fetched the master fine but every variant came back
+                            // 403 with our headers. So don't stop at the master: let the page's own
+                            // player load it and then ask for one variant, record the headers it
+                            // used, and give those to the link. At most 5s more.
+                            val master = masterRef.get()
+                            val reqHeaders = request.requestHeaders ?: emptyMap()
+                            if (master == null) {
+                                masterRef.set(url)
+                                log("sniff: found ${url.substringBefore('?').takeLast(60)} — waiting for the player to open a variant")
+                                sniffedHeaders[url] = cleanCapturedHeaders(reqHeaders)
+                                handler.postDelayed({ if (!done) { log("sniff: no variant request within 5s, using master headers"); finish(url) } }, 5_000L)
+                                return null
+                            }
+                            if (url != master) {
+                                val kept = cleanCapturedHeaders(reqHeaders)
+                                sniffedHeaders[master] = kept
+                                log("sniff: player opened variant ${url.substringBefore('?').takeLast(50)} with headers: " +
+                                    kept.entries.joinToString("; ") { "${it.key}=${it.value.take(60)}" })
+                                handler.post { finish(master) }
+                            }
+                            return null
                         }
                         // Media segments mean we missed the playlist — nothing useful to take.
                         if (u.contains(".ts?") || u.endsWith(".ts")) return emptyResponse()
@@ -1823,7 +1869,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 // with sound. Aimed at the centre (vidstack's big play button), then a
                 // little off-centre in case the centre is covered.
                 fun realTap(tag: String, fx: Float, fy: Float) {
-                    if (done || !blockAds) return
+                    if (done || !blockAds || masterRef.get() != null) return
                     try {
                         val x = wv.width * fx; val y = wv.height * fy
                         if (wv.width <= 0 || wv.height <= 0) return
@@ -1834,6 +1880,10 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         try { wv.dispatchTouchEvent(down); wv.dispatchTouchEvent(up) } finally { syntheticTouch = false }
                         down.recycle(); up.recycle()
                         log("sniff: $tag real tap at ${x.toInt()},${y.toInt()}")
+                        // v27: the page now plays for a moment while we wait for a variant;
+                        // a real tap counts as a gesture, so make sure it plays silently.
+                        try { wv.evaluateJavascript(muteJs, null) } catch (_: Throwable) {}
+                        handler.postDelayed({ if (!done) try { wv.evaluateJavascript(muteJs, null) } catch (_: Throwable) {} }, 400L)
                     } catch (e: Throwable) { log("sniff: tap failed: ${e.message}") }
                 }
                 tapAgain = { realTap("tap after pop-under", 0.5f, 0.5f) }
@@ -1921,9 +1971,15 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                     val pageUrl = exUrl.substringBefore('#')
                     val origin = try { java.net.URI(pageUrl).let { "${it.scheme}://${it.host}" } } catch (_: Exception) { pageUrl }
                     val sniffHeaders = mutableMapOf("User-Agent" to ua, "Referer" to pageUrl, "Origin" to origin).also { h ->
+                        // v27: whatever the page's own player sent for the stream wins (custom
+                        // headers included). Cookies aren't in that list, so they're added after.
+                        sniffedHeaders[sniffed]?.forEach { (k, v) ->
+                            h.keys.firstOrNull { it.equals(k, true) }?.let { h.remove(it) }
+                            h[k] = v
+                        }
                         (cookiesFor(sniffed) ?: cookiesFor(pageUrl))?.let { h["Cookie"] = it }
                     }.toMap()
-                    log("sniff: link headers = UA + Referer $origin${if (sniffHeaders.containsKey("Cookie")) " + cookies" else ""}")
+                    log("sniff: link headers = ${sniffHeaders.keys.joinToString()}${sniffedHeaders[sniffed]?.let { " (copied from the page's player)" } ?: ""}")
                     val body = try { app.get(sniffed, headers = sniffHeaders, timeout = 10L).text }
                     catch (e: kotlinx.coroutines.CancellationException) { throw e }
                     catch (e: Exception) { log("step4: sniffed playlist fetch failed: ${e.message}"); "" }
@@ -2316,7 +2372,12 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         try {
             val pl = app.get(variantUrl, headers = headers, timeout = 8L)
             val text = pl.text
-            if (!text.trimStart().startsWith("#EXTM3U")) { log("sniff: variant playlist not readable (code ${pl.code})"); return }
+            if (!text.trimStart().startsWith("#EXTM3U")) {
+                // v27: say who refused and how, not just the code.
+                log("sniff: variant playlist not readable (code ${pl.code}, server=${pl.headers["server"]}, cf-ray=${pl.headers["cf-ray"]}, " +
+                    "type=${pl.headers["Content-Type"]}) body=${text.replace(Regex("\\s+"), " ").take(120)} | sent: ${headers.keys.joinToString()}")
+                return
+            }
             if (text.contains("#EXT-X-KEY")) {
                 val m = Regex("""#EXT-X-KEY:[^\n]*""").find(text)?.value?.take(120)
                 log("sniff: playlist is ENCRYPTED -> $m")
