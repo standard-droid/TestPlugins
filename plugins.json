@@ -23,10 +23,10 @@
     },
     {
         "iconUrl": "https://anizm.net/favicon.ico",
-        "fileHash": "sha256-adcb1efbda2707b21ac6b97e65df14b78c50b167cc0b5de644e8ea5fb6ab2f0c",
+        "fileHash": "sha256-10176879d1c2763b0a98ce9e388a69e96d40f2c86acbac4244b48777660ad1c1",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/standard-droid/TestPlugins",
-        "fileSize": 159840,
+        "fileSize": 172517,
         "status": 1,
         "language": "tr",
         "authors": [
