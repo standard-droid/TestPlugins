@@ -1987,13 +1987,33 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                     if (body.trimStart().startsWith("#EXTM3U")) {
                         val variants = parseVariants(body, sniffed)
                         log("sniff: master has ${variants.size} variant(s): ${variants.joinToString(", ") { "${it.height}p/${(it.bandwidth ?: 0) / 1000}k" }}")
-                        variants.firstOrNull()?.let { probeFirstSegment(it.url, sniffHeaders) }
+                        // v28: the link's referer used to be exUrl — with its #fragment. CloudStream
+                        // sends that as the Referer header, which no browser ever does, and the
+                        // stream host answered the player with 403 (v27 log). Use the player's
+                        // origin, exactly what the page's own player sent.
+                        val linkReferer = sniffHeaders.entries.firstOrNull { it.key.equals("Referer", true) }?.value ?: "$origin/"
+                        // v28: find a header set the stream host accepts for a variant playlist
+                        // AND its first segment (the v27 log: segments 403 while playlists passed).
+                        val secFetch = mapOf("Sec-Fetch-Dest" to "empty", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Site" to "cross-site",
+                            "Accept-Language" to (try { java.util.Locale.getDefault().toLanguageTag() } catch (_: Throwable) { "en-US" }) + ",en;q=0.8")
+                        val minimal = mapOf("User-Agent" to ua, "Referer" to linkReferer, "Origin" to origin)
+                        val candidates = listOf(
+                            "player + browser fetch headers" to sniffHeaders + secFetch,
+                            "player" to sniffHeaders,
+                            "player, no cookies" to sniffHeaders.filterKeys { !it.equals("Cookie", true) } + secFetch,
+                            "minimal + fetch headers" to minimal + secFetch,
+                            "minimal" to minimal,
+                        )
+                        val picked = variants.lastOrNull()?.let { pickStreamHeaders(it.url, candidates) }
+                        val linkHeaders = picked ?: candidates.first().second
+                        if (picked == null) log("sniff: no header set got a segment from this app's client — listing the links anyway (the player's own network stack may still get through)")
                         found = if (variants.isNotEmpty())
-                            emitVariants(variants, cleanLabel, exUrl, sniffHeaders, callback, "sniff",
-                                "sn:${sniffed.substringBefore('?').takeLast(40)}", allowDeclaredFallback = true)
+                            emitVariants(variants, cleanLabel, linkReferer, linkHeaders, callback, "sniff",
+                                "sn:${sniffed.substringBefore('?').takeLast(40)}", allowDeclaredFallback = true,
+                                trustPlaylists = picked == null)
                         else {
                             callback(newExtractorLink(source = cleanLabel, name = cleanLabel, url = sniffed, type = ExtractorLinkType.M3U8) {
-                                quality = Qualities.Unknown.value; referer = exUrl; headers = sniffHeaders })
+                                quality = Qualities.Unknown.value; referer = linkReferer; headers = linkHeaders })
                             true
                         }
                     } else {
@@ -2161,7 +2181,15 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         variants: List<Variant>, cleanLabel: String, referer: String, headers: Map<String, String>,
         callback: (ExtractorLink) -> Unit, tag: String, sizeKey: String,
         allowDeclaredFallback: Boolean = false,
+        // v28: emit every variant as HLS without the probe (used when our own client is
+        // refused but the player's network stack may not be).
+        trustPlaylists: Boolean = false,
     ): Boolean {
+        if (trustPlaylists) {
+            for (v in variants) callback(newExtractorLink(source = cleanLabel, name = "$cleanLabel ${v.height}p",
+                url = v.url, type = ExtractorLinkType.M3U8) { quality = v.height; this.referer = referer; this.headers = headers })
+            return variants.isNotEmpty()
+        }
         val sizes = if (estimateHlsSizes) {
             cachedSizes(sizeKey)
                 ?: (withTimeoutOrNull(sizeEstimateBudgetMs) { estimateVariantSizes(variants, headers, allowDeclaredFallback) } ?: emptyMap())
@@ -2179,6 +2207,10 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         catch (e: Exception) { log("$tag: variant ${v.height}p probe failed: ${e.message}"); return@withPermit }
                         val pt = probe.text.trimStart()
                         when {
+                            // v28: a refusal is a refusal, whatever its body looks like. v27 listed a
+                            // 403 answer as a plain video file ("Sistenn1 1080p", type=VIDEO).
+                            probe.code !in 200..299 ->
+                                log("$tag: variant ${v.height}p refused (http ${probe.code})")
                             pt.startsWith("#EXTM3U") -> {
                                 callback(newExtractorLink(source = cleanLabel, name = "$cleanLabel ${v.height}p" + formatSize(sizes[v.height], isEstimate = true),
                                     url = v.url, type = ExtractorLinkType.M3U8) { quality = v.height; this.referer = referer; this.headers = headers })
@@ -2197,6 +2229,37 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             }
         }
         return any.get()
+    }
+
+    /**
+     * v28: try header sets in order against one variant playlist and its first segment (one
+     * byte). Returns the first set that gets both; logs what each refused one got.
+     */
+    private suspend fun pickStreamHeaders(variantUrl: String, sets: List<Pair<String, Map<String, String>>>): Map<String, String>? {
+        for ((name, h) in sets) {
+            val why = try {
+                val pl = app.get(variantUrl, headers = h, timeout = 8L)
+                val text = pl.text
+                if (pl.code !in 200..299 || !text.trimStart().startsWith("#EXTM3U")) {
+                    "playlist http ${pl.code} ${pl.headers["Content-Type"] ?: ""} ${text.replace(Regex("\\s+"), " ").take(60)}"
+                } else {
+                    val first = text.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
+                    if (first == null) "no segments in playlist" else {
+                        val segUrl = try { java.net.URI(variantUrl).resolve(first).toString() } catch (_: Exception) { first }
+                        val r = app.get(segUrl, headers = h + mapOf("Range" to "bytes=0-0"), timeout = 8L)
+                        val code = r.code
+                        val info = "${r.headers["Content-Type"]}, server=${r.headers["server"]}"
+                        try { r.okhttpResponse.close() } catch (_: Exception) {}
+                        if (code in 200..299) { log("sniff: headers '$name' work (playlist ok, segment $code, $info)"); return h }
+                        "segment http $code, $info"
+                    }
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { "error ${e.javaClass.simpleName}: ${e.message?.take(60)}" }
+            log("sniff: headers '$name' refused: $why")
+            delay(250)
+        }
+        return null
     }
 
     // Why sampling instead of BANDWIDTH × duration (what 3.x did): Aincrad's BANDWIDTH is a
