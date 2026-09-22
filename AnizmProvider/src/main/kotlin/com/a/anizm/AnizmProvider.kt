@@ -2,7 +2,12 @@ package com.a.anizm
 
 import android.os.Looper
 import android.view.View
+import android.net.http.SslError
+import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
+import android.webkit.SslErrorHandler
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
@@ -20,6 +25,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.sync.Mutex
@@ -1146,6 +1152,12 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         val enabledSet = enabledIds.toHashSet()
         val disabledIds = ordered(listed.map { it.numId }.filter { it !in enabledSet })
         log("loadLinks: ${enabledIds.size} enabled, ${disabledIds.size} disabled by settings; lazy=$lazy target=$target minQ=$minQuality lastResort=$lastResort")
+        // v22: the v21 log had wave 1 = Sistenn, Sistenn1, Aincrad, which is not what the
+        // settings order says it should be. Print the order actually used so that's visible.
+        log("loadLinks: try order: " + enabledIds.joinToString(", ") { id ->
+            val vi = byNumId[id]!!.minByOrNull { settings.priorityOf(it.name) }!!
+            "${vi.name}#${settings.priorityOf(vi.name)}"
+        })
 
         val embedMap = java.util.concurrent.ConcurrentHashMap<String, String>()
         val found = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -1162,6 +1174,39 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // requests at the same handful of hosts.
         val stepGate = Semaphore(5)
         val tried = java.util.LinkedHashSet<String>()
+        // v22: sources that can only be read with the in-app browser (Sistenn & co.) are put
+        // off while lazy loading. In the v21 log, two of them sat in wave 1 and cost 48s of
+        // sniff timeouts, while Aincrad, GDrive and Beta — enough for the target on their
+        // own — waited behind them. Now the cheap sources go first, and the sniffs only run
+        // if the target still isn't met afterwards.
+        val deferredSniffs = java.util.concurrent.ConcurrentLinkedQueue<Pair<VidInfo, String>>()
+
+        suspend fun runOne(vi: VidInfo, embed: String, allowDefer: Boolean) {
+            stepGate.withPermit {
+                try {
+                    // Track this source's best quality on the way through.
+                    // CAS loop, not accumulateAndGet (API 24; minSdk is 21).
+                    val best = java.util.concurrent.atomic.AtomicInteger(Int.MIN_VALUE)
+                    val trackingCallback: (ExtractorLink) -> Unit = { l ->
+                        val q = if (l.quality == Qualities.Unknown.value) Int.MIN_VALUE + 1 else l.quality
+                        while (true) { val cur = best.get(); if (q <= cur || best.compareAndSet(cur, q)) break }
+                        safeCallback(l)
+                    }
+                    val defer: ((VidInfo, String) -> Unit)? =
+                        if (allowDefer) { v, e -> deferredSniffs.add(v to e) } else null
+                    if (processSource(vi, embed, data, trackingCallback, subtitleCallback, defer)) {
+                        found.set(true)
+                        val b = best.get().let { if (it <= Int.MIN_VALUE + 1) Qualities.Unknown.value else it }
+                        if (meetsMin(b)) okSources.incrementAndGet()
+                        else { belowMinSources.incrementAndGet(); log("step4: ${vi.fansub}/${vi.name} works but best=$b < min $minQuality, not counted") }
+                    }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    log("step4: ${vi.fansub}/${vi.name} error: ${e.message}")
+                }
+            }
+        }
 
         // Growing waves: 3, 6, 12, … When the first waves come up empty (typical for old
         // episodes where most hosts are dead), the remaining sources are tried in bigger
@@ -1189,32 +1234,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             coroutineScope {
                 fun dispatch(id: String, embed: String) {
                     byNumId[id]?.let { list ->
-                        for (vi in list) {
-                            launch {
-                                stepGate.withPermit {
-                                    try {
-                                        // Track this source's best quality on the way through.
-                                        // CAS loop, not accumulateAndGet (API 24; minSdk is 21).
-                                        val best = java.util.concurrent.atomic.AtomicInteger(Int.MIN_VALUE)
-                                        val trackingCallback: (ExtractorLink) -> Unit = { l ->
-                                            val q = if (l.quality == Qualities.Unknown.value) Int.MIN_VALUE + 1 else l.quality
-                                            while (true) { val cur = best.get(); if (q <= cur || best.compareAndSet(cur, q)) break }
-                                            safeCallback(l)
-                                        }
-                                        if (processSource(vi, embed, data, trackingCallback, subtitleCallback)) {
-                                            found.set(true)
-                                            val b = best.get().let { if (it <= Int.MIN_VALUE + 1) Qualities.Unknown.value else it }
-                                            if (meetsMin(b)) okSources.incrementAndGet()
-                                            else { belowMinSources.incrementAndGet(); log("step4: ${vi.fansub}/${vi.name} works but best=$b < min $minQuality, not counted") }
-                                        }
-                                    } catch (e: kotlinx.coroutines.CancellationException) {
-                                        throw e
-                                    } catch (e: Exception) {
-                                        log("step4: ${vi.fansub}/${vi.name} error: ${e.message}")
-                                    }
-                                }
-                            }
-                        }
+                        for (vi in list) launch { runOne(vi, embed, allowDefer = lazy) }
                     }
                 }
                 fun accept(id: String, embed: String) {
@@ -1258,6 +1278,25 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             }
         }
 
+        // Phase 1b (v22): the browser-only sources that were put off above, in priority
+        // order, only if the cheap ones didn't reach the goal. They run one at a time anyway
+        // (sniffGate), so stop as soon as the goal is met.
+        suspend fun flushDeferred(goalMet: () -> Boolean, what: String) {
+            if (deferredSniffs.isEmpty()) return
+            val queue = deferredSniffs.toList().sortedBy { settings.priorityOf(it.first.name) }
+            deferredSniffs.clear()
+            if (goalMet()) {
+                log("loadLinks: $what met without the browser — skipped ${queue.size} sniff source(s): ${queue.joinToString { it.first.name }}")
+                return
+            }
+            log("loadLinks: ${okSources.get()}/$target working, now trying ${queue.size} browser-only source(s)")
+            for ((vi, embed) in queue) {
+                runOne(vi, embed, allowDefer = false)
+                if (goalMet()) break
+            }
+        }
+        flushDeferred({ !lazy || okSources.get() >= target }, "target")
+
         // Phase 2: only if NOTHING worked. "Found some, just fewer than the target" doesn't
         // count — the user turned those hosts off, and one working source is a result.
         if (!found.get() && lastResort && disabledIds.isNotEmpty()) {
@@ -1267,6 +1306,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 runWave(wave, "last-resort wave ${i + 1}/${w2.size}")
                 if (found.get()) break // last resort: stop at the first thing that plays
             }
+            flushDeferred({ found.get() }, "last resort")
         }
 
         for (vi in listed) if (vi.numId in tried && !embedMap.containsKey(vi.numId)) log("step4: ${vi.fansub}/${vi.name} MISSING")
@@ -1443,6 +1483,73 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         }
     }
 
+    // v22: hosts the hidden WebView refused on TLS grounds. The v21 log shows the WebView's
+    // own network stack failing a handshake (net_error -202, ERR_CERT_AUTHORITY_INVALID,
+    // "Trust anchor for certification path not found") ~2–4s into BOTH Sistenn sniffs —
+    // right where the page should have asked for /api/v1/video — while the page's only
+    // visible requests were /api/v1/info and a bundle. The WebView cancels such a request
+    // silently, so the player just waits. Likely causes: an ISP block page answering for
+    // that host (the app's own HTTP client may resolve DNS differently), or a server
+    // missing an intermediate certificate. Once a host lands here, later requests to it
+    // from the sniffer go through the app's HTTP client instead, which still validates
+    // TLS fully — nothing is ever let through with a bad certificate.
+    private val sslBadHosts = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val charsetRe = Regex("""charset=([^;\s]+)""", RegexOption.IGNORE_CASE)
+
+    private fun sslErrorName(e: SslError?): String = when (e?.primaryError) {
+        SslError.SSL_UNTRUSTED -> "untrusted CA"
+        SslError.SSL_EXPIRED -> "expired"
+        SslError.SSL_IDMISMATCH -> "hostname mismatch"
+        SslError.SSL_NOTYETVALID -> "not yet valid"
+        SslError.SSL_DATE_INVALID -> "date invalid"
+        SslError.SSL_INVALID -> "invalid"
+        else -> "error ${e?.primaryError}"
+    }
+
+    /**
+     * Fetch one sniffer GET through the app's HTTP client (runs on the WebView's IO thread,
+     * so blocking is fine). Returns null — i.e. "let the WebView try itself" — on any failure.
+     */
+    private fun proxyViaApp(req: WebResourceRequest, note: (String) -> Unit): WebResourceResponse? {
+        val url = req.url?.toString() ?: return null
+        val host = req.url?.host ?: ""
+        return try {
+            val h = HashMap<String, String>(req.requestHeaders ?: emptyMap())
+            h["User-Agent"] = ua
+            cookiesFor(url)?.let { h["Cookie"] = it }
+            val r = runBlocking { app.get(url, headers = h, timeout = 10L) }
+            val code = r.code
+            // The app client follows redirects; a 3xx here or a 1xx can't be expressed in a
+            // WebResourceResponse, so hand those back to the WebView.
+            if (code < 200 || code in 300..399) { note("sniff: via app $host -> http $code, giving it back"); return null }
+            val ct = r.headers["Content-Type"] ?: "application/octet-stream"
+            val mime = ct.substringBefore(';').trim().ifEmpty { "application/octet-stream" }
+            val charset = charsetRe.find(ct)?.groupValues?.get(1)
+            val bytes = bodyBytes(r) ?: ByteArray(0)
+            val headers = LinkedHashMap<String, String>()
+            for (name in r.okhttpResponse.headers.names()) {
+                // Already decoded by the client; a stale length/encoding would corrupt the body.
+                if (name.equals("content-encoding", true) || name.equals("content-length", true) ||
+                    name.equals("transfer-encoding", true)) continue
+                if (name.equals("set-cookie", true)) {
+                    r.okhttpResponse.headers.values(name).forEach { c ->
+                        try { CookieManager.getInstance().setCookie(url, c) } catch (_: Throwable) {}
+                    }
+                    continue
+                }
+                headers[name] = r.okhttpResponse.headers.values(name).joinToString(", ")
+            }
+            note("sniff: via app $host${req.url?.path?.take(40) ?: ""} -> http $code, ${bytes.size}B $mime")
+            val reason = r.okhttpResponse.message.ifBlank { if (code < 400) "OK" else "Error" }
+            WebResourceResponse(mime, charset, code, reason, headers, ByteArrayInputStream(bytes))
+        } catch (e: Throwable) {
+            // If the app's client fails too, that says the host itself is broken (not just
+            // the WebView's view of it) — which is worth knowing for the next step.
+            note("sniff: via app $host failed too: ${e.javaClass.simpleName}: ${e.message?.take(90)}")
+            null
+        }
+    }
+
     private suspend fun sniffHlsViaWebView(pageUrl: String, referer: String, budgetMs: Long = 24_000L): String? =
         suspendCancellableCoroutine { cont ->
             val handler = android.os.Handler(Looper.getMainLooper())
@@ -1456,6 +1563,12 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 val decoysSeen = java.util.concurrent.atomic.AtomicInteger(0)
                 val blockAds = sniffBlockAdsNext
                 val adsBlocked = java.util.concurrent.atomic.AtomicInteger(0)
+                // v22: capped diagnostic lines per sniff (console errors, failed requests,
+                // TLS refusals), so the next log says what the page tripped over.
+                val diagLines = java.util.concurrent.atomic.AtomicInteger(0)
+                fun diag(msg: String) { if (diagLines.incrementAndGet() <= 30) log(msg) }
+                fun isAdHost(h: String) = adHostKeywords.any { h.contains(it, true) } || imaHostKeywords.any { h.contains(it, true) }
+                var reloadedForTls = false
                 val act = currentActivity()
                 val wv = WebView(act ?: ctx).apply {
                     settings.javaScriptEnabled = true
@@ -1579,7 +1692,42 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         // Diagnostics only: the handful of requests that could have been it.
                         if (u.contains("/api/") || u.contains("video") || u.contains(".mp4") || u.contains("stream"))
                             if (seen.size < 40) seen.add(url.substringBefore('?').takeLast(70))
+                        // v22: a host the WebView refused on TLS goes through the app's client.
+                        if (host in sslBadHosts && request.method.equals("GET", true))
+                            return proxyViaApp(request) { diag(it) }
                         return null
+                    }
+
+                    // v22: default behaviour is to cancel silently. Still cancel (never proceed
+                    // on a bad certificate), but log it, remember the host, and reload once so
+                    // the page's requests to it can go through the app's client instead.
+                    override fun onReceivedSslError(view: WebView?, h: SslErrorHandler?, error: SslError?) {
+                        try { h?.cancel() } catch (_: Throwable) {}
+                        val badHost = try { android.net.Uri.parse(error?.url ?: "").host } catch (_: Throwable) { null } ?: return
+                        // Ad hosts: nothing to rescue, and not worth routing through the app.
+                        if (isAdHost(badHost)) { diag("sniff: TLS refused for ad host $badHost"); return }
+                        val isNew = sslBadHosts.add(badHost)
+                        diag("sniff: TLS refused for $badHost (${sslErrorName(error)})${if (isNew) " — will route it through the app" else ""}")
+                        if (isNew && !reloadedForTls && !done) {
+                            reloadedForTls = true
+                            handler.postDelayed({
+                                if (!done) { log("sniff: reloading page once with $badHost routed through the app"); try { view?.reload() } catch (_: Throwable) {} }
+                            }, 300L)
+                        }
+                    }
+
+                    override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                        super.onReceivedError(view, request, error)
+                        val h = request?.url?.host ?: return
+                        if (isAdHost(h)) return
+                        diag("sniff: request failed ${h}${request.url?.path?.take(50) ?: ""}: ${error?.errorCode} ${error?.description}")
+                    }
+
+                    override fun onReceivedHttpError(view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?) {
+                        super.onReceivedHttpError(view, request, errorResponse)
+                        val h = request?.url?.host ?: return
+                        if (isAdHost(h)) return
+                        diag("sniff: http ${errorResponse?.statusCode} for ${h}${request.url?.path?.take(50) ?: ""}")
                     }
 
                     override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
@@ -1594,7 +1742,22 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         poke(view, "poke@ready")
                     }
                 }
-                log("sniff: loading ${pageUrl.substringBefore('#')}")
+                // v22: console errors from the page (a thrown exception in the key/decrypt step
+                // would otherwise be invisible).
+                wv.webChromeClient = object : WebChromeClient() {
+                    override fun onConsoleMessage(m: ConsoleMessage?): Boolean {
+                        if (m == null) return true
+                        val lvl = m.messageLevel()
+                        if (lvl == ConsoleMessage.MessageLevel.ERROR || lvl == ConsoleMessage.MessageLevel.WARNING) {
+                            val src = try { android.net.Uri.parse(m.sourceId() ?: "").let { "${it.host}${it.path?.takeLast(30) ?: ""}" } } catch (_: Throwable) { "" }
+                            diag("sniff: console ${lvl.name.lowercase()} $src:${m.lineNumber()} ${m.message().take(160)}")
+                        }
+                        return true
+                    }
+                }
+                // v22: log the full URL. The id is in the #fragment and the page needs it; v21
+                // trimmed it from this line only, which made the log look like it was dropped.
+                log("sniff: loading $pageUrl${if (sslBadHosts.isNotEmpty()) " (via app: ${sslBadHosts.joinToString()})" else ""}")
                 wv.loadUrl(pageUrl, mapOf("Referer" to referer))
                 // Fixed timeline, not tied to onPageFinished: with ad scripts in the page that
                 // callback can arrive after the whole budget has run out.
@@ -1613,6 +1776,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         data: String,
         callback: (ExtractorLink) -> Unit,
         subtitleCallback: (SubtitleFile) -> Unit,
+        // v22: when set, a source that would need a browser sniff is handed back through
+        // this instead of sniffed now (loadLinks retries it later, only if still needed).
+        deferSniff: ((VidInfo, String) -> Unit)? = null,
     ): Boolean {
         val label = "${vi.fansub} - ${vi.name.replace(adsRe, "").trim()}"
         log("step4: $label embed=$embed")
@@ -1645,6 +1811,11 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             if (!found && settings.browserSniff) {
                 val cached = sniffCache[exUrl]?.takeIf { System.currentTimeMillis() - it.second < sniffCacheTtlMs }?.first
                 if (cached != null) log("step4: reusing sniffed playlist for $label")
+                if (cached == null && deferSniff != null) {
+                    log("step4: $label needs the browser — deferred until the cheap sources are done")
+                    deferSniff(vi, embed)
+                    return false
+                }
                 val overBudget = sniffSpentThisLoad >= sniffBudgetPerLoadMs
                 val skip = cached == null && (sniffHostOnCooldown(exUrl) || overBudget)
                 if (skip) log("step4: skipping sniff for $label (${if (overBudget) "episode sniff budget spent" else "host on cooldown"})")
