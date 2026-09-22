@@ -1294,6 +1294,67 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         "aphacicfable", "prahmnatured", "brigadedelegatesandbox", "gigglemagnetismunaired",
         "cacklegrievingtank", "attirecideryeah", "popads", "propeller", "popcash")
 
+    // v21: Google's ad stack (IMA SDK + its creatives). In the v20 log the Sistenn page loaded
+    // /api/v1/info and s0.2mdn.net/instream/video/client.js and then never asked for
+    // /api/v1/video — it sits waiting on the preroll. Whether it copes better with the ad
+    // failing (script error -> content) or with the ad running is not knowable from here, so
+    // the sniffer alternates: a failed attempt flips the mode for the next one, a successful
+    // one keeps it. Blocked requests get a real 404 so the page's onerror fallback fires,
+    // rather than an empty 200 script that leaves `google.ima` undefined and throws later.
+    private val imaHostKeywords = listOf(
+        "imasdk.googleapis.com", "2mdn.net", "doubleclick.net", "googlesyndication.com",
+        "googleadservices.com", "adservice.google", "googletagservices.com")
+    @Volatile private var sniffBlockAdsNext = true
+    private fun notFoundResponse() = WebResourceResponse("text/plain", "utf-8", 404, "Not Found",
+        mapOf("Access-Control-Allow-Origin" to "*"), ByteArrayInputStream(emptyBytes))
+
+    /** evaluateJavascript hands back a JSON value; unwrap a string result properly (escaped quotes, ampersands). */
+    private fun jsResult(r: String?): String {
+        if (r.isNullOrEmpty() || r == "null") return ""
+        return try { JSONArray("[$r]").optString(0, "") } catch (_: Exception) { r.trim('"') }
+    }
+
+    /** CloudStream's current Activity, if it exposes one. Reflection so a rename can't break the build. */
+    private fun currentActivity(): android.app.Activity? = try {
+        val c = Class.forName("com.lagradost.cloudstream3.CommonActivity")
+        val inst = try { c.getField("INSTANCE").get(null) } catch (_: Throwable) { null }
+        (c.getMethod("getActivity").invoke(inst) as? android.app.Activity)
+            ?.takeIf { !it.isFinishing && !it.isDestroyed }
+    } catch (_: Throwable) { null }
+
+    // Runs as the page starts. A WebView that is not on screen reports document.hidden = true,
+    // and players (and the IMA SDK) hold off loading anything for a hidden tab.
+    private val docStartJs = """
+        (function(){
+          if (window.__anzHook) return; window.__anzHook = 1;
+          try { Object.defineProperty(document, 'hidden', { get: function(){ return false; } }); } catch(e) {}
+          try { Object.defineProperty(document, 'visibilityState', { get: function(){ return 'visible'; } }); } catch(e) {}
+          try { document.hasFocus = function(){ return true; }; } catch(e) {}
+        })()
+    """.trimIndent()
+
+    // What the page looked like when the sniff gave up — says whether it is stuck on an
+    // AdBlock notice, has a player with an error, or never built a player at all.
+    private val stateJs = """
+        (function(){
+          var o = [];
+          try { o.push('vis=' + document.visibilityState + ' ' + innerWidth + 'x' + innerHeight); } catch(e) {}
+          try {
+            var p = document.querySelector('media-player');
+            if (!p) o.push('no media-player');
+            else {
+              var st = p.state || {};
+              o.push('player src=' + String((st.source && st.source.src) || p.src || '').slice(0, 90));
+              if (st.error) o.push('err=' + String(st.error.message || st.error).slice(0, 80));
+              o.push('canLoad=' + st.canLoad + ' canPlay=' + st.canPlay + ' started=' + st.started);
+            }
+          } catch(e) { o.push('perr ' + e); }
+          try { o.push('ifr=' + document.querySelectorAll('iframe').length); } catch(e) {}
+          try { o.push('text="' + (document.body.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 160) + '"'); } catch(e) {}
+          return o.join(' | ');
+        })()
+    """.trimIndent()
+
     /** Placeholder playlists a player attaches before it has the real source. */
     private val decoyPlaylistNames = listOf("preload", "blank", "dummy", "placeholder", "empty", "init")
 
@@ -1315,7 +1376,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // explicit layout() in the sniffer.
     private val playClickJs = """
         (function(){
-          var did = [], clicks = 0;
+          var did = [], clicks = 0, found = '';
           function looksLikePlay(el) {
             var lbl = '';
             try { lbl = (el.getAttribute('aria-label') || el.getAttribute('title') || '') + ' ' +
@@ -1333,6 +1394,12 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 try { el.muted = true; el.preload = 'auto'; el.autoplay = true; } catch(e) {}
                 try { var r = el.play(); if (r && r.catch) r.catch(function(){}); did.push('video.play'); } catch(e) {}
               } else if (tag === 'MEDIA-PLAYER' || tag === 'MEDIA-PROVIDER') {
+                // v21: if the player already holds the decrypted playlist, just take it.
+                try {
+                  var st = el.state || {};
+                  var s = String((st.source && st.source.src) || el.src || '');
+                  if (/\.m3u8|\/hlsmod\//i.test(s)) found = s;
+                } catch(e) {}
                 try { if (el.startLoading) { el.startLoading(); did.push('startLoading'); } } catch(e) {}
                 try { if (el.startLoadingPoster) el.startLoadingPoster(); } catch(e) {}
                 try { el.muted = true; } catch(e) {}
@@ -1344,6 +1411,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             }
           }
           try { walk(document, 0); } catch(e) { return 'err:' + e; }
+          if (found) return 'src:' + found;
           return did.length ? did.join(',') : 'nothing';
         })()
     """.trimIndent()
@@ -1386,10 +1454,16 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 // *why* it failed instead of just "timeout".
                 val seen = java.util.Collections.synchronizedList(mutableListOf<String>())
                 val decoysSeen = java.util.concurrent.atomic.AtomicInteger(0)
-                val wv = WebView(ctx).apply {
+                val blockAds = sniffBlockAdsNext
+                val adsBlocked = java.util.concurrent.atomic.AtomicInteger(0)
+                val act = currentActivity()
+                val wv = WebView(act ?: ctx).apply {
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
-                    settings.mediaPlaybackRequiresUserGesture = false // lets play() work without a real tap
+                    // Ads blocked: nothing but our own muted play() can make sound, so allow it.
+                    // Ads allowed: keep the gesture rule so a preroll can't blare through the
+                    // user's speakers; the player still fetches its source without playing.
+                    settings.mediaPlaybackRequiresUserGesture = !blockAds
                     settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     settings.loadWithOverviewMode = true
                     settings.useWideViewPort = true
@@ -1403,6 +1477,25 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         View.MeasureSpec.makeMeasureSpec(720, View.MeasureSpec.EXACTLY))
                     wv.layout(0, 0, 1280, 720)
                 } catch (_: Throwable) {}
+                // v21: actually attach it to the window. A detached WebView never gets vsync, so
+                // requestAnimationFrame never fires and timers are throttled — enough to stall a
+                // player (and the IMA SDK) forever, which matches the v20 log exactly. It goes in
+                // behind the app's own UI, nearly transparent, and can't take touches or focus.
+                var attachedTo: android.view.ViewGroup? = null
+                try {
+                    val content = act?.findViewById<android.view.ViewGroup>(android.R.id.content)
+                    if (content != null) {
+                        wv.alpha = 0.01f
+                        wv.isFocusable = false
+                        wv.isFocusableInTouchMode = false
+                        wv.descendantFocusability = android.view.ViewGroup.FOCUS_BLOCK_DESCENDANTS
+                        wv.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+                        wv.setOnTouchListener { _, _ -> true }
+                        content.addView(wv, 0, android.widget.FrameLayout.LayoutParams(1280, 720))
+                        attachedTo = content
+                    }
+                } catch (e: Throwable) { log("sniff: could not attach webview: ${e.message}") }
+                log("sniff: mode ads=${if (blockAds) "blocked" else "allowed"}, ${if (attachedTo != null) "attached" else "detached"}")
                 CookieManager.getInstance().setAcceptCookie(true)
                 CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
@@ -1410,22 +1503,43 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                     if (done) return
                     done = true
                     handler.removeCallbacksAndMessages(null)
+                    try { attachedTo?.removeView(wv) } catch (_: Throwable) {}
                     try { wv.stopLoading(); wv.loadUrl("about:blank"); wv.destroy() } catch (_: Exception) {}
+                    // Alternate the ad mode after a failure; keep whatever worked.
+                    if (result == null) sniffBlockAdsNext = !blockAds
                     if (cont.isActive) cont.resume(result)
                 }
                 cont.invokeOnCancellation { handler.post { finish(null) } }
                 handler.postDelayed({
                     val tail = synchronized(seen) { seen.takeLast(8).joinToString(" | ") }
-                    log("sniff: timeout for ${pageUrl.substringBefore('#')}; saw ${seen.size} candidate requests${if (tail.isEmpty()) "" else ": $tail"}")
-                    finish(null)
+                    log("sniff: timeout for ${pageUrl.substringBefore('#')}; saw ${seen.size} candidate requests${if (tail.isEmpty()) "" else ": $tail"}" +
+                        (if (adsBlocked.get() > 0) "; blocked ${adsBlocked.get()} ad requests" else ""))
+                    // One last look at the page before it is torn down (capped at 1.5s).
+                    handler.postDelayed({ finish(null) }, 1_500L)
+                    try {
+                        wv.evaluateJavascript(stateJs) { r ->
+                            if (!done) log("sniff: page state: ${jsResult(r)}")
+                            finish(null)
+                        }
+                    } catch (_: Throwable) { finish(null) }
                 }, budgetMs)
 
                 fun poke(view: WebView?, tag: String) {
                     if (done) return
                     try {
                         view?.evaluateJavascript(playClickJs) { r ->
-                            val v = r?.trim('"') ?: ""
-                            if (!done && v.isNotEmpty() && v != "nothing") log("sniff: $tag -> $v")
+                            val v = jsResult(r)
+                            if (done) return@evaluateJavascript
+                            if (v.startsWith("src:")) {
+                                val src = v.removePrefix("src:")
+                                val file = src.lowercase().substringBefore('?').substringAfterLast('/')
+                                if (src.startsWith("http") && decoyPlaylistNames.none { file.startsWith(it) }) {
+                                    log("sniff: player holds ${src.substringBefore('?').takeLast(60)}")
+                                    finish(src)
+                                    return@evaluateJavascript
+                                }
+                            }
+                            if (v.isNotEmpty() && v != "nothing") log("sniff: $tag -> $v")
                         }
                     } catch (_: Exception) {}
                 }
@@ -1435,6 +1549,10 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         val url = request?.url?.toString() ?: return null
                         val host = request.url?.host ?: ""
                         if (adHostKeywords.any { host.contains(it, ignoreCase = true) }) return emptyResponse()
+                        if (blockAds && imaHostKeywords.any { host.contains(it, ignoreCase = true) }) {
+                            adsBlocked.incrementAndGet()
+                            return notFoundResponse()
+                        }
                         // The master playlist, whatever path it lives under. Some of these
                         // players serve it as .txt or with no extension at all.
                         val u = url.lowercase()
@@ -1462,6 +1580,11 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         if (u.contains("/api/") || u.contains("video") || u.contains(".mp4") || u.contains("stream"))
                             if (seen.size < 40) seen.add(url.substringBefore('?').takeLast(70))
                         return null
+                    }
+
+                    override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                        super.onPageStarted(view, url, favicon)
+                        try { view?.evaluateJavascript(docStartJs, null) } catch (_: Throwable) {}
                     }
 
                     override fun onPageFinished(view: WebView?, url: String?) {
