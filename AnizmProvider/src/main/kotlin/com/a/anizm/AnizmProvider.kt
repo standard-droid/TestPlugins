@@ -1576,6 +1576,10 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 fun isAdHost(h: String) = adHostKeywords.any { h.contains(it, true) } || imaHostKeywords.any { h.contains(it, true) }
                 var reloadedForTls = false
                 var syntheticTouch = false
+                // v25: set below; lets a blocked pop-under schedule a follow-up tap.
+                var tapAgain: (() -> Unit)? = null
+                val pageHost = try { java.net.URI(pageUrl).host ?: "" } catch (_: Exception) { "" }
+                val navsBlocked = java.util.concurrent.atomic.AtomicInteger(0)
                 val act = currentActivity()
                 val wv = WebView(act ?: ctx).apply {
                     settings.javaScriptEnabled = true
@@ -1588,6 +1592,10 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                     settings.loadWithOverviewMode = true
                     settings.useWideViewPort = true
                     if (settings.userAgentString != ua) settings.userAgentString = ua
+                    // v25: no automatic window.open (pop-unders); with multiple windows off,
+                    // a gesture-driven one would load here and is caught by shouldOverrideUrlLoading.
+                    settings.javaScriptCanOpenWindowsAutomatically = false
+                    settings.setSupportMultipleWindows(false)
                 }
                 // Give the offscreen WebView a real viewport. Without this it is 0x0, so
                 // IntersectionObserver never fires and a lazy player never loads its source.
@@ -1634,7 +1642,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 handler.postDelayed({
                     val tail = synchronized(seen) { seen.takeLast(8).joinToString(" | ") }
                     log("sniff: timeout for ${pageUrl.substringBefore('#')}; saw ${seen.size} candidate requests${if (tail.isEmpty()) "" else ": $tail"}" +
-                        (if (adsBlocked.get() > 0) "; blocked ${adsBlocked.get()} ad requests" else ""))
+                        (if (adsBlocked.get() > 0) "; blocked ${adsBlocked.get()} ad requests" else "") +
+                        (if (navsBlocked.get() > 0) "; blocked ${navsBlocked.get()} pop-under(s)" else ""))
                     // One last look at the page before it is torn down (capped at 1.5s).
                     handler.postDelayed({ finish(null) }, 1_500L)
                     try {
@@ -1721,6 +1730,21 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         return null
                     }
 
+                    // v25: the v24 log showed the first real tap replacing the player page with
+                    // another one (viewport 465 -> 980 wide, no media-player): an invisible ad
+                    // layer that opens a pop-under on the first click. In a browser that goes to
+                    // a new tab and the next click reaches the player; here it navigated the only
+                    // window away. Keep the main frame on the player's own site, then tap again.
+                    override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                        if (request?.isForMainFrame != true) return false
+                        val target = request.url?.host ?: return false
+                        if (pageHost.isEmpty() || target.equals(pageHost, true) || target.endsWith(".$pageHost", true)) return false
+                        val n = navsBlocked.incrementAndGet()
+                        log("sniff: blocked navigation to $target (pop-under #$n)")
+                        if (n <= 4) handler.postDelayed({ tapAgain?.invoke() }, 800L)
+                        return true
+                    }
+
                     // v22: default behaviour is to cancel silently. Still cancel (never proceed
                     // on a bad certificate), but log it, remember the host, and reload once so
                     // the page's requests to it can go through the app's client instead.
@@ -1803,9 +1827,11 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         log("sniff: $tag real tap at ${x.toInt()},${y.toInt()}")
                     } catch (e: Throwable) { log("sniff: tap failed: ${e.message}") }
                 }
+                tapAgain = { realTap("tap after pop-under", 0.5f, 0.5f) }
                 handler.postDelayed({ realTap("tap@2s", 0.5f, 0.5f) }, 2_000L)
-                handler.postDelayed({ realTap("tap@6s", 0.5f, 0.5f) }, 6_000L)
-                handler.postDelayed({ realTap("tap@11s", 0.5f, 0.6f) }, 11_000L)
+                handler.postDelayed({ realTap("tap@5s", 0.5f, 0.5f) }, 5_000L)
+                handler.postDelayed({ realTap("tap@9s", 0.5f, 0.6f) }, 9_000L)
+                handler.postDelayed({ realTap("tap@14s", 0.5f, 0.5f) }, 14_000L)
                 for (delay in listOf(1_500L, 3_000L, 5_000L, 7_500L, 10_000L, 13_000L, 17_000L, 21_000L)) {
                     handler.postDelayed({ poke(wv, "poke@${delay / 1000}s") }, delay)
                 }
