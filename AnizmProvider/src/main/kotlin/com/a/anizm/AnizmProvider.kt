@@ -1134,6 +1134,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         val target = settings.lazyTargetSources
         val lastResort = settings.tryDisabledAsLastResort
         val minQuality = settings.lazyMinQuality
+        // v23: deferring browser-only sources is optional. Off = the settings order is
+        // followed exactly, so a Sistenn placed high in the list is sniffed in its turn.
+        val deferBrowser = lazy && settings.deferBrowserSources
         // A source only counts toward the lazy target if its best link reaches minQuality.
         // Unknown quality never counts (unless minQuality is "Any"): we can't tell a 480p
         // mystery link from a 1080p one, and stopping on it is exactly the failure this avoids.
@@ -1151,7 +1154,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         enabledIds.firstOrNull()?.let { lastProbeTarget = it to data }
         val enabledSet = enabledIds.toHashSet()
         val disabledIds = ordered(listed.map { it.numId }.filter { it !in enabledSet })
-        log("loadLinks: ${enabledIds.size} enabled, ${disabledIds.size} disabled by settings; lazy=$lazy target=$target minQ=$minQuality lastResort=$lastResort")
+        log("loadLinks: ${enabledIds.size} enabled, ${disabledIds.size} disabled by settings; lazy=$lazy target=$target minQ=$minQuality lastResort=$lastResort deferBrowser=$deferBrowser")
         // v22: the v21 log had wave 1 = Sistenn, Sistenn1, Aincrad, which is not what the
         // settings order says it should be. Print the order actually used so that's visible.
         log("loadLinks: try order: " + enabledIds.joinToString(", ") { id ->
@@ -1234,7 +1237,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             coroutineScope {
                 fun dispatch(id: String, embed: String) {
                     byNumId[id]?.let { list ->
-                        for (vi in list) launch { runOne(vi, embed, allowDefer = lazy) }
+                        for (vi in list) launch { runOne(vi, embed, allowDefer = deferBrowser) }
                     }
                 }
                 fun accept(id: String, embed: String) {
@@ -1390,6 +1393,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             }
           } catch(e) { o.push('perr ' + e); }
           try { o.push('ifr=' + document.querySelectorAll('iframe').length); } catch(e) {}
+          try { o.push('pk=' + (typeof window.__pk)); } catch(e) {}
           try { o.push('text="' + (document.body.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 160) + '"'); } catch(e) {}
           return o.join(' | ');
         })()
@@ -1494,6 +1498,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // from the sniffer go through the app's HTTP client instead, which still validates
     // TLS fully — nothing is ever let through with a bad certificate.
     private val sslBadHosts = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val brokenTrackerHosts = listOf("mc.yandex.", "hdrc.yandex.net", "mdd.yandex.net", "an.yandex.")
     private val charsetRe = Regex("""charset=([^;\s]+)""", RegexOption.IGNORE_CASE)
 
     private fun sslErrorName(e: SslError?): String = when (e?.primaryError) {
@@ -1566,9 +1571,11 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 // v22: capped diagnostic lines per sniff (console errors, failed requests,
                 // TLS refusals), so the next log says what the page tripped over.
                 val diagLines = java.util.concurrent.atomic.AtomicInteger(0)
+                val infoLogged = java.util.concurrent.atomic.AtomicBoolean(false)
                 fun diag(msg: String) { if (diagLines.incrementAndGet() <= 30) log(msg) }
                 fun isAdHost(h: String) = adHostKeywords.any { h.contains(it, true) } || imaHostKeywords.any { h.contains(it, true) }
                 var reloadedForTls = false
+                var syntheticTouch = false
                 val act = currentActivity()
                 val wv = WebView(act ?: ctx).apply {
                     settings.javaScriptEnabled = true
@@ -1603,7 +1610,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         wv.isFocusableInTouchMode = false
                         wv.descendantFocusability = android.view.ViewGroup.FOCUS_BLOCK_DESCENDANTS
                         wv.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
-                        wv.setOnTouchListener { _, _ -> true }
+                        // v24: our own synthetic taps (see realTap) pass; real touches don't.
+                        wv.setOnTouchListener { _, _ -> !syntheticTouch }
                         content.addView(wv, 0, android.widget.FrameLayout.LayoutParams(1280, 720))
                         attachedTo = content
                     }
@@ -1662,6 +1670,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         val url = request?.url?.toString() ?: return null
                         val host = request.url?.host ?: ""
                         if (adHostKeywords.any { host.contains(it, ignoreCase = true) }) return emptyResponse()
+                        // v24: Yandex Metrica. Its hosts fail TLS on this network for the app's
+                        // client too (v22 log), so answer at once instead of a doomed handshake.
+                        if (brokenTrackerHosts.any { host.contains(it, ignoreCase = true) }) return notFoundResponse()
                         if (blockAds && imaHostKeywords.any { host.contains(it, ignoreCase = true) }) {
                             adsBlocked.incrementAndGet()
                             return notFoundResponse()
@@ -1692,6 +1703,18 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         // Diagnostics only: the handful of requests that could have been it.
                         if (u.contains("/api/") || u.contains("video") || u.contains(".mp4") || u.contains("stream"))
                             if (seen.size < 40) seen.add(url.substringBefore('?').takeLast(70))
+                        // v24: log what the page is told by /api/v1/info — it's the last
+                        // thing it asks for before going quiet.
+                        if (u.contains("/api/v1/info") && infoLogged.compareAndSet(false, true)) {
+                            val hdrs = HashMap<String, String>(request.requestHeaders ?: emptyMap()).also { it["User-Agent"] = ua }
+                            Thread {
+                                try {
+                                    val r = runBlocking { app.get(url, headers = hdrs, timeout = 8L) }
+                                    log("sniff: info (page used ${request.method}) ${r.code}: ${r.text.replace(Regex("\\s+"), " ").take(400)}")
+                                } catch (e: Throwable) { log("sniff: info side-fetch failed: ${e.message?.take(80)}") }
+                            }.start()
+                        }
+                        if (u.contains("/api/v1/video")) log("sniff: page asked for the video: ${url.substringBefore('?').takeLast(60)}")
                         // v22: a host the WebView refused on TLS goes through the app's client.
                         if (host in sslBadHosts && request.method.equals("GET", true))
                             return proxyViaApp(request) { diag(it) }
@@ -1761,6 +1784,28 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 wv.loadUrl(pageUrl, mapOf("Referer" to referer))
                 // Fixed timeline, not tied to onPageFinished: with ad scripts in the page that
                 // callback can arrive after the whole budget has run out.
+                // v24: a real tap. JS click() is an untrusted event; if the player only asks
+                // for the video on a genuine user gesture, this is what it's waiting for.
+                // Only with ads blocked: with them allowed a real tap could start a preroll
+                // with sound. Aimed at the centre (vidstack's big play button), then a
+                // little off-centre in case the centre is covered.
+                fun realTap(tag: String, fx: Float, fy: Float) {
+                    if (done || !blockAds) return
+                    try {
+                        val x = wv.width * fx; val y = wv.height * fy
+                        if (wv.width <= 0 || wv.height <= 0) return
+                        val t = android.os.SystemClock.uptimeMillis()
+                        val down = android.view.MotionEvent.obtain(t, t, android.view.MotionEvent.ACTION_DOWN, x, y, 0)
+                        val up = android.view.MotionEvent.obtain(t, t + 60, android.view.MotionEvent.ACTION_UP, x, y, 0)
+                        syntheticTouch = true
+                        try { wv.dispatchTouchEvent(down); wv.dispatchTouchEvent(up) } finally { syntheticTouch = false }
+                        down.recycle(); up.recycle()
+                        log("sniff: $tag real tap at ${x.toInt()},${y.toInt()}")
+                    } catch (e: Throwable) { log("sniff: tap failed: ${e.message}") }
+                }
+                handler.postDelayed({ realTap("tap@2s", 0.5f, 0.5f) }, 2_000L)
+                handler.postDelayed({ realTap("tap@6s", 0.5f, 0.5f) }, 6_000L)
+                handler.postDelayed({ realTap("tap@11s", 0.5f, 0.6f) }, 11_000L)
                 for (delay in listOf(1_500L, 3_000L, 5_000L, 7_500L, 10_000L, 13_000L, 17_000L, 21_000L)) {
                     handler.postDelayed({ poke(wv, "poke@${delay / 1000}s") }, delay)
                 }
