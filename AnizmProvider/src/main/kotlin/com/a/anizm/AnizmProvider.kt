@@ -23,6 +23,7 @@ import java.io.ByteArrayInputStream
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.runBlocking
@@ -1412,12 +1413,15 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         (function(m, q){
           window.__anzPl = {}; window.__anzPlDone = 0;
           function tok(u){ return (q && u.indexOf('?') < 0) ? u + '?' + q : u; }
-          fetch(m).then(function(r){ return r.text(); }).then(function(t){
+          // v34: 3s cap per request — the host stalls some variants (1080p) indefinitely.
+          function tf(u){ var c = window.AbortController ? new AbortController() : null;
+            if (c) setTimeout(function(){ c.abort(); }, 3000); return fetch(u, c ? { signal: c.signal } : {}); }
+          tf(m).then(function(r){ return r.text(); }).then(function(t){
             if (t.indexOf('#EXTM3U') === 0) window.__anzPl[m.split('?')[0]] = t;
             var urls = [];
             t.split('\n').forEach(function(l){ l = l.trim(); if (l && l.charAt(0) !== '#') { try { urls.push(tok(new URL(l, m).href)); } catch(e){} } });
             return Promise.all(urls.map(function(u){
-              return fetch(u).then(function(r){ return r.ok ? r.text() : ''; })
+              return tf(u).then(function(r){ return r.ok ? r.text() : ''; })
                 .then(function(x){ if (x.indexOf('#EXTM3U') === 0) window.__anzPl[u.split('?')[0]] = x; })
                 .catch(function(){});
             }));
@@ -1673,7 +1677,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 // v22: capped diagnostic lines per sniff (console errors, failed requests,
                 // TLS refusals), so the next log says what the page tripped over.
                 val diagLines = java.util.concurrent.atomic.AtomicInteger(0)
-                val infoLogged = java.util.concurrent.atomic.AtomicBoolean(false)
+                val infoLogged = java.util.concurrent.atomic.AtomicBoolean(false) // page asked /api/v1/info (Sistenn family)
+                val videoAsked = java.util.concurrent.atomic.AtomicBoolean(false)
                 fun diag(msg: String) { if (diagLines.incrementAndGet() <= 30) log(msg) }
                 fun isAdHost(h: String) = adHostKeywords.any { h.contains(it, true) } || imaHostKeywords.any { h.contains(it, true) }
                 var reloadedForTls = false
@@ -1754,20 +1759,26 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                     val q = (variantRef.get() ?: m).substringAfter('?', "")
                     try { wv.evaluateJavascript(playlistCaptureJs(m, q), null) } catch (_: Throwable) { finish(m); return }
                     var polls = 0
+                    fun store(json: String, partial: Boolean) {
+                        try {
+                            val o = JSONObject(json)
+                            if (sniffedPlaylistTexts.size > 40) sniffedPlaylistTexts.clear()
+                            for (k in o.keys()) sniffedPlaylistTexts[k] = o.getString(k)
+                            log("sniff: page fetched ${o.length()} playlist(s) itself${if (partial) " (the rest did not answer in time)" else ""}: " +
+                                o.keys().asSequence().joinToString { it.substringAfterLast('/') })
+                        } catch (e: Exception) { log("sniff: playlist capture unreadable: ${e.message}") }
+                    }
                     fun poll() {
                         if (done) return
+                        // v34: on the last poll take whatever arrived. v33 waited for ALL playlists,
+                        // and one stalled 1080p variant meant nothing was kept, not even the 720p.
+                        val last = ++polls >= 12
+                        val js = if (last) "JSON.stringify(window.__anzPl || {})" else "window.__anzPlDone ? JSON.stringify(window.__anzPl) : ''"
                         try {
-                            wv.evaluateJavascript("window.__anzPlDone ? JSON.stringify(window.__anzPl) : ''") { r ->
+                            wv.evaluateJavascript(js) { r ->
                                 val json = jsResult(r)
-                                if (json.isNotEmpty()) {
-                                    try {
-                                        val o = JSONObject(json)
-                                        if (sniffedPlaylistTexts.size > 40) sniffedPlaylistTexts.clear()
-                                        for (k in o.keys()) sniffedPlaylistTexts[k] = o.getString(k)
-                                        log("sniff: page fetched ${o.length()} playlist(s) itself: ${o.keys().asSequence().joinToString { it.substringAfterLast('/') }}")
-                                    } catch (e: Exception) { log("sniff: playlist capture unreadable: ${e.message}") }
-                                    finish(m)
-                                } else if (++polls >= 12) { log("sniff: page did not finish fetching the playlists in time"); finish(m) }
+                                if (json.isNotEmpty()) { store(json, partial = last); finish(m) }
+                                else if (last) { log("sniff: page fetched no playlists in time"); finish(m) }
                                 else handler.postDelayed({ poll() }, 300L)
                             }
                         } catch (_: Throwable) { finish(m) }
@@ -1896,18 +1907,11 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         // Diagnostics only: the handful of requests that could have been it.
                         if (u.contains("/api/") || u.contains("video") || u.contains(".mp4") || u.contains("stream"))
                             if (seen.size < 40) seen.add(url.substringBefore('?').takeLast(70))
-                        // v24: log what the page is told by /api/v1/info — it's the last
-                        // thing it asks for before going quiet.
-                        if (u.contains("/api/v1/info") && infoLogged.compareAndSet(false, true)) {
-                            val hdrs = HashMap<String, String>(request.requestHeaders ?: emptyMap()).also { it["User-Agent"] = ua }
-                            Thread {
-                                try {
-                                    val r = runBlocking { app.get(url, headers = hdrs, timeout = 8L) }
-                                    log("sniff: info (page used ${request.method}) ${r.code}: ${r.text.replace(Regex("\\s+"), " ").take(400)}")
-                                } catch (e: Throwable) { log("sniff: info side-fetch failed: ${e.message?.take(80)}") }
-                            }.start()
-                        }
-                        if (u.contains("/api/v1/video")) log("sniff: page asked for the video: ${url.substringBefore('?').takeLast(60)}")
+                        // v34: the v24 diagnostic that re-fetched /api/v1/info through the app's client
+                        // is gone (one extra request per sniff, and its answer is encrypted anyway).
+                        // The flags drive the early give-up in onPageFinished.
+                        if (u.contains("/api/v1/info")) infoLogged.set(true)
+                        if (u.contains("/api/v1/video")) { videoAsked.set(true); log("sniff: page asked for the video: ${url.substringBefore('?').takeLast(60)}") }
                         // v22: a host the WebView refused on TLS goes through the app's client.
                         if (host in sslBadHosts && request.method.equals("GET", true))
                             return proxyViaApp(request) { diag(it) }
@@ -1984,6 +1988,15 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         if (done) return
                         log("sniff: page ready")
                         poke(view, "poke@ready")
+                        // v34: a Sistenn-family page (it loads /api/v1/info) asks /api/v1/video about
+                        // 3-4s after load once tapped. strp2p's page loaded, never asked, and sat out
+                        // the full 24s budget (device log 2026-09-26). Give such a page 12s.
+                        handler.postDelayed({
+                            if (!done && infoLogged.get() && !videoAsked.get() && masterRef.get() == null) {
+                                log("sniff: page never asked for a video within 12s of loading — giving up")
+                                finish(null)
+                            }
+                        }, 12_000L)
                     }
                 }
                 // v22: console errors from the page (a thrown exception in the key/decrypt step
@@ -2131,7 +2144,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         (cookiesFor(sniffed) ?: cookiesFor(pageUrl))?.let { h["Cookie"] = it }
                     }.toMap()
                     log("sniff: link headers = ${sniffHeaders.keys.joinToString()}${sniffedHeaders[sniffed]?.let { " (copied from the page's player)" } ?: ""}")
-                    val fetched = try { app.get(sniffed, headers = sniffHeaders, timeout = 10L).text }
+                    val fetched = try { app.get(sniffed, headers = sniffHeaders, timeout = 6L).text }
                     catch (e: kotlinx.coroutines.CancellationException) { throw e }
                     catch (e: Exception) { log("step4: sniffed playlist fetch failed: ${e.message}"); "" }
                     // v33: the host may ignore this client entirely; the page's own copy is as good.
@@ -2174,9 +2187,20 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                             "minimal + fetch headers" to minimal + secFetch,
                             "minimal" to minimal,
                         )
-                        val picked = variants.lastOrNull()?.let { pickStreamHeaders(it.url, candidates, tokenQuery) }
+                        // v34: token links go through the local playlist server and the player fetches
+                        // segments itself, so this client's view of the host decides nothing; probing
+                        // only cost time (8s timeouts in the device logs).
+                        val picked = if (tokenQuery.isNotEmpty()) null
+                            else variants.lastOrNull()?.let { pickStreamHeaders(it.url, candidates, tokenQuery) }
                         val linkHeaders = picked ?: candidates.first().second
-                        if (picked == null) log("sniff: no header set got a segment from this app's client — listing the links anyway (the player's own network stack may still get through)")
+                        if (picked == null && tokenQuery.isEmpty()) log("sniff: no header set got a segment from this app's client — listing the links anyway (the player's own network stack may still get through)")
+                        // v34: if the page could fetch some variants but not others, the missing ones are
+                        // the ones the host stalls (1080p index-f2 in every log so far): don't list them.
+                        val captured = variants.filter { sniffedPlaylistTexts.containsKey(it.url.substringBefore('?')) }
+                        if (tokenQuery.isNotEmpty() && captured.isNotEmpty() && captured.size < variants.size) {
+                            log("sniff: leaving out ${variants.filter { it !in captured }.joinToString { "${it.height}p" }} — the page could not fetch it")
+                            variants = captured
+                        }
                         // v32: segments need the token too. The variant playlists list them relative
                         // and without it, so ExoPlayer asked for bare init/seg URLs and got Cloudflare
                         // 403s (device log 2026-09-26: 35s of buffering, no error). Serve the player a
@@ -2339,6 +2363,19 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         if (embed.startsWith("gd:")) {
             val fileId = embed.removePrefix("gd:")
             log("gdrive: fileId=$fileId for $label")
+            // v35: stream first, the way Drive's own embedded player does. The download route below
+            // hits the file's download quota ("Quota exceeded") long before the streaming one runs
+            // out; the website kept playing files the app could not (2026-09-26).
+            val streams = try { gdriveGate.withPermit { resolveGDriveStreams(fileId) } }
+                catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (e: Exception) { log("gdrive: stream lookup error: ${e.message}"); emptyList() }
+            if (streams.isNotEmpty()) {
+                val cleanLabel = cleanDisplayName(label)
+                for (st in streams) callback(newExtractorLink(source = cleanLabel, name = "$cleanLabel ${st.height}p" + formatSize(st.sizeBytes),
+                    url = st.url, type = ExtractorLinkType.VIDEO) {
+                    quality = st.height; referer = "https://drive.google.com/"; headers = mapOf("User-Agent" to ua) })
+                return true
+            }
             gdriveQuotaUntil[fileId]?.let { until ->
                 if (System.currentTimeMillis() < until) {
                     log("gdrive: $fileId hit its download quota recently — not asking Google again for ${(until - System.currentTimeMillis()) / 60000} min")
@@ -2924,6 +2961,82 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
      * byte 0, same headers) and only list it if that is still the file. Logs what Google sent
      * otherwise, which says whether the confirm/uuid link is single-use, quota-limited, etc.
      */
+    // ── Drive streaming (v35) ────────────────────────────────────────────────
+    // What drive.google.com/file/d/<id>/preview itself does (browser capture, 2026-09-26):
+    //   GET content-workspacevideo-pa.googleapis.com/v1/drive/media/<id>/playback?key=<AIza…>
+    // Cookie-free; 200 with mediaStreamingData.formatStreamingData.progressiveTranscodes =
+    // muxed MP4s (itag 18/22/37 → 360/720/1080p) on *.c.drive.google.com/videoplayback, valid
+    // 3 h and signed to the requesting IP (the phone, same as the player). Without key → 403;
+    // a file over its signed-out play limit → 429. The key is Drive's public web key: it is read
+    // from the preview page (every AIza… string there is tried once) and then remembered.
+    private data class DriveStream(val height: Int, val url: String, val sizeBytes: Long?)
+    @Volatile private var driveApiKey: String? = null
+    private val driveKeyRe = Regex("""AIza[0-9A-Za-z_\-]{35}""")
+    private val driveStreamCache = java.util.concurrent.ConcurrentHashMap<String, Pair<List<DriveStream>, Long>>()
+    private val driveStreamTtlMs = 2 * 60 * 60 * 1000L // links live 3 h
+    private val driveStreamQuotaUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    private suspend fun resolveGDriveStreams(fileId: String): List<DriveStream> {
+        val now = System.currentTimeMillis()
+        driveStreamCache[fileId]?.takeIf { now - it.second < driveStreamTtlMs }?.let { log("gdrive: reusing stream links for $fileId"); return it.first }
+        driveStreamQuotaUntil[fileId]?.takeIf { now < it }?.let { log("gdrive: $fileId is over its streaming limit (recently) — skipping the stream lookup"); return emptyList() }
+        val keys = driveApiKey?.let { listOf(it) } ?: run {
+            val html = try { app.get("https://drive.google.com/file/d/$fileId/preview", headers = mapOf("User-Agent" to ua,
+                "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"), timeout = 12L).text } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { "" }
+            driveKeyRe.findAll(html).map { it.value }.distinct().toList().also { log("gdrive: preview page has ${it.size} API key candidate(s)") }
+        }
+        if (keys.isEmpty()) return emptyList()
+        val apiHeaders = mapOf("User-Agent" to ua, "Origin" to "https://drive.google.com", "Referer" to "https://drive.google.com/",
+            "Accept" to "*/*", "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7")
+        var body: String? = null
+        for (key in keys.take(6)) {
+            val r = try { app.get("https://content-workspacevideo-pa.googleapis.com/v1/drive/media/$fileId/playback?key=$key&auditContext=forDisplay",
+                headers = apiHeaders, timeout = 12L) } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (e: Exception) { log("gdrive: playback API error: ${e.message}"); return emptyList() }
+            when (r.code) {
+                200 -> { body = r.text; driveApiKey = key; break }
+                429 -> {
+                    log("gdrive: $fileId is over its streaming limit (429): ${r.text.replace(Regex("\\s+"), " ").take(120)}")
+                    driveStreamQuotaUntil[fileId] = now + 60 * 60 * 1000L
+                    return emptyList()
+                }
+                else -> {
+                    log("gdrive: playback API refused key #${keys.indexOf(key) + 1} (http ${r.code}): ${r.text.replace(Regex("\\s+"), " ").take(120)}")
+                    if (driveApiKey == key) driveApiKey = null
+                }
+            }
+        }
+        val json = body?.let { try { JSONObject(it) } catch (_: Exception) { null } } ?: return emptyList()
+        val progressive = json.optJSONObject("mediaStreamingData")?.optJSONObject("formatStreamingData")?.optJSONArray("progressiveTranscodes")
+            ?: run { log("gdrive: playback answer has no progressive formats (state=${json.optJSONObject("mediaStreamingData")?.optJSONObject("transcodeAvailabilityState")?.optString("state")})"); return emptyList() }
+        val found = (0 until progressive.length()).mapNotNull { i ->
+            val o = progressive.optJSONObject(i) ?: return@mapNotNull null
+            val url = o.optString("url").ifBlank { return@mapNotNull null }
+            val h = o.optJSONObject("transcodeMetadata")?.optInt("height", 0)?.takeIf { it > 0 } ?: return@mapNotNull null
+            h to url
+        }.distinctBy { it.first }.sortedByDescending { it.first }
+        // Check each link answers with media (one byte) and take its real size from Content-Range;
+        // the API's own contentLength for these is wrong (~400 KB for a 23-min file).
+        val checked = coroutineScope {
+            found.map { (h, url) ->
+                async {
+                    try {
+                        val r = app.get(url, headers = mapOf("User-Agent" to ua, "Range" to "bytes=0-0"), timeout = 10L)
+                        val size = r.headers["Content-Range"]?.substringAfterLast('/')?.trim()?.toLongOrNull()
+                        val ok = r.code == 206 || r.code == 200
+                        try { r.okhttpResponse.close() } catch (_: Exception) {}
+                        if (ok) DriveStream(h, url, size) else { log("gdrive: ${h}p stream answered http ${r.code}"); null }
+                    } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                    catch (e: Exception) { log("gdrive: ${h}p stream check failed: ${e.message}"); null }
+                }
+            }.mapNotNull { it.await() }
+        }
+        log("gdrive: streaming ${checked.joinToString { "${it.height}p" + formatSize(it.sizeBytes) }} for $fileId (of ${found.size} offered)")
+        if (checked.isNotEmpty()) driveStreamCache[fileId] = checked to now
+        if (driveStreamCache.size > 100) driveStreamCache.entries.removeAll { now - it.value.second > driveStreamTtlMs }
+        return checked
+    }
+
     // v33: files whose download quota ran out. Google resets it over the day; asking again on
     // every load only adds to the count, so the file is skipped for a few hours.
     private val gdriveQuotaUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
