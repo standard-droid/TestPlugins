@@ -1116,7 +1116,45 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         return list
     }
 
+    // v33: one run per episode at a time. CloudStream calls loadLinks twice for the same
+    // episode ~0.5s apart (preload + open); the device logs (2026-09-26) show both calls doing
+    // everything — two WebView sniffs per Sistenn source, two Drive resolves (each one counting
+    // against the file's download quota), two Beta size estimates. The second call now joins
+    // the first: it gets every link found so far at once, then the rest as they arrive.
+    private class LinkRun {
+        val links = ArrayList<ExtractorLink>()
+        val subscribers = ArrayList<(ExtractorLink) -> Unit>()
+        // null = the run was cancelled before finishing (a joined caller then runs its own)
+        val done = kotlinx.coroutines.CompletableDeferred<Boolean?>()
+    }
+    private val linkRuns = java.util.concurrent.ConcurrentHashMap<String, LinkRun>()
+
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+        val mine = LinkRun()
+        val running = linkRuns.putIfAbsent(data, mine)
+        if (running != null) {
+            val replay = synchronized(running) { running.subscribers.add(callback); running.links.toList() }
+            log("loadLinks: $data is already loading — joining that run (${replay.size} link(s) so far)")
+            replay.forEach(callback)
+            val result = try { running.done.await() } finally { synchronized(running) { running.subscribers.remove(callback) } }
+            if (result != null) return result
+            log("loadLinks: the run it joined was cancelled — loading again")
+            return loadLinks(data, isCasting, subtitleCallback, callback)
+        }
+        synchronized(mine) { mine.subscribers.add(callback) }
+        val fanOut: (ExtractorLink) -> Unit = { link ->
+            val subs = synchronized(mine) { mine.links.add(link); mine.subscribers.toList() }
+            subs.forEach { it(link) }
+        }
+        return try {
+            loadLinksWork(data, isCasting, subtitleCallback, fanOut).also { mine.done.complete(it) }
+        } finally {
+            linkRuns.remove(data, mine)
+            mine.done.complete(null) // no-op if already completed with a result
+        }
+    }
+
+    private suspend fun loadLinksWork(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         log("loadLinks: $data")
         // v9: tell a real "reload links" apart from the app's own double call.
         // CloudStream calls loadLinks again a second or two after the first (preload, then
@@ -1529,6 +1567,14 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         return System.currentTimeMillis() < until
     }
 
+    /** v33: the page itself is down (5xx / DNS): no point loading it again for a while. */
+    private fun parkSniffHost(url: String, why: String) {
+        val host = try { java.net.URI(url).host ?: return } catch (_: Exception) { return }
+        sniffHostFails[host] = 2
+        sniffHostBlockedUntil[host] = System.currentTimeMillis() + sniffHostCooldownMs
+        log("sniff: $host is down ($why) — parked for ${sniffHostCooldownMs / 60000} min")
+    }
+
     private fun noteSniffResult(url: String, ok: Boolean) {
         val host = try { java.net.URI(url).host ?: return } catch (_: Exception) { return }
         if (ok) { sniffHostFails.remove(host); sniffHostBlockedUntil.remove(host); return }
@@ -1906,6 +1952,11 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         val h = request?.url?.host ?: return
                         if (isAdHost(h)) return
                         diag("sniff: request failed ${h}${request.url?.path?.take(50) ?: ""}: ${error?.errorCode} ${error?.description}")
+                        // v33: the player page itself did not load (DNS, refused, timeout): stop now.
+                        if (request.isForMainFrame && !done && h.equals(pageHost, true)) {
+                            parkSniffHost(pageUrl, "${error?.description}")
+                            handler.post { finish(null) }
+                        }
                     }
 
                     override fun onReceivedHttpError(view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?) {
@@ -1913,6 +1964,14 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         val h = request?.url?.host ?: return
                         if (isAdHost(h)) return
                         diag("sniff: http ${errorResponse?.statusCode} for ${h}${request.url?.path?.take(50) ?: ""}")
+                        // v33: the player page itself answered 5xx (rpmvid/strp2p: 530 + Cloudflare
+                        // "Error 1016", device logs 2026-09-26). Each of those used to sit out the
+                        // whole 24s budget before giving up.
+                        val code = errorResponse?.statusCode ?: 0
+                        if (request.isForMainFrame && code >= 500 && !done && h.equals(pageHost, true)) {
+                            parkSniffHost(pageUrl, "http $code")
+                            handler.post { finish(null) }
+                        }
                     }
 
                     override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
@@ -2038,7 +2097,12 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 if (skip) log("step4: skipping sniff for $label (${if (overBudget) "episode sniff budget spent" else "host on cooldown"})")
                 val sniffed = cached ?: if (skip) null else try {
                     val t0 = System.currentTimeMillis()
-                    sniffGate.withPermit { sniffHlsViaWebView(exUrl, "$mainUrl/") }
+                    sniffGate.withPermit {
+                        // v33: another source (or load) may have sniffed this page while we waited.
+                        sniffCache[exUrl]?.takeIf { System.currentTimeMillis() - it.second < sniffCacheTtlMs }?.first
+                            ?.also { log("step4: $label was sniffed meanwhile — reusing it") }
+                            ?: sniffHlsViaWebView(exUrl, "$mainUrl/")
+                    }
                         .also {
                             sniffSpentThisLoad += System.currentTimeMillis() - t0
                             noteSniffResult(exUrl, it != null)
@@ -2275,11 +2339,17 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         if (embed.startsWith("gd:")) {
             val fileId = embed.removePrefix("gd:")
             log("gdrive: fileId=$fileId for $label")
+            gdriveQuotaUntil[fileId]?.let { until ->
+                if (System.currentTimeMillis() < until) {
+                    log("gdrive: $fileId hit its download quota recently — not asking Google again for ${(until - System.currentTimeMillis()) / 60000} min")
+                    return false
+                }
+            }
             val resolved = try {
                 gdriveGate.withPermit { resolveGDrive(fileId) }
             } catch (e: kotlinx.coroutines.CancellationException) { throw e }
               catch (e: Exception) { log("gdrive: resolve error: ${e.message}"); null }
-            if (resolved != null && !gdriveReusable(resolved)) return false
+            if (resolved != null && !gdriveReusable(resolved, fileId)) return false
             if (resolved != null) {
                 val cleanLabel = cleanDisplayName(label)
                 val displayName = cleanLabel + formatSize(resolved.sizeBytes)
@@ -2854,7 +2924,12 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
      * byte 0, same headers) and only list it if that is still the file. Logs what Google sent
      * otherwise, which says whether the confirm/uuid link is single-use, quota-limited, etc.
      */
-    private suspend fun gdriveReusable(res: GDriveResolution): Boolean {
+    // v33: files whose download quota ran out. Google resets it over the day; asking again on
+    // every load only adds to the count, so the file is skipped for a few hours.
+    private val gdriveQuotaUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val gdriveQuotaBackoffMs = 3 * 60 * 60 * 1000L
+
+    private suspend fun gdriveReusable(res: GDriveResolution, fileId: String): Boolean {
         return try {
             val r = app.get(res.url, headers = res.headers + mapOf("Range" to "bytes=0-"), timeout = 15)
             val ct = r.headers["Content-Type"] ?: "?"
@@ -2865,6 +2940,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 val page = String(head, Charsets.UTF_8)
                 val title = Regex("<title>([^<]*)", RegexOption.IGNORE_CASE).find(page)?.groupValues?.get(1)?.trim()
                 logW("gdrive: resolved link is not reusable — second request got http ${r.code}, $ct, title='${title ?: "-"}': ${page.replace(Regex("\\s+"), " ").take(160)}")
+                if (title?.contains("quota", ignoreCase = true) == true || page.contains("Quota exceeded", ignoreCase = true))
+                    gdriveQuotaUntil[fileId] = System.currentTimeMillis() + gdriveQuotaBackoffMs
                 false
             } else {
                 log("gdrive: second request ok (http ${r.code}, $ct, ${r.headers["Content-Range"] ?: r.headers["Content-Length"] ?: "?"}, " +
