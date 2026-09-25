@@ -1405,6 +1405,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // v35: every segment (path only) the page's player fetched, per master.
     private val sniffedSegmentSets = java.util.concurrent.ConcurrentHashMap<String, MutableSet<String>>()
     private val variantTagRe = Regex("""index-(f\d+[^/.?]*)""")
+    // v35: the page's token refresh URL, per player page (exUrl).
+    private val sniffedRefreshUrls = java.util.concurrent.ConcurrentHashMap<String, String>()
     // v33: playlist texts fetched by the sniff page itself (the WebView's network stack), keyed
     // by URL without query. The device log (2026-09-26) had shky.stellarwebconcepts.store answer
     // the page's player in 0.2s but time out on every request from the app's HTTP client, so
@@ -1748,9 +1750,12 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 // IntersectionObserver never fires and a lazy player never loads its source.
                 try {
                     wv.measure(
-                        View.MeasureSpec.makeMeasureSpec(1280, View.MeasureSpec.EXACTLY),
-                        View.MeasureSpec.makeMeasureSpec(720, View.MeasureSpec.EXACTLY))
-                    wv.layout(0, 0, 1280, 720)
+                        // v35: 1920x1080, not 1280x720. The page reports its size to /api/v1/video
+                        // (w=,h=) and its player caps quality at the element size, so at 720 it never
+                        // tried 1080p — which the variant filter would then read as "1080p broken".
+                        View.MeasureSpec.makeMeasureSpec(1920, View.MeasureSpec.EXACTLY),
+                        View.MeasureSpec.makeMeasureSpec(1080, View.MeasureSpec.EXACTLY))
+                    wv.layout(0, 0, 1920, 1080)
                 } catch (_: Throwable) {}
                 // v21: actually attach it to the window. A detached WebView never gets vsync, so
                 // requestAnimationFrame never fires and timers are throttled — enough to stall a
@@ -1767,7 +1772,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         wv.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
                         // v24: our own synthetic taps (see realTap) pass; real touches don't.
                         wv.setOnTouchListener { _, _ -> !syntheticTouch }
-                        content.addView(wv, 0, android.widget.FrameLayout.LayoutParams(1280, 720))
+                        content.addView(wv, 0, android.widget.FrameLayout.LayoutParams(1920, 1080))
                         attachedTo = content
                     }
                 } catch (e: Throwable) { log("sniff: could not attach webview: ${e.message}") }
@@ -1961,6 +1966,11 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         // The flags drive the early give-up in onPageFinished.
                         if (u.contains("/api/v1/info")) infoLogged.set(true)
                         if (u.contains("/api/v1/video")) { videoAsked.set(true); log("sniff: page asked for the video: ${url.substringBefore('?').takeLast(60)}") }
+                        // v35: the page's token refresh (window.__refreshPlayToken → /api/v1/player?t=…, every
+                        // ~10s; answers {k, kx=now+1800}). Its t stays valid for hours without cookies, so
+                        // the local server can renew the stream token itself mid-playback.
+                        if (u.contains("/api/v1/player?t=") && sniffedRefreshUrls.put(pageUrl, url) == null)
+                            log("sniff: captured the token refresh call (${url.substringBefore('?').takeLast(40)}, t=${url.substringAfter("t=").length} chars)")
                         // v22: a host the WebView refused on TLS goes through the app's client.
                         if (host in sslBadHosts && request.method.equals("GET", true))
                             return proxyViaApp(request) { diag(it) }
@@ -2271,8 +2281,16 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         // rewritten copy of each variant from 127.0.0.1 in which every segment is an
                         // absolute URL carrying the token; the segments themselves still come
                         // straight from the stream host.
+                        // v35: with the page's refresh call known, segments are served as redirects that carry a
+                        // token the local server keeps fresh (the one in the playlist expires 30 min after the sniff).
+                        val tokenState = if (tokenQuery.isNotEmpty() && !hlsmod) sniffedRefreshUrls[exUrl]?.let { ru ->
+                            LocalHlsServer.TokenState(tokenQuery, ru, mapOf("User-Agent" to ua, "Accept" to "*/*",
+                                "Referer" to (try { java.net.URI(ru).let { "${it.scheme}://${it.host}/" } } catch (_: Exception) { "$origin/" })))
+                        } else null
+                        if (tokenState != null) log("sniff: token will be renewed through the page's refresh call when it nears expiry")
                         val proxied = if (useProxy && variants.isNotEmpty())
-                            variants.mapNotNull { v -> localHls.register(v.url, tokenQuery, linkHeaders, sniffedPlaylistTexts[v.url.substringBefore('?')], stripSegments = hlsmod)?.let { v to it } } else emptyList()
+                            variants.mapNotNull { v -> localHls.register(v.url, tokenQuery, linkHeaders, sniffedPlaylistTexts[v.url.substringBefore('?')],
+                                stripSegments = hlsmod, token = tokenState)?.let { v to it } } else emptyList()
                         if (proxied.isNotEmpty()) log("sniff: serving ${proxied.size} tokenised playlist(s) via ${proxied.first().second.substringBeforeLast('/')}, " +
                             "${variants.count { sniffedPlaylistTexts.containsKey(it.url.substringBefore('?')) }} from the page's own fetch")
                         found = if (proxied.isNotEmpty()) {
@@ -3199,19 +3217,50 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
  */
 internal class LocalHlsServer(private val log: (String) -> Unit) {
     private data class Entry(val url: String, val query: String, val headers: Map<String, String>, val created: Long,
-                             val cached: String? = null, val strip: Boolean = false)
+                             val cached: String? = null, val strip: Boolean = false, val token: TokenState? = null)
+
+    /** v35: a stream token shared by all qualities of one stream, renewed via the page's refresh URL. */
+    class TokenState(initialQuery: String, val refreshUrl: String, val headers: Map<String, String>) {
+        @Volatile var query: String = initialQuery
+        @Volatile var expiresAtMs: Long = expiry(initialQuery)
+        @Volatile var lastTryMs: Long = 0L
+        companion object {
+            fun expiry(q: String): Long = Regex("""(?:^|&)kx=(\d{9,13})""").find(q)?.groupValues?.get(1)?.toLongOrNull()
+                ?.let { if (it < 100_000_000_000L) it * 1000 else it } ?: (System.currentTimeMillis() + 25 * 60_000L)
+        }
+    }
+
+    /** Renew the token if it expires within 5 min (at most one attempt per 30 s). */
+    private fun ensureFresh(t: TokenState) {
+        val now = System.currentTimeMillis()
+        if (t.expiresAtMs - now > 5 * 60_000L) return
+        synchronized(t) {
+            if (t.expiresAtMs - System.currentTimeMillis() > 5 * 60_000L || now - t.lastTryMs < 30_000L) return
+            t.lastTryMs = now
+            try {
+                val r = kotlinx.coroutines.runBlocking { app.get(t.refreshUrl, headers = t.headers, timeout = 10L) }
+                val o = org.json.JSONObject(r.text)
+                val k = o.optString("k"); val kx = o.optLong("kx")
+                if (r.code in 200..299 && k.isNotBlank() && kx > 0) {
+                    t.query = "k=$k&kx=$kx"; t.expiresAtMs = TokenState.expiry(t.query)
+                    log("hls-proxy: stream token renewed, valid ${(t.expiresAtMs - System.currentTimeMillis()) / 60000} more min")
+                } else log("hls-proxy: token refresh answered http ${r.code}: ${r.text.take(120)}")
+            } catch (e: Exception) { log("hls-proxy: token refresh failed: ${e.message?.take(80)}") }
+        }
+    }
     private val entries = java.util.concurrent.ConcurrentHashMap<String, Entry>()
     @Volatile private var socket: java.net.ServerSocket? = null
     private val uriAttrRe = Regex("""URI="([^"]+)"""")
     private val entryTtlMs = 6 * 60 * 60 * 1000L
 
     /** Returns the local URL for this playlist, or null if the server could not start. */
-    fun register(url: String, query: String, headers: Map<String, String>, cachedText: String? = null, stripSegments: Boolean = false): String? {
+    fun register(url: String, query: String, headers: Map<String, String>, cachedText: String? = null, stripSegments: Boolean = false,
+                 token: TokenState? = null): String? {
         val port = ensureStarted() ?: return null
         val now = System.currentTimeMillis()
         entries.entries.removeAll { now - it.value.created > entryTtlMs }
         val key = java.util.UUID.randomUUID().toString().replace("-", "").take(16)
-        entries[key] = Entry(url, query, headers, now, cachedText?.takeIf { it.trimStart().startsWith("#EXTM3U") }, stripSegments)
+        entries[key] = Entry(url, query, headers, now, cachedText?.takeIf { it.trimStart().startsWith("#EXTM3U") }, stripSegments, token)
         return "http://127.0.0.1:$port/hls/$key.m3u8"
     }
 
@@ -3256,6 +3305,14 @@ internal class LocalHlsServer(private val log: (String) -> Unit) {
                 if (isSeg) {
                     val segUrl = try { java.net.URLDecoder.decode(target.substringAfter("?u=", ""), "UTF-8") } catch (_: Exception) { "" }
                     if (!segUrl.startsWith("http")) { reply(400, "Bad Request", ByteArray(0), "text/plain"); return }
+                    // v35: tokenised streams: send the player straight to the host with the current token.
+                    entry.token?.takeIf { !entry.strip }?.let { t ->
+                        ensureFresh(t)
+                        val loc = segUrl.substringBefore('?') + "?" + t.query
+                        out.write(("HTTP/1.1 302 Found\r\nLocation: $loc\r\nContent-Length: 0\r\nCache-Control: no-store\r\n" +
+                            "Connection: close\r\n\r\n").toByteArray(Charsets.ISO_8859_1))
+                        out.flush(); return
+                    }
                     val r = try { kotlinx.coroutines.runBlocking { app.get(segUrl, headers = entry.headers, timeout = 20L) } } catch (e: Exception) { null }
                     val bytes = try { r?.okhttpResponse?.body?.bytes() } catch (_: Exception) { null }
                     if (r == null || r.code !in 200..299 || bytes == null) {
@@ -3316,9 +3373,12 @@ internal class LocalHlsServer(private val log: (String) -> Unit) {
         val line = raw.trimEnd('\r')
         when {
             line.isBlank() -> line
+            line.startsWith("#") && entry.token != null && !entry.strip -> uriAttrRe.replace(line) { m ->
+                "URI=\"http://127.0.0.1:$port/seg/$key?u=" + java.net.URLEncoder.encode(tokenised(m.groupValues[1], entry), "UTF-8") + "\"" }
             line.startsWith("#") -> uriAttrRe.replace(line) { m -> "URI=\"${tokenised(m.groupValues[1], entry)}\"" }
-            // v35: disguised segments come back through here to be cut down to the real media.
-            entry.strip -> "http://127.0.0.1:$port/seg/$key?u=" + java.net.URLEncoder.encode(tokenised(line, entry), "UTF-8")
+            // v35: disguised segments come back through here to be cut down to the real media;
+            // tokenised ones come back to be redirected with a fresh token.
+            entry.strip || entry.token != null -> "http://127.0.0.1:$port/seg/$key?u=" + java.net.URLEncoder.encode(tokenised(line, entry), "UTF-8")
             else -> tokenised(line, entry)
         }
     }
