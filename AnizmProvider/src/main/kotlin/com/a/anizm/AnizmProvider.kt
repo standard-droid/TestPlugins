@@ -152,7 +152,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // had no size, a different name too. CloudStream treats that as a new link. Caching the
     // signed URL (until shortly before it expires) and the size estimate per stream makes a
     // repeat load emit byte-identical links, which the app de-duplicates.
-    private data class AincradSource(val videoSource: String, val securedLink: String, val validUntil: Long)
+    private data class AincradSource(val videoSource: String, val securedLink: String, val validUntil: Long, val cookie: String = "")
     private val aincradCache = java.util.concurrent.ConcurrentHashMap<String, AincradSource>()
     private val expiresParamRe = Regex("""[?&]expires=(\d{9,13})""")
     private val sizeCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Map<Int, Long>, Long>>()
@@ -2092,17 +2092,24 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             val cachedSource = aincradCache[hash]?.takeIf { it.validUntil > now }
             val videoSource: String
             val securedLink: String
+            // v32: the player's session cookies. The device log (2026-09-26) had master.txt
+            // answer this client with 200 "security error" while the browser, which sends the
+            // cookies the player page and getVideo set, got the playlist. The app's HTTP client
+            // keeps no cookie jar, so they are carried by hand, to getVideo and onto the link.
+            val cookieJar = LinkedHashMap<String, String>()
             if (cachedSource != null) {
                 videoSource = cachedSource.videoSource; securedLink = cachedSource.securedLink
+                cachedSource.cookie.split("; ").filter { '=' in it }.forEach { cookieJar[it.substringBefore('=')] = it.substringAfter('=') }
                 log("aincrad: reusing signed URL for $apBase $hash (${(cachedSource.validUntil - now) / 1000}s left)")
             } else {
-                try { app.get(playerRef, headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/"), timeout = 8) }
+                try { app.get(playerRef, headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/"), timeout = 8).cookies.let { cookieJar.putAll(it) } }
                 catch (e: kotlinx.coroutines.CancellationException) { throw e }
                 catch (_: Exception) {}
                 // 4.0: FirePlayer's own call is $.ajax POST with data {hash: ID, r: document.referrer}.
                 val streamResp = try {
-                    app.post("$apBase/player/index.php?data=$hash&do=getVideo", headers = aHeaders,
-                        data = mapOf("hash" to hash, "r" to "$mainUrl/"), timeout = 10)
+                    app.post("$apBase/player/index.php?data=$hash&do=getVideo",
+                        headers = aHeaders + (if (cookieJar.isEmpty()) emptyMap() else mapOf("Cookie" to cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" })),
+                        data = mapOf("hash" to hash, "r" to "$mainUrl/"), timeout = 10).also { cookieJar.putAll(it.cookies) }
                 } catch (e: kotlinx.coroutines.CancellationException) { throw e }
                   catch (e: Exception) { log("aincrad error: ${e.javaClass.simpleName}: ${e.message}"); return false }
                 val streamText = streamResp.text
@@ -2115,28 +2122,34 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 }
                 securedLink = json.optString("securedLink", "")
                 videoSource = json.optString("videoSource", "")
-                log("aincrad: hls=${json.optBoolean("hls")} secured=${securedLink.isNotBlank()} source=${videoSource.isNotBlank()} same=${securedLink == videoSource} dl=${json.optJSONArray("downloadLinks")?.length() ?: 0}")
+                log("aincrad: hls=${json.optBoolean("hls")} secured=${securedLink.isNotBlank()} source=${videoSource.isNotBlank()} same=${securedLink == videoSource} dl=${json.optJSONArray("downloadLinks")?.length() ?: 0} " +
+                    "keys=${json.keys().asSequence().joinToString(",")} cookies=${cookieJar.keys.joinToString(",").ifEmpty { "none" }}")
                 if (videoSource.isBlank() && securedLink.isBlank())
                     log("aincrad: getVideo gave no link (http ${streamResp.code}), keys=${json.keys().asSequence().joinToString()}: ${streamText.replace(Regex("\\s+"), " ").take(200)}")
                 else log("aincrad: link ${videoSource.ifBlank { securedLink }.substringBefore('?').take(120)}")
                 // Valid until 2 min before the URL's own expiry (seconds or ms epoch), max 30 min;
                 // 10 min if the URL doesn't say.
-                val exp = expiresParamRe.find(videoSource.ifBlank { securedLink })?.groupValues?.get(1)?.toLongOrNull()
+                // v32: securedLink carries the expiry; videoSource (master.txt) has none since they split.
+                val exp = (expiresParamRe.find(securedLink) ?: expiresParamRe.find(videoSource))?.groupValues?.get(1)?.toLongOrNull()
                     ?.let { if (it < 100_000_000_000L) it * 1000 else it }
                 val until = minOf(exp?.minus(120_000) ?: (now + 10 * 60_000), now + 30 * 60_000)
                 if (until > now && (videoSource.isNotBlank() || securedLink.isNotBlank())) {
-                    aincradCache[hash] = AincradSource(videoSource, securedLink, until)
+                    aincradCache[hash] = AincradSource(videoSource, securedLink, until,
+                        cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" })
                     if (aincradCache.size > 200) aincradCache.entries.removeAll { it.value.validUntil <= now }
                 }
             }
             // Single entry per source, chosen by CONTENT, not by JSON field name — see git
             // history for the 3003 error this avoids. NOTE ON DOWNLOADS: split-audio masters
             // stream fine but CloudStream's downloader can't mux them (app limitation).
-            val hlsHeaders = mapOf("User-Agent" to ua, "Origin" to apBase, "Referer" to playerRef)
+            val hlsHeaders = mapOf("User-Agent" to ua, "Origin" to apBase, "Referer" to playerRef) +
+                (if (cookieJar.isEmpty()) emptyMap() else mapOf("Cookie" to cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" }))
 
             var resolved = false
-            // distinct(): on every sample checked, videoSource == securedLink.
-            for (cand in listOf(videoSource, securedLink).filter { it.isNotBlank() }.distinct()) {
+            // v32: securedLink first. Until 2026-09 both fields held the same URL; now videoSource
+            // is a bare master.txt behind a session check ("security error"), and securedLink is
+            // the md5/expires-signed master.m3u8, which carries its own authorisation.
+            for (cand in listOf(securedLink, videoSource).filter { it.isNotBlank() }.distinct()) {
                 if (resolved) break
                 val head = try {
                     app.get(cand, headers = hlsHeaders + mapOf("Range" to "bytes=0-4095"), timeout = 8)
@@ -2169,8 +2182,11 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                             resolved = emitVariants(variants, cleanLabel, playerRef, hlsHeaders, callback, "aincrad", "ap:$hash")
                         }
                     }
-                    t.startsWith("<") || t.contains("<html", ignoreCase = true) || t.isBlank() || head.code !in 200..299 ->
-                        log("aincrad: candidate unusable (http ${head.code}): ${t.replace(Regex("\\s+"), " ").take(160)}")
+                    // v32: only a real media answer becomes a VIDEO link. A 14-byte text/html
+                    // "security error" used to land in the else branch and was listed as a video,
+                    // which ExoPlayer then failed on (UnrecognizedInputFormat, 3003).
+                    !looksLikeMedia(head, t) ->
+                        log("aincrad: candidate unusable (http ${head.code}, ${head.headers["Content-Type"]}): ${t.replace(Regex("\\s+"), " ").take(160)}")
                     else -> {
                         val cleanLabel = cleanDisplayName(label)
                         val sizeBytes = parseContentRangeTotal(head.headers)
@@ -2190,6 +2206,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 gdriveGate.withPermit { resolveGDrive(fileId) }
             } catch (e: kotlinx.coroutines.CancellationException) { throw e }
               catch (e: Exception) { log("gdrive: resolve error: ${e.message}"); null }
+            if (resolved != null && !gdriveReusable(resolved)) return false
             if (resolved != null) {
                 val cleanLabel = cleanDisplayName(label)
                 val displayName = cleanLabel + formatSize(resolved.sizeBytes)
@@ -2225,6 +2242,16 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         }
 
         return false
+    }
+
+    /** v32: a 2xx answer that is actually media (by type, or binary content), not an error text. */
+    private fun looksLikeMedia(r: NiceResponse, text: String): Boolean {
+        if (r.code !in 200..299 || text.isBlank()) return false
+        val ct = (r.headers["Content-Type"] ?: "").lowercase()
+        if (ct.startsWith("video/") || ct.startsWith("audio/") || ct.contains("octet-stream") || ct.contains("mp2t")) return true
+        if (ct.startsWith("text/") || ct.contains("json") || ct.contains("html") || ct.contains("xml")) return false
+        // No usable type: binary content (control bytes in the first 64 chars) counts as media.
+        return text.take(64).count { it.code < 9 || (it.code in 14..31) || it == '\uFFFD' } > 4
     }
 
     // ── HLS helpers (4.0) ────────────────────────────────────────────────────
@@ -2739,6 +2766,34 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         return GDriveResolution(r.url, headers, size, height)
     }
     private fun isHtml(r: NiceResponse) = (r.headers["Content-Type"] ?: "").contains("text/html", ignoreCase = true)
+
+    /**
+     * v32: the device log (2026-09-26) had a Drive link resolve fine here (form submit ->
+     * 830MB, 1080p) and then fail in ExoPlayer 22s later with UnrecognizedInputFormat, i.e. the
+     * same URL no longer returned the video. Ask for it once more the way the player will (from
+     * byte 0, same headers) and only list it if that is still the file. Logs what Google sent
+     * otherwise, which says whether the confirm/uuid link is single-use, quota-limited, etc.
+     */
+    private suspend fun gdriveReusable(res: GDriveResolution): Boolean {
+        return try {
+            val r = app.get(res.url, headers = res.headers + mapOf("Range" to "bytes=0-"), timeout = 15)
+            val ct = r.headers["Content-Type"] ?: "?"
+            val head = try { r.okhttpResponse.body?.byteStream()?.use { s -> ByteArray(512).let { b -> b.copyOf(s.read(b).coerceAtLeast(0)) } } } catch (_: Exception) { null } ?: ByteArray(0)
+            try { r.okhttpResponse.close() } catch (_: Exception) {}
+            val html = ct.contains("text/html", true) || String(head, Charsets.ISO_8859_1).trimStart().startsWith("<")
+            if (html || r.code !in 200..299) {
+                val page = String(head, Charsets.UTF_8)
+                val title = Regex("<title>([^<]*)", RegexOption.IGNORE_CASE).find(page)?.groupValues?.get(1)?.trim()
+                logW("gdrive: resolved link is not reusable — second request got http ${r.code}, $ct, title='${title ?: "-"}': ${page.replace(Regex("\\s+"), " ").take(160)}")
+                false
+            } else {
+                log("gdrive: second request ok (http ${r.code}, $ct, ${r.headers["Content-Range"] ?: r.headers["Content-Length"] ?: "?"}, " +
+                    "magic ${head.take(8).joinToString("") { "%02x".format(it) }})")
+                true
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Exception) { log("gdrive: second request failed (${e.message}), listing the link anyway"); true }
+    }
 
     private suspend fun resolveGDrive(fileId: String): GDriveResolution? {
         // 64KB: covers Google's whole interstitial page (confirm/uuid sit well past 2KB), and
