@@ -392,6 +392,15 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // read and classified. No WebView, no iframe injection, no loading the host's embed
     // page just to learn its URL, and no per-id 1.5s timeouts. Parallel (3 at a time).
     private val playerBaseLock = Any()
+    // v31: the domain each "ap:" hash was found on. apRe accepts any *player* host with a
+    // /video/<hex> path (FirePlayer clones included), but every ap: source used to be sent to
+    // the one global playerBase — whichever such host was seen last. An episode with Aincrad
+    // plus another FirePlayer host then asked the wrong server for half its getVideo calls.
+    private val apDomains = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private fun noteApDomain(hash: String, domain: String) {
+        apDomains[hash] = domain
+        if (apDomains.size > 400) apDomains.clear() // lookups fall back to playerBase
+    }
 
     private fun classifyEmbedUrl(url: String): String? {
         val host = try { java.net.URI(url).host ?: "" } catch (_: Exception) { "" }
@@ -402,6 +411,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             synchronized(playerBaseLock) {
                 if (!playerBase.contains(domain.substringAfter("://"))) { playerBase = domain; log("resolve: player domain updated to $domain") }
             }
+            noteApDomain(m.groupValues[2], domain)
             return "ap:${m.groupValues[2]}"
         }
         gdRe.find(url)?.let { return "gd:${it.groupValues[1]}" }
@@ -726,6 +736,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                                         playerBase = domain; log("resolve: player domain updated to $domain")
                                     }
                                 }
+                                noteApDomain(m.groupValues[2], domain)
                                 if (seenEmbeds.add(m.groupValues[2]))
                                     handler.post { handleDetectedEmbed("ap:${m.groupValues[2]}") }
                                 return emptyResponse()
@@ -2072,24 +2083,25 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             // The old warm-up hit $playerBase/player/{hash}, which is a 404 on
             // anizmplayer.com (verified), so every Aincrad play started with a request
             // no browser ever makes, and then used that 404 URL as the Referer.
-            val playerRef = "$playerBase/video/$hash"
+            val apBase = apDomains[hash] ?: playerBase
+            val playerRef = "$apBase/video/$hash"
             val aHeaders = mapOf("User-Agent" to ua,
                 "X-Requested-With" to "XMLHttpRequest", "Accept" to "*/*",
-                "Referer" to playerRef, "Origin" to playerBase)
+                "Referer" to playerRef, "Origin" to apBase)
             val now = System.currentTimeMillis()
             val cachedSource = aincradCache[hash]?.takeIf { it.validUntil > now }
             val videoSource: String
             val securedLink: String
             if (cachedSource != null) {
                 videoSource = cachedSource.videoSource; securedLink = cachedSource.securedLink
-                log("aincrad: reusing signed URL for $hash (${(cachedSource.validUntil - now) / 1000}s left)")
+                log("aincrad: reusing signed URL for $apBase $hash (${(cachedSource.validUntil - now) / 1000}s left)")
             } else {
                 try { app.get(playerRef, headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/"), timeout = 8) }
                 catch (e: kotlinx.coroutines.CancellationException) { throw e }
                 catch (_: Exception) {}
                 // 4.0: FirePlayer's own call is $.ajax POST with data {hash: ID, r: document.referrer}.
                 val streamResp = try {
-                    app.post("$playerBase/player/index.php?data=$hash&do=getVideo", headers = aHeaders,
+                    app.post("$apBase/player/index.php?data=$hash&do=getVideo", headers = aHeaders,
                         data = mapOf("hash" to hash, "r" to "$mainUrl/"), timeout = 10)
                 } catch (e: kotlinx.coroutines.CancellationException) { throw e }
                   catch (e: Exception) { log("aincrad error: ${e.javaClass.simpleName}: ${e.message}"); return false }
@@ -2120,7 +2132,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             // Single entry per source, chosen by CONTENT, not by JSON field name — see git
             // history for the 3003 error this avoids. NOTE ON DOWNLOADS: split-audio masters
             // stream fine but CloudStream's downloader can't mux them (app limitation).
-            val hlsHeaders = mapOf("User-Agent" to ua, "Origin" to playerBase, "Referer" to playerRef)
+            val hlsHeaders = mapOf("User-Agent" to ua, "Origin" to apBase, "Referer" to playerRef)
 
             var resolved = false
             // distinct(): on every sample checked, videoSource == securedLink.

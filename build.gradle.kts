@@ -1,4 +1,4 @@
-import com.android.build.gradle.BaseExtension
+import com.android.build.api.dsl.LibraryExtension
 import com.lagradost.cloudstream3.gradle.CloudstreamExtension
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
@@ -12,7 +12,9 @@ buildscript {
     }
 
     dependencies {
-        classpath("com.android.tools.build:gradle:8.7.3")
+        // 2026-09-25: build setup aligned with SaurabhKaperwan/CSX (AGP 9.1.0, Gradle 9.3.1,
+        // Kotlin 2.3.20, plugin 81b1d424d2), a large extension repo that builds with it daily.
+        classpath("com.android.tools.build:gradle:9.1.0")
         // Cloudstream gradle plugin which makes everything work and builds plugins
         // POSTMORTEM: this was pinned to a specific commit (32895aedb6) to survive
         // upstream API breaks (Plugin->BasePlugin, AcraApplication removal did exactly
@@ -23,8 +25,15 @@ buildscript {
         // doesn't publish). Floating SNAPSHOT it is — the weekly Monday cron build below
         // exists specifically to catch upstream breaks on our own schedule instead of
         // silently, so this is the more durable choice of two imperfect options.
-        classpath("com.github.recloudstream:gradle:-SNAPSHOT")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0")
+        // UPDATE 2026-09-25: SNAPSHOT broke the same way. It resolves to upstream HEAD,
+        // which is that same 32895aedb6 (2026-07-02, "Update dependencies": Kotlin 2.4.0,
+        // sdk-common 32.1.1), and JitPack stopped serving it again ("Could not find
+        // ...:gradle:-SNAPSHOT", pom gradle--32895aedb6-1). Pinned to 81b1d424d2 (2026-04-20,
+        // "Add full configuration cache support"), the commit just before that update and the
+        // one SaurabhKaperwan/CSX pins, which keeps its JitPack build in regular use. It has
+        // AGP 9 support.
+        classpath("com.github.recloudstream:gradle:81b1d424d2")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.20")
     }
 }
 
@@ -38,11 +47,13 @@ allprojects {
 
 fun Project.cloudstream(configuration: CloudstreamExtension.() -> Unit) = extensions.getByName<CloudstreamExtension>("cloudstream").configuration()
 
-fun Project.android(configuration: BaseExtension.() -> Unit) = extensions.getByName<BaseExtension>("android").configuration()
+// AGP 9 removed BaseExtension; library modules are configured through LibraryExtension.
+fun Project.android(configuration: LibraryExtension.() -> Unit) = extensions.getByName<LibraryExtension>("android").configuration()
 
 subprojects {
     apply(plugin = "com.android.library")
-    apply(plugin = "kotlin-android")
+    // No "kotlin-android": AGP 9 compiles Kotlin itself (built-in Kotlin), and applying
+    // the separate plugin on top of it is an error.
     apply(plugin = "com.lagradost.cloudstream3.gradle")
 
     cloudstream {
@@ -58,28 +69,27 @@ subprojects {
         // so this can never collide and needs no manual upkeep when a new module is added.
         namespace = "com.a.${project.name.lowercase()}"
 
+        compileSdk = 36
         defaultConfig {
             minSdk = 21
-            compileSdkVersion(35)
-            targetSdk = 35
         }
 
         compileOptions {
             sourceCompatibility = JavaVersion.VERSION_1_8
             targetCompatibility = JavaVersion.VERSION_1_8
         }
+    }
 
-        tasks.withType<KotlinJvmCompile> {
-            compilerOptions {
-                jvmTarget.set(JvmTarget.JVM_1_8) // Required
-                freeCompilerArgs.addAll(
-                    "-Xno-call-assertions",
-                    "-Xno-param-assertions",
-                    "-Xno-receiver-assertions",
-                    // From upstream PR #37: correct annotation defaults on Kotlin 2.x
-                    "-Xannotation-default-target=param-property"
-                )
-            }
+    tasks.withType<KotlinJvmCompile>().configureEach {
+        compilerOptions {
+            jvmTarget.set(JvmTarget.JVM_1_8) // Required
+            freeCompilerArgs.addAll(
+                "-Xno-call-assertions",
+                "-Xno-param-assertions",
+                "-Xno-receiver-assertions",
+                // From upstream PR #37: correct annotation defaults on Kotlin 2.x
+                "-Xannotation-default-target=param-property"
+            )
         }
     }
 
@@ -118,8 +128,8 @@ subprojects {
         // but you don't need to include any of them if you don't need them.
         // https://github.com/recloudstream/cloudstream/blob/master/app/build.gradle.kts
         implementation(kotlin("stdlib")) // Adds Standard Kotlin Features
-        implementation("com.github.Blatzar:NiceHttp:0.4.11") // HTTP Lib
-        implementation("org.jsoup:jsoup:1.18.3") // HTML Parser
+        implementation("com.github.Blatzar:NiceHttp:0.4.18") // HTTP Lib
+        implementation("org.jsoup:jsoup:1.22.2") // HTML Parser
         // IMPORTANT: Do not bump Jackson above 2.13.1, as newer versions will
         // break compatibility on older Android devices.
         // Jackson removed (3.3) — confirmed unused; both providers parse JSON with
@@ -127,6 +137,6 @@ subprojects {
     }
 }
 
-task<Delete>("clean") {
+tasks.register<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
 }
