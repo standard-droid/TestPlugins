@@ -23,6 +23,7 @@ import java.io.ByteArrayInputStream
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.runBlocking
@@ -2362,6 +2363,19 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         if (embed.startsWith("gd:")) {
             val fileId = embed.removePrefix("gd:")
             log("gdrive: fileId=$fileId for $label")
+            // v35: stream first, the way Drive's own embedded player does. The download route below
+            // hits the file's download quota ("Quota exceeded") long before the streaming one runs
+            // out; the website kept playing files the app could not (2026-09-26).
+            val streams = try { gdriveGate.withPermit { resolveGDriveStreams(fileId) } }
+                catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (e: Exception) { log("gdrive: stream lookup error: ${e.message}"); emptyList() }
+            if (streams.isNotEmpty()) {
+                val cleanLabel = cleanDisplayName(label)
+                for (st in streams) callback(newExtractorLink(source = cleanLabel, name = "$cleanLabel ${st.height}p" + formatSize(st.sizeBytes),
+                    url = st.url, type = ExtractorLinkType.VIDEO) {
+                    quality = st.height; referer = "https://drive.google.com/"; headers = mapOf("User-Agent" to ua) })
+                return true
+            }
             gdriveQuotaUntil[fileId]?.let { until ->
                 if (System.currentTimeMillis() < until) {
                     log("gdrive: $fileId hit its download quota recently — not asking Google again for ${(until - System.currentTimeMillis()) / 60000} min")
@@ -2947,6 +2961,82 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
      * byte 0, same headers) and only list it if that is still the file. Logs what Google sent
      * otherwise, which says whether the confirm/uuid link is single-use, quota-limited, etc.
      */
+    // ── Drive streaming (v35) ────────────────────────────────────────────────
+    // What drive.google.com/file/d/<id>/preview itself does (browser capture, 2026-09-26):
+    //   GET content-workspacevideo-pa.googleapis.com/v1/drive/media/<id>/playback?key=<AIza…>
+    // Cookie-free; 200 with mediaStreamingData.formatStreamingData.progressiveTranscodes =
+    // muxed MP4s (itag 18/22/37 → 360/720/1080p) on *.c.drive.google.com/videoplayback, valid
+    // 3 h and signed to the requesting IP (the phone, same as the player). Without key → 403;
+    // a file over its signed-out play limit → 429. The key is Drive's public web key: it is read
+    // from the preview page (every AIza… string there is tried once) and then remembered.
+    private data class DriveStream(val height: Int, val url: String, val sizeBytes: Long?)
+    @Volatile private var driveApiKey: String? = null
+    private val driveKeyRe = Regex("""AIza[0-9A-Za-z_\-]{35}""")
+    private val driveStreamCache = java.util.concurrent.ConcurrentHashMap<String, Pair<List<DriveStream>, Long>>()
+    private val driveStreamTtlMs = 2 * 60 * 60 * 1000L // links live 3 h
+    private val driveStreamQuotaUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    private suspend fun resolveGDriveStreams(fileId: String): List<DriveStream> {
+        val now = System.currentTimeMillis()
+        driveStreamCache[fileId]?.takeIf { now - it.second < driveStreamTtlMs }?.let { log("gdrive: reusing stream links for $fileId"); return it.first }
+        driveStreamQuotaUntil[fileId]?.takeIf { now < it }?.let { log("gdrive: $fileId is over its streaming limit (recently) — skipping the stream lookup"); return emptyList() }
+        val keys = driveApiKey?.let { listOf(it) } ?: run {
+            val html = try { app.get("https://drive.google.com/file/d/$fileId/preview", headers = mapOf("User-Agent" to ua,
+                "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"), timeout = 12L).text } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { "" }
+            driveKeyRe.findAll(html).map { it.value }.distinct().toList().also { log("gdrive: preview page has ${it.size} API key candidate(s)") }
+        }
+        if (keys.isEmpty()) return emptyList()
+        val apiHeaders = mapOf("User-Agent" to ua, "Origin" to "https://drive.google.com", "Referer" to "https://drive.google.com/",
+            "Accept" to "*/*", "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7")
+        var body: String? = null
+        for (key in keys.take(6)) {
+            val r = try { app.get("https://content-workspacevideo-pa.googleapis.com/v1/drive/media/$fileId/playback?key=$key&auditContext=forDisplay",
+                headers = apiHeaders, timeout = 12L) } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (e: Exception) { log("gdrive: playback API error: ${e.message}"); return emptyList() }
+            when (r.code) {
+                200 -> { body = r.text; driveApiKey = key; break }
+                429 -> {
+                    log("gdrive: $fileId is over its streaming limit (429): ${r.text.replace(Regex("\\s+"), " ").take(120)}")
+                    driveStreamQuotaUntil[fileId] = now + 60 * 60 * 1000L
+                    return emptyList()
+                }
+                else -> {
+                    log("gdrive: playback API refused key #${keys.indexOf(key) + 1} (http ${r.code}): ${r.text.replace(Regex("\\s+"), " ").take(120)}")
+                    if (driveApiKey == key) driveApiKey = null
+                }
+            }
+        }
+        val json = body?.let { try { JSONObject(it) } catch (_: Exception) { null } } ?: return emptyList()
+        val progressive = json.optJSONObject("mediaStreamingData")?.optJSONObject("formatStreamingData")?.optJSONArray("progressiveTranscodes")
+            ?: run { log("gdrive: playback answer has no progressive formats (state=${json.optJSONObject("mediaStreamingData")?.optJSONObject("transcodeAvailabilityState")?.optString("state")})"); return emptyList() }
+        val found = (0 until progressive.length()).mapNotNull { i ->
+            val o = progressive.optJSONObject(i) ?: return@mapNotNull null
+            val url = o.optString("url").ifBlank { return@mapNotNull null }
+            val h = o.optJSONObject("transcodeMetadata")?.optInt("height", 0)?.takeIf { it > 0 } ?: return@mapNotNull null
+            h to url
+        }.distinctBy { it.first }.sortedByDescending { it.first }
+        // Check each link answers with media (one byte) and take its real size from Content-Range;
+        // the API's own contentLength for these is wrong (~400 KB for a 23-min file).
+        val checked = coroutineScope {
+            found.map { (h, url) ->
+                async {
+                    try {
+                        val r = app.get(url, headers = mapOf("User-Agent" to ua, "Range" to "bytes=0-0"), timeout = 10L)
+                        val size = r.headers["Content-Range"]?.substringAfterLast('/')?.trim()?.toLongOrNull()
+                        val ok = r.code == 206 || r.code == 200
+                        try { r.okhttpResponse.close() } catch (_: Exception) {}
+                        if (ok) DriveStream(h, url, size) else { log("gdrive: ${h}p stream answered http ${r.code}"); null }
+                    } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                    catch (e: Exception) { log("gdrive: ${h}p stream check failed: ${e.message}"); null }
+                }
+            }.mapNotNull { it.await() }
+        }
+        log("gdrive: streaming ${checked.joinToString { "${it.height}p" + formatSize(it.sizeBytes) }} for $fileId (of ${found.size} offered)")
+        if (checked.isNotEmpty()) driveStreamCache[fileId] = checked to now
+        if (driveStreamCache.size > 100) driveStreamCache.entries.removeAll { now - it.value.second > driveStreamTtlMs }
+        return checked
+    }
+
     // v33: files whose download quota ran out. Google resets it over the day; asking again on
     // every load only adds to the count, so the file is skipped for a few hours.
     private val gdriveQuotaUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
