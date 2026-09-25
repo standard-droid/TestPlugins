@@ -1930,6 +1930,10 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     ): Boolean {
         val label = "${vi.fansub} - ${vi.name.replace(adsRe, "").trim()}"
         log("step4: $label embed=$embed")
+        // v31: an Aincrad button that no longer lands on anizmplayer (apRe) means the site moved
+        // the player; it then silently goes down the generic extractor/sniff path instead.
+        if (settings.groupOf(vi.name).key == "aincrad" && !embed.startsWith("ap:"))
+            logW("site-change warning: Aincrad source ${vi.fansub}/${vi.name} resolved to $embed, not an anizmplayer /video/ link")
 
         if (embed.startsWith("ex:")) {
             val exUrl = embed.removePrefix("ex:")
@@ -2084,15 +2088,25 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 catch (e: kotlinx.coroutines.CancellationException) { throw e }
                 catch (_: Exception) {}
                 // 4.0: FirePlayer's own call is $.ajax POST with data {hash: ID, r: document.referrer}.
-                val streamText = try {
+                val streamResp = try {
                     app.post("$playerBase/player/index.php?data=$hash&do=getVideo", headers = aHeaders,
-                        data = mapOf("hash" to hash, "r" to "$mainUrl/"), timeout = 10).text
+                        data = mapOf("hash" to hash, "r" to "$mainUrl/"), timeout = 10)
                 } catch (e: kotlinx.coroutines.CancellationException) { throw e }
-                  catch (e: Exception) { log("aincrad error: ${e.message}"); return false }
-                val json = try { JSONObject(streamText) } catch (_: Exception) { return false }
+                  catch (e: Exception) { log("aincrad error: ${e.javaClass.simpleName}: ${e.message}"); return false }
+                val streamText = streamResp.text
+                // v31: these two exits used to be silent, so a changed answer from getVideo left
+                // nothing in the log but a missing source. Say what came back instead.
+                val json = try { JSONObject(streamText) } catch (_: Exception) {
+                    log("aincrad: getVideo not JSON (http ${streamResp.code}, ${streamResp.headers["Content-Type"]}, server=${streamResp.headers["server"]}, " +
+                        "cf-mitigated=${streamResp.headers["cf-mitigated"]}, final=${streamResp.url.take(80)}): ${streamText.replace(Regex("\\s+"), " ").take(200)}")
+                    return false
+                }
                 securedLink = json.optString("securedLink", "")
                 videoSource = json.optString("videoSource", "")
                 log("aincrad: hls=${json.optBoolean("hls")} secured=${securedLink.isNotBlank()} source=${videoSource.isNotBlank()} same=${securedLink == videoSource} dl=${json.optJSONArray("downloadLinks")?.length() ?: 0}")
+                if (videoSource.isBlank() && securedLink.isBlank())
+                    log("aincrad: getVideo gave no link (http ${streamResp.code}), keys=${json.keys().asSequence().joinToString()}: ${streamText.replace(Regex("\\s+"), " ").take(200)}")
+                else log("aincrad: link ${videoSource.ifBlank { securedLink }.substringBefore('?').take(120)}")
                 // Valid until 2 min before the URL's own expiry (seconds or ms epoch), max 30 min;
                 // 10 min if the URL doesn't say.
                 val exp = expiresParamRe.find(videoSource.ifBlank { securedLink })?.groupValues?.get(1)?.toLongOrNull()
@@ -2118,6 +2132,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                     throw e
                 } catch (e: Exception) { log("aincrad: probe failed: ${e.message}"); continue }
                 val t = head.text.trimStart()
+                log("aincrad: probe http ${head.code}, ${head.headers["Content-Type"]}, ${t.length}B, starts '${t.take(24).replace('\n', ' ')}'")
                 when {
                     t.startsWith("#EXTM3U") -> {
                         val cleanLabel = cleanDisplayName(label)
@@ -2142,8 +2157,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                             resolved = emitVariants(variants, cleanLabel, playerRef, hlsHeaders, callback, "aincrad", "ap:$hash")
                         }
                     }
-                    t.startsWith("<") || t.contains("<html", ignoreCase = true) || t.isBlank() ->
-                        log("aincrad: candidate unusable, trying next")
+                    t.startsWith("<") || t.contains("<html", ignoreCase = true) || t.isBlank() || head.code !in 200..299 ->
+                        log("aincrad: candidate unusable (http ${head.code}): ${t.replace(Regex("\\s+"), " ").take(160)}")
                     else -> {
                         val cleanLabel = cleanDisplayName(label)
                         val sizeBytes = parseContentRangeTotal(head.headers)
@@ -2189,7 +2204,12 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             if (!body.trimStart().startsWith("#EXTM3U")) { log("beta: master.txt not a valid playlist"); return false }
             val variants = parseVariants(body, masterUrl)
             if (variants.isEmpty()) { log("beta: no parseable variants in master.txt"); return false }
-            return emitVariants(variants, cleanDisplayName(label), watchRef, betaHeaders, callback, "beta", "bp:$hash")
+            log("beta: master lists ${variants.joinToString { "${it.height}p ${it.url.substringAfterLast('/').substringBefore('?').take(40)}${if (it.url.contains('?')) "?…" else ""}" }}")
+            return coroutineScope {
+                // v31 diagnostic (playback stops after 7–8 min): runs alongside the probes.
+                launch { describeMediaPlaylist(variants.first().url, betaHeaders, "beta") }
+                emitVariants(variants, cleanDisplayName(label), watchRef, betaHeaders, callback, "beta", "bp:$hash")
+            }
         }
 
         return false
@@ -2487,6 +2507,45 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             log("sniff: first segment ${segUrl.substringBefore('?').takeLast(50)} -> ${r.code}, $ct, $len")
         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
         catch (e: Exception) { log("sniff: segment probe failed: ${e.message}") }
+    }
+
+    /**
+     * v31 diagnostic: one line on how a media playlist is built — whether it is VOD (ENDLIST),
+     * where its segments live, and whether their URLs carry a query (a signed, expiring token
+     * would explain playback dying a few minutes in: ExoPlayer reads a VOD playlist once).
+     * Query parameter NAMES only; unix-time-looking values are shown as seconds from now.
+     */
+    private suspend fun describeMediaPlaylist(url: String, headers: Map<String, String>, tag: String) {
+        try {
+            val r = app.get(url, headers = headers, timeout = 8L)
+            val text = r.text
+            if (!text.trimStart().startsWith("#EXTM3U")) {
+                log("$tag: playlist ${url.substringAfterLast('/').substringBefore('?')} not readable (http ${r.code}): ${text.replace(Regex("\\s+"), " ").take(100)}")
+                return
+            }
+            val lines = text.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
+            val segs = lines.filter { !it.startsWith("#") }
+            val dur = lines.filter { it.startsWith("#EXTINF:") }.mapNotNull { extinfRe.find(it)?.groupValues?.get(1)?.toDoubleOrNull() }.sum()
+            val first = segs.firstOrNull()?.let { try { java.net.URI(url).resolve(it).toString() } catch (_: Exception) { it } }
+            val now = System.currentTimeMillis() / 1000
+            fun queryInfo(u: String?): String {
+                val q = u?.substringAfter('?', "")?.substringBefore('#').orEmpty()
+                if (q.isEmpty()) return "none"
+                return q.split('&').joinToString(",") { p ->
+                    val k = p.substringBefore('='); val v = p.substringAfter('=', "")
+                    val n = v.toLongOrNull()
+                    val t = n?.let { if (it > 100_000_000_000L) it / 1000 else it }
+                    if (t != null && t in 1_500_000_000L..4_000_000_000L) "$k(${t - now}s from now)" else k
+                }
+            }
+            log("$tag: playlist ${url.substringAfterLast('/').substringBefore('?')}: ${segs.size} segs, ${(dur / 60).toInt()}m${(dur % 60).toInt()}s, " +
+                "endlist=${text.contains("#EXT-X-ENDLIST")}, type=${lines.firstOrNull { it.startsWith("#EXT-X-PLAYLIST-TYPE") }?.substringAfter(':') ?: "-"}, " +
+                "key=${lines.firstOrNull { it.startsWith("#EXT-X-KEY") }?.take(60) ?: "-"}, map=${lines.any { it.startsWith("#EXT-X-MAP") }}, " +
+                "playlist query=${queryInfo(url)}, cache-control=${r.headers["Cache-Control"]}")
+            if (first != null) log("$tag: first segment host=${try { java.net.URI(first).host } catch (_: Exception) { "?" }} " +
+                "file=${first.substringBefore('?').substringAfterLast('/').take(50)} query=${queryInfo(first)}")
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Exception) { log("$tag: playlist describe failed: ${e.message}") }
     }
 
     // Muxed masters: sample only the top variant, then scale the others by their BANDWIDTH
