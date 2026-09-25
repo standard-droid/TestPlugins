@@ -1402,6 +1402,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // v29: the exact variant/segment addresses the page's player requested, keyed by master URL.
     private val sniffedVariantUrls = java.util.concurrent.ConcurrentHashMap<String, String>()
     private val sniffedSegmentUrls = java.util.concurrent.ConcurrentHashMap<String, String>()
+    // v35: every segment (path only) the page's player fetched, per master.
+    private val sniffedSegmentSets = java.util.concurrent.ConcurrentHashMap<String, MutableSet<String>>()
+    private val variantTagRe = Regex("""index-(f\d+[^/.?]*)""")
     // v33: playlist texts fetched by the sniff page itself (the WebView's network stack), keyed
     // by URL without query. The device log (2026-09-26) had shky.stellarwebconcepts.store answer
     // the page's player in 0.2s but time out on every request from the app's HTTP client, so
@@ -1411,16 +1414,17 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // texts in window.__anzPl; __anzPlDone flips when all requests have settled.
     private fun playlistCaptureJs(master: String, query: String) = """
         (function(m, q){
-          window.__anzPl = {}; window.__anzPlDone = 0;
+          window.__anzPl = window.__anzPl || {}; window.__anzPlDone = 0;
+          function have(u){ return !!window.__anzPl[u.split('?')[0]]; }
           function tok(u){ return (q && u.indexOf('?') < 0) ? u + '?' + q : u; }
           // v34: 3s cap per request — the host stalls some variants (1080p) indefinitely.
           function tf(u){ var c = window.AbortController ? new AbortController() : null;
             if (c) setTimeout(function(){ c.abort(); }, 3000); return fetch(u, c ? { signal: c.signal } : {}); }
-          tf(m).then(function(r){ return r.text(); }).then(function(t){
+          (have(m) ? Promise.resolve(window.__anzPl[m.split('?')[0]]) : tf(m).then(function(r){ return r.text(); })).then(function(t){
             if (t.indexOf('#EXTM3U') === 0) window.__anzPl[m.split('?')[0]] = t;
             var urls = [];
             t.split('\n').forEach(function(l){ l = l.trim(); if (l && l.charAt(0) !== '#') { try { urls.push(tok(new URL(l, m).href)); } catch(e){} } });
-            return Promise.all(urls.map(function(u){
+            return Promise.all(urls.filter(function(u){ return !have(u); }).map(function(u){
               return tf(u).then(function(r){ return r.ok ? r.text() : ''; })
                 .then(function(x){ if (x.indexOf('#EXTM3U') === 0) window.__anzPl[u.split('?')[0]] = x; })
                 .catch(function(){});
@@ -1466,6 +1470,37 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
           try { Object.defineProperty(document, 'hidden', { get: function(){ return false; } }); } catch(e) {}
           try { Object.defineProperty(document, 'visibilityState', { get: function(){ return 'visible'; } }); } catch(e) {}
           try { document.hasFocus = function(){ return true; }; } catch(e) {}
+          // v35: keep a copy of every playlist the page's own player downloads, so the app never
+          // has to fetch it a second time (the stream hosts stall repeat requests; device logs
+          // 2026-09-26). Read back through window.__anzPl; toString stays native-looking.
+          try {
+            window.__anzPl = window.__anzPl || {};
+            var isPl = function(u){ return /\.(m3u8|txt)(\?|$)/i.test(String(u)); };
+            var keep = function(u, t){ try { if (t && String(t).indexOf('#EXTM3U') === 0) window.__anzPl[String(u).split('?')[0]] = String(t); } catch(e){} };
+            var XP = XMLHttpRequest.prototype, xo = XP.open, xs = XP.send;
+            XP.open = function(m, u){ try { this.__anzU = u; } catch(e){} return xo.apply(this, arguments); };
+            XP.send = function(){
+              var x = this;
+              try { x.addEventListener('load', function(){ try {
+                var u = x.responseURL || x.__anzU;
+                if (isPl(u) && (x.responseType === '' || x.responseType === 'text')) keep(u, x.responseText);
+              } catch(e){} }); } catch(e){}
+              return xs.apply(this, arguments);
+            };
+            XP.open.toString = function(){ return xo.toString(); };
+            XP.send.toString = function(){ return xs.toString(); };
+            var fo = window.fetch;
+            if (fo) {
+              window.fetch = function(i){
+                var p = fo.apply(this, arguments);
+                try { var u = (typeof i === 'string') ? i : (i && i.url);
+                  if (u && isPl(u)) p.then(function(r){ try { r.clone().text().then(function(t){ keep(r.url || u, t); }); } catch(e){} }, function(){});
+                } catch(e){}
+                return p;
+              };
+              window.fetch.toString = function(){ return fo.toString(); };
+            }
+          } catch(e) {}
         })()
     """.trimIndent()
 
@@ -1840,24 +1875,38 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         // (variant playlist, whatever it is called — or a segment) is what the
                         // player sends for media. Its headers are the ones the link needs.
                         val m0 = masterRef.get()
-                        if (m0 != null && url != m0 && host.isNotEmpty() && host == (try { java.net.URI(m0).host } catch (_: Exception) { null })) {
+                        val pathLc = (request.url?.path ?: "").lowercase()
+                        // v35: when the stream is served from the page's own host (Sistenn "hlsmod"), that
+                        // host also carries the page's API calls, icons and thumbnails — the v34 log took a
+                        // PNG for the variant and /api/v1/player for a segment. Those are not media.
+                        val notMedia = pathLc.contains("/api/") || pathLc.contains("/cdn-cgi/") || pathLc.endsWith(".ico") ||
+                            pathLc.contains("thumbnail") || pathLc.endsWith(".js") || pathLc.endsWith(".css") || pathLc.endsWith(".html") ||
+                            pathLc == "/" || pathLc.endsWith("/anizm.net")
+                        if (m0 != null && url != m0 && !notMedia && host.isNotEmpty() && host == (try { java.net.URI(m0).host } catch (_: Exception) { null })) {
                             val kept = cleanCapturedHeaders(request.requestHeaders ?: emptyMap())
+                            val looksPlaylist = url.substringBefore('?').lowercase().let { it.endsWith(".m3u8") || it.endsWith(".txt") }
+                            if (!looksPlaylist) sniffedSegmentSets.getOrPut(m0) { java.util.concurrent.ConcurrentHashMap.newKeySet() }
+                                .let { if (it.size < 40) it.add(url.substringBefore('?')) }
                             // v29: v28's log had every header set refused on the variant playlist
                             // 200ms after the page's player opened the same one, while the master
                             // from the same host was fine. Headers aren't it, so log the FULL
                             // addresses (v27/v28 cut them at '?') — a token in the query is the
                             // likely difference — and wait for the first segment too.
-                            if (variantRef.compareAndSet(null, url)) {
+                            if (looksPlaylist && variantRef.compareAndSet(null, url)) {
                                 sniffedHeaders[m0] = kept
                                 sniffedVariantUrls[m0] = url
                                 log("sniff: player opened variant ${url.take(260)}")
                                 log("sniff:   with headers: " + kept.entries.joinToString("; ") { "${it.key}=${it.value.take(60)}" })
                                 handler.postDelayed({ if (!done) { log("sniff: no segment request within 4s"); finishCapturing(m0) } }, 4_000L)
-                            } else if (!url.substringBefore('?').lowercase().let { it.endsWith(".m3u8") || it.endsWith(".txt") }) {
-                                sniffedSegmentUrls[m0] = url
-                                log("sniff: player fetched segment ${url.take(260)}")
-                                if (kept != sniffedHeaders[m0]) log("sniff:   segment headers: " + kept.entries.joinToString("; ") { "${it.key}=${it.value.take(60)}" })
-                                handler.post { finishCapturing(m0) }
+                            } else if (!looksPlaylist) {
+                                if (sniffedSegmentUrls.put(m0, url) == null) {
+                                    log("sniff: player fetched segment ${url.take(260)}")
+                                    if (kept != sniffedHeaders[m0]) log("sniff:   segment headers: " + kept.entries.joinToString("; ") { "${it.key}=${it.value.take(60)}" })
+                                    if (sniffedHeaders[m0] == null || variantRef.get() == null) sniffedHeaders[m0] = kept
+                                    // v35: a second more lets the player load its other playlists and a few
+                                    // more segments, which is what the variant filter below goes by.
+                                    handler.postDelayed({ finishCapturing(m0) }, 1_000L)
+                                }
                             } else log("sniff: player opened another playlist ${url.take(200)}")
                             return null
                         }
@@ -2196,10 +2245,25 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         if (picked == null && tokenQuery.isEmpty()) log("sniff: no header set got a segment from this app's client — listing the links anyway (the player's own network stack may still get through)")
                         // v34: if the page could fetch some variants but not others, the missing ones are
                         // the ones the host stalls (1080p index-f2 in every log so far): don't list them.
+                        // v35: "hlsmod" streams (Sistenn serving a TikTok-CDN stream from its own host) disguise
+                        // every segment as an image; the page's player strips that, ExoPlayer can't
+                        // (UnrecognizedInputFormat, device log 2026-09-26). Those go through the local
+                        // server, which fetches each segment and cuts it down to the real media.
+                        val hlsmod = sniffed.contains("/hlsmod/", ignoreCase = true)
+                        val useProxy = tokenQuery.isNotEmpty() || hlsmod
                         val captured = variants.filter { sniffedPlaylistTexts.containsKey(it.url.substringBefore('?')) }
-                        if (tokenQuery.isNotEmpty() && captured.isNotEmpty() && captured.size < variants.size) {
+                        if (useProxy && captured.isNotEmpty() && captured.size < variants.size) {
                             log("sniff: leaving out ${variants.filter { it !in captured }.joinToString { "${it.height}p" }} — the page could not fetch it")
                             variants = captured
+                        }
+                        // v35: and only the qualities the page's player actually got segments for. The stream
+                        // hosts stall 1080p (index-f2) segments for the app as well (v34 log: Cronet
+                        // SocketTimeoutException) while the page only ever played f1.
+                        val segsSeen = sniffedSegmentSets[sniffed].orEmpty()
+                        val played = variants.filter { v -> variantTagRe.find(v.url)?.groupValues?.get(1)?.let { t -> segsSeen.any { it.contains("-$t.") } } == true }
+                        if (useProxy && played.isNotEmpty() && played.size < variants.size) {
+                            log("sniff: leaving out ${variants.filter { it !in played }.joinToString { "${it.height}p" }} — the page's player never loaded its segments")
+                            variants = played
                         }
                         // v32: segments need the token too. The variant playlists list them relative
                         // and without it, so ExoPlayer asked for bare init/seg URLs and got Cloudflare
@@ -2207,8 +2271,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         // rewritten copy of each variant from 127.0.0.1 in which every segment is an
                         // absolute URL carrying the token; the segments themselves still come
                         // straight from the stream host.
-                        val proxied = if (tokenQuery.isNotEmpty() && variants.isNotEmpty())
-                            variants.mapNotNull { v -> localHls.register(v.url, tokenQuery, linkHeaders, sniffedPlaylistTexts[v.url.substringBefore('?')])?.let { v to it } } else emptyList()
+                        val proxied = if (useProxy && variants.isNotEmpty())
+                            variants.mapNotNull { v -> localHls.register(v.url, tokenQuery, linkHeaders, sniffedPlaylistTexts[v.url.substringBefore('?')], stripSegments = hlsmod)?.let { v to it } } else emptyList()
                         if (proxied.isNotEmpty()) log("sniff: serving ${proxied.size} tokenised playlist(s) via ${proxied.first().second.substringBeforeLast('/')}, " +
                             "${variants.count { sniffedPlaylistTexts.containsKey(it.url.substringBefore('?')) }} from the page's own fetch")
                         found = if (proxied.isNotEmpty()) {
@@ -3134,19 +3198,20 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
  * (usesCleartextTraffic="true"), so http://127.0.0.1 is permitted.
  */
 internal class LocalHlsServer(private val log: (String) -> Unit) {
-    private data class Entry(val url: String, val query: String, val headers: Map<String, String>, val created: Long, val cached: String? = null)
+    private data class Entry(val url: String, val query: String, val headers: Map<String, String>, val created: Long,
+                             val cached: String? = null, val strip: Boolean = false)
     private val entries = java.util.concurrent.ConcurrentHashMap<String, Entry>()
     @Volatile private var socket: java.net.ServerSocket? = null
     private val uriAttrRe = Regex("""URI="([^"]+)"""")
     private val entryTtlMs = 6 * 60 * 60 * 1000L
 
     /** Returns the local URL for this playlist, or null if the server could not start. */
-    fun register(url: String, query: String, headers: Map<String, String>, cachedText: String? = null): String? {
+    fun register(url: String, query: String, headers: Map<String, String>, cachedText: String? = null, stripSegments: Boolean = false): String? {
         val port = ensureStarted() ?: return null
         val now = System.currentTimeMillis()
         entries.entries.removeAll { now - it.value.created > entryTtlMs }
         val key = java.util.UUID.randomUUID().toString().replace("-", "").take(16)
-        entries[key] = Entry(url, query, headers, now, cachedText?.takeIf { it.trimStart().startsWith("#EXTM3U") })
+        entries[key] = Entry(url, query, headers, now, cachedText?.takeIf { it.trimStart().startsWith("#EXTM3U") }, stripSegments)
         return "http://127.0.0.1:$port/hls/$key.m3u8"
     }
 
@@ -3175,7 +3240,10 @@ internal class LocalHlsServer(private val log: (String) -> Unit) {
                 while (true) { val l = input.readLine() ?: break; if (l.isEmpty()) break }
                 val parts = requestLine.split(' ')
                 val method = parts.getOrNull(0) ?: ""
-                val key = parts.getOrNull(1)?.substringAfter("/hls/", "")?.substringBefore('.')?.substringBefore('?') ?: ""
+                val target = parts.getOrNull(1) ?: ""
+                val isSeg = target.startsWith("/seg/")
+                val key = (if (isSeg) target.substringAfter("/seg/", "") else target.substringAfter("/hls/", ""))
+                    .substringBefore('.').substringBefore('?').substringBefore('/')
                 val entry = entries[key]
                 val out = sock.getOutputStream()
                 fun reply(code: Int, reason: String, body: ByteArray, type: String) {
@@ -3185,11 +3253,26 @@ internal class LocalHlsServer(private val log: (String) -> Unit) {
                     out.flush()
                 }
                 if (entry == null) { reply(404, "Not Found", ByteArray(0), "text/plain"); return }
+                if (isSeg) {
+                    val segUrl = try { java.net.URLDecoder.decode(target.substringAfter("?u=", ""), "UTF-8") } catch (_: Exception) { "" }
+                    if (!segUrl.startsWith("http")) { reply(400, "Bad Request", ByteArray(0), "text/plain"); return }
+                    val r = try { kotlinx.coroutines.runBlocking { app.get(segUrl, headers = entry.headers, timeout = 20L) } } catch (e: Exception) { null }
+                    val bytes = try { r?.okhttpResponse?.body?.bytes() } catch (_: Exception) { null }
+                    if (r == null || r.code !in 200..299 || bytes == null) {
+                        log("hls-proxy: segment ${segUrl.substringBefore('?').takeLast(50)} -> ${r?.code ?: "error"}")
+                        reply(502, "Bad Gateway", ByteArray(0), "text/plain"); return
+                    }
+                    val start = mediaStart(bytes)
+                    if (start > 0 && !loggedStrip) { loggedStrip = true; log("hls-proxy: segments carry a ${start}-byte disguise (${bytes.take(4).joinToString("") { "%02x".format(it) }}…), stripping it") }
+                    val body = if (start > 0) bytes.copyOfRange(start, bytes.size) else bytes
+                    val type = if (body.isNotEmpty() && body[0] == 0x47.toByte()) "video/mp2t" else "video/mp4"
+                    reply(200, "OK", body, type); return
+                }
                 // v33: VOD playlists (ENDLIST) don't change, so the copy the sniff page fetched
                 // through the WebView is served as-is; only without one is the host asked.
                 entry.cached?.let {
                     log("hls-proxy: served ${entry.url.substringBefore('?').substringAfterLast('/')} from the page's copy")
-                    reply(200, "OK", rewrite(it, entry).toByteArray(Charsets.UTF_8), "application/vnd.apple.mpegurl"); return
+                    reply(200, "OK", rewrite(it, entry, key, sock.localPort).toByteArray(Charsets.UTF_8), "application/vnd.apple.mpegurl"); return
                 }
                 var failure = ""
                 val upstream = try {
@@ -3200,21 +3283,42 @@ internal class LocalHlsServer(private val log: (String) -> Unit) {
                     log("hls-proxy: upstream ${entry.url.substringBefore('?').takeLast(50)} -> ${upstream?.code ?: failure}")
                     reply(502, "Bad Gateway", ByteArray(0), "text/plain"); return
                 }
-                reply(200, "OK", rewrite(text, entry).toByteArray(Charsets.UTF_8), "application/vnd.apple.mpegurl")
+                reply(200, "OK", rewrite(text, entry, key, sock.localPort).toByteArray(Charsets.UTF_8), "application/vnd.apple.mpegurl")
             }
         } catch (e: Exception) { log("hls-proxy: ${e.javaClass.simpleName}: ${e.message}") }
     }
 
     private fun tokenised(ref: String, entry: Entry): String {
         val abs = try { java.net.URI(entry.url).resolve(ref.trim()).toString() } catch (_: Exception) { ref.trim() }
-        return if (abs.contains('?')) abs else "$abs?${entry.query}"
+        return if (abs.contains('?') || entry.query.isEmpty()) abs else "$abs?${entry.query}"
     }
 
-    private fun rewrite(playlist: String, entry: Entry): String = playlist.lineSequence().joinToString("\n") { raw ->
+    @Volatile private var loggedStrip = false
+
+    /** Where the real media starts: 3 MPEG-TS sync bytes 188 apart, or an MP4 ftyp/styp/moof box. */
+    private fun mediaStart(b: ByteArray): Int {
+        val limit = minOf(b.size, 262_144)
+        var i = 0
+        while (i + 376 < limit) {
+            if (b[i] == 0x47.toByte() && b[i + 188] == 0x47.toByte() && b[i + 376] == 0x47.toByte()) return i
+            i++
+        }
+        i = 4
+        while (i + 4 <= limit) {
+            val t = String(b, i, 4, Charsets.ISO_8859_1)
+            if (t == "ftyp" || t == "styp" || t == "moof") return i - 4
+            i++
+        }
+        return 0
+    }
+
+    private fun rewrite(playlist: String, entry: Entry, key: String, port: Int): String = playlist.lineSequence().joinToString("\n") { raw ->
         val line = raw.trimEnd('\r')
         when {
             line.isBlank() -> line
             line.startsWith("#") -> uriAttrRe.replace(line) { m -> "URI=\"${tokenised(m.groupValues[1], entry)}\"" }
+            // v35: disguised segments come back through here to be cut down to the real media.
+            entry.strip -> "http://127.0.0.1:$port/seg/$key?u=" + java.net.URLEncoder.encode(tokenised(line, entry), "UTF-8")
             else -> tokenised(line, entry)
         }
     }
