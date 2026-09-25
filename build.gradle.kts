@@ -23,7 +23,14 @@ buildscript {
         // doesn't publish). Floating SNAPSHOT it is — the weekly Monday cron build below
         // exists specifically to catch upstream breaks on our own schedule instead of
         // silently, so this is the more durable choice of two imperfect options.
-        classpath("com.github.recloudstream:gradle:-SNAPSHOT")
+        // UPDATE 2026-09-25: SNAPSHOT broke the same way. It resolves to upstream HEAD,
+        // which is that same 32895aedb6 (2026-07-02, "Update dependencies": Kotlin 2.4.0,
+        // sdk-common 32.1.1), and JitPack stopped serving it again ("Could not find
+        // ...:gradle:-SNAPSHOT", pom gradle--32895aedb6-1). Pinned to 81b1d424d2 (2026-04-20,
+        // "Add full configuration cache support"), the commit just before that update and the
+        // one SaurabhKaperwan/CSX pins, which keeps its JitPack build in regular use. It has
+        // configuration-cache support and AGP 8 + 9 support.
+        classpath("com.github.recloudstream:gradle:81b1d424d2")
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0")
     }
 }
