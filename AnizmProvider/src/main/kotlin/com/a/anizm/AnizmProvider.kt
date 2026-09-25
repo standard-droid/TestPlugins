@@ -1412,12 +1412,15 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         (function(m, q){
           window.__anzPl = {}; window.__anzPlDone = 0;
           function tok(u){ return (q && u.indexOf('?') < 0) ? u + '?' + q : u; }
-          fetch(m).then(function(r){ return r.text(); }).then(function(t){
+          // v34: 3s cap per request — the host stalls some variants (1080p) indefinitely.
+          function tf(u){ var c = window.AbortController ? new AbortController() : null;
+            if (c) setTimeout(function(){ c.abort(); }, 3000); return fetch(u, c ? { signal: c.signal } : {}); }
+          tf(m).then(function(r){ return r.text(); }).then(function(t){
             if (t.indexOf('#EXTM3U') === 0) window.__anzPl[m.split('?')[0]] = t;
             var urls = [];
             t.split('\n').forEach(function(l){ l = l.trim(); if (l && l.charAt(0) !== '#') { try { urls.push(tok(new URL(l, m).href)); } catch(e){} } });
             return Promise.all(urls.map(function(u){
-              return fetch(u).then(function(r){ return r.ok ? r.text() : ''; })
+              return tf(u).then(function(r){ return r.ok ? r.text() : ''; })
                 .then(function(x){ if (x.indexOf('#EXTM3U') === 0) window.__anzPl[u.split('?')[0]] = x; })
                 .catch(function(){});
             }));
@@ -1673,7 +1676,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 // v22: capped diagnostic lines per sniff (console errors, failed requests,
                 // TLS refusals), so the next log says what the page tripped over.
                 val diagLines = java.util.concurrent.atomic.AtomicInteger(0)
-                val infoLogged = java.util.concurrent.atomic.AtomicBoolean(false)
+                val infoLogged = java.util.concurrent.atomic.AtomicBoolean(false) // page asked /api/v1/info (Sistenn family)
+                val videoAsked = java.util.concurrent.atomic.AtomicBoolean(false)
                 fun diag(msg: String) { if (diagLines.incrementAndGet() <= 30) log(msg) }
                 fun isAdHost(h: String) = adHostKeywords.any { h.contains(it, true) } || imaHostKeywords.any { h.contains(it, true) }
                 var reloadedForTls = false
@@ -1754,20 +1758,26 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                     val q = (variantRef.get() ?: m).substringAfter('?', "")
                     try { wv.evaluateJavascript(playlistCaptureJs(m, q), null) } catch (_: Throwable) { finish(m); return }
                     var polls = 0
+                    fun store(json: String, partial: Boolean) {
+                        try {
+                            val o = JSONObject(json)
+                            if (sniffedPlaylistTexts.size > 40) sniffedPlaylistTexts.clear()
+                            for (k in o.keys()) sniffedPlaylistTexts[k] = o.getString(k)
+                            log("sniff: page fetched ${o.length()} playlist(s) itself${if (partial) " (the rest did not answer in time)" else ""}: " +
+                                o.keys().asSequence().joinToString { it.substringAfterLast('/') })
+                        } catch (e: Exception) { log("sniff: playlist capture unreadable: ${e.message}") }
+                    }
                     fun poll() {
                         if (done) return
+                        // v34: on the last poll take whatever arrived. v33 waited for ALL playlists,
+                        // and one stalled 1080p variant meant nothing was kept, not even the 720p.
+                        val last = ++polls >= 12
+                        val js = if (last) "JSON.stringify(window.__anzPl || {})" else "window.__anzPlDone ? JSON.stringify(window.__anzPl) : ''"
                         try {
-                            wv.evaluateJavascript("window.__anzPlDone ? JSON.stringify(window.__anzPl) : ''") { r ->
+                            wv.evaluateJavascript(js) { r ->
                                 val json = jsResult(r)
-                                if (json.isNotEmpty()) {
-                                    try {
-                                        val o = JSONObject(json)
-                                        if (sniffedPlaylistTexts.size > 40) sniffedPlaylistTexts.clear()
-                                        for (k in o.keys()) sniffedPlaylistTexts[k] = o.getString(k)
-                                        log("sniff: page fetched ${o.length()} playlist(s) itself: ${o.keys().asSequence().joinToString { it.substringAfterLast('/') }}")
-                                    } catch (e: Exception) { log("sniff: playlist capture unreadable: ${e.message}") }
-                                    finish(m)
-                                } else if (++polls >= 12) { log("sniff: page did not finish fetching the playlists in time"); finish(m) }
+                                if (json.isNotEmpty()) { store(json, partial = last); finish(m) }
+                                else if (last) { log("sniff: page fetched no playlists in time"); finish(m) }
                                 else handler.postDelayed({ poll() }, 300L)
                             }
                         } catch (_: Throwable) { finish(m) }
@@ -1896,18 +1906,11 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         // Diagnostics only: the handful of requests that could have been it.
                         if (u.contains("/api/") || u.contains("video") || u.contains(".mp4") || u.contains("stream"))
                             if (seen.size < 40) seen.add(url.substringBefore('?').takeLast(70))
-                        // v24: log what the page is told by /api/v1/info — it's the last
-                        // thing it asks for before going quiet.
-                        if (u.contains("/api/v1/info") && infoLogged.compareAndSet(false, true)) {
-                            val hdrs = HashMap<String, String>(request.requestHeaders ?: emptyMap()).also { it["User-Agent"] = ua }
-                            Thread {
-                                try {
-                                    val r = runBlocking { app.get(url, headers = hdrs, timeout = 8L) }
-                                    log("sniff: info (page used ${request.method}) ${r.code}: ${r.text.replace(Regex("\\s+"), " ").take(400)}")
-                                } catch (e: Throwable) { log("sniff: info side-fetch failed: ${e.message?.take(80)}") }
-                            }.start()
-                        }
-                        if (u.contains("/api/v1/video")) log("sniff: page asked for the video: ${url.substringBefore('?').takeLast(60)}")
+                        // v34: the v24 diagnostic that re-fetched /api/v1/info through the app's client
+                        // is gone (one extra request per sniff, and its answer is encrypted anyway).
+                        // The flags drive the early give-up in onPageFinished.
+                        if (u.contains("/api/v1/info")) infoLogged.set(true)
+                        if (u.contains("/api/v1/video")) { videoAsked.set(true); log("sniff: page asked for the video: ${url.substringBefore('?').takeLast(60)}") }
                         // v22: a host the WebView refused on TLS goes through the app's client.
                         if (host in sslBadHosts && request.method.equals("GET", true))
                             return proxyViaApp(request) { diag(it) }
@@ -1984,6 +1987,15 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         if (done) return
                         log("sniff: page ready")
                         poke(view, "poke@ready")
+                        // v34: a Sistenn-family page (it loads /api/v1/info) asks /api/v1/video about
+                        // 3-4s after load once tapped. strp2p's page loaded, never asked, and sat out
+                        // the full 24s budget (device log 2026-09-26). Give such a page 12s.
+                        handler.postDelayed({
+                            if (!done && infoLogged.get() && !videoAsked.get() && masterRef.get() == null) {
+                                log("sniff: page never asked for a video within 12s of loading — giving up")
+                                finish(null)
+                            }
+                        }, 12_000L)
                     }
                 }
                 // v22: console errors from the page (a thrown exception in the key/decrypt step
@@ -2131,7 +2143,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         (cookiesFor(sniffed) ?: cookiesFor(pageUrl))?.let { h["Cookie"] = it }
                     }.toMap()
                     log("sniff: link headers = ${sniffHeaders.keys.joinToString()}${sniffedHeaders[sniffed]?.let { " (copied from the page's player)" } ?: ""}")
-                    val fetched = try { app.get(sniffed, headers = sniffHeaders, timeout = 10L).text }
+                    val fetched = try { app.get(sniffed, headers = sniffHeaders, timeout = 6L).text }
                     catch (e: kotlinx.coroutines.CancellationException) { throw e }
                     catch (e: Exception) { log("step4: sniffed playlist fetch failed: ${e.message}"); "" }
                     // v33: the host may ignore this client entirely; the page's own copy is as good.
@@ -2174,9 +2186,20 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                             "minimal + fetch headers" to minimal + secFetch,
                             "minimal" to minimal,
                         )
-                        val picked = variants.lastOrNull()?.let { pickStreamHeaders(it.url, candidates, tokenQuery) }
+                        // v34: token links go through the local playlist server and the player fetches
+                        // segments itself, so this client's view of the host decides nothing; probing
+                        // only cost time (8s timeouts in the device logs).
+                        val picked = if (tokenQuery.isNotEmpty()) null
+                            else variants.lastOrNull()?.let { pickStreamHeaders(it.url, candidates, tokenQuery) }
                         val linkHeaders = picked ?: candidates.first().second
-                        if (picked == null) log("sniff: no header set got a segment from this app's client — listing the links anyway (the player's own network stack may still get through)")
+                        if (picked == null && tokenQuery.isEmpty()) log("sniff: no header set got a segment from this app's client — listing the links anyway (the player's own network stack may still get through)")
+                        // v34: if the page could fetch some variants but not others, the missing ones are
+                        // the ones the host stalls (1080p index-f2 in every log so far): don't list them.
+                        val captured = variants.filter { sniffedPlaylistTexts.containsKey(it.url.substringBefore('?')) }
+                        if (tokenQuery.isNotEmpty() && captured.isNotEmpty() && captured.size < variants.size) {
+                            log("sniff: leaving out ${variants.filter { it !in captured }.joinToString { "${it.height}p" }} — the page could not fetch it")
+                            variants = captured
+                        }
                         // v32: segments need the token too. The variant playlists list them relative
                         // and without it, so ExoPlayer asked for bare init/seg URLs and got Cloudflare
                         // 403s (device log 2026-09-26: 35s of buffering, no error). Serve the player a
