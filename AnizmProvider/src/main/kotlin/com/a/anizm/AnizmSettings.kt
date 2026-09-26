@@ -55,7 +55,7 @@ class AnizmSettings(private val prefs: SharedPreferences) {
             SourceGroup("sendvid", "SendVid", listOf("sendvid")),
             SourceGroup("hdvid", "HDVid", listOf("hdvid")),
             SourceGroup("abyss", "Abyss", listOf("abyss")),
-            SourceGroup(OTHER, "Other players (LuluStream, Sistenn, FireStream…)", emptyList()),
+            SourceGroup(OTHER, "Other players (LuluStream, FireStream, UpBolt…)", emptyList()),
         )
 
 
