@@ -2160,393 +2160,427 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         if (settings.groupOf(vi.name).key == "aincrad" && !embed.startsWith("ap:"))
             logW("site-change warning: Aincrad source ${vi.fansub}/${vi.name} resolved to $embed, not an anizmplayer /video/ link")
 
-        if (embed.startsWith("ex:")) {
-            val exUrl = embed.removePrefix("ex:")
-            log("step4: $label -> loadExtractor $exUrl")
-            var found = false
-            try {
-                // Collect, then re-emit with the fansub in the name — otherwise these
-                // links show only the extractor name ("Voe") with no fansub attribution
-                val collected = java.util.concurrent.CopyOnWriteArrayList<ExtractorLink>()
-                kotlinx.coroutines.withTimeoutOrNull(15_000) {
-                    loadExtractor(exUrl, data, subtitleCallback) { collected.add(it) }
-                }
-                for (l in collected) {
-                    // Some built-in extractors (StreamLare, Voe, etc.) already bake a
-                    // quality tag onto the end of their own .name — e.g. "Voe 1080p".
-                    // Strip it before appending ours below, or it shows as "Voe 1080p 1080p".
-                    val cleanName = cleanDisplayName(l.name)
-                    callback(newExtractorLink(source = "${vi.fansub} - $cleanName", name = "${vi.fansub} - $cleanName", url = l.url, type = l.type) {
-                        referer = l.referer; quality = l.quality; headers = l.headers; extractorData = l.extractorData })
-                    found = true
-                }
-            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
-            catch (e: Exception) { log("step4: loadExtractor failed: ${e.message}") }
-
-            // v16: CloudStream had no extractor for this host (or it produced nothing).
-            // Load the player page in a hidden WebView and take the playlist it requests.
-            // v37: Sistenn-family pages (sistenn.uns.bio, rpmvid, strp2p: https://host/#id) are asked
-            // directly through their own API before any WebView is loaded — one to three small
-            // requests instead of a full page with ads, taps and a 10-25 s wait.
-            if (!found) {
-                val direct = try { trySistennApi(exUrl, cleanDisplayName(label), callback) }
-                    catch (e: kotlinx.coroutines.CancellationException) { throw e }
-                    catch (e: Exception) { log("sistenn-api: error ${e.javaClass.simpleName}: ${e.message?.take(100)}"); SistennResult.UNAVAILABLE }
-                when (direct) {
-                    SistennResult.EMITTED -> return true
-                    SistennResult.CAPACITY -> return false // the page would hit the same wall
-                    SistennResult.UNAVAILABLE -> {}
-                }
-            }
-            if (!found && settings.browserSniff) {
-                val cached = sniffCache[exUrl]?.takeIf { System.currentTimeMillis() - it.second < sniffCacheTtlMs }?.first
-                if (cached != null) log("step4: reusing sniffed playlist for $label")
-                if (cached == null && deferSniff != null) {
-                    log("step4: $label needs the browser — deferred until the cheap sources are done")
-                    deferSniff(vi, embed)
-                    return false
-                }
-                val overBudget = sniffSpentThisLoad >= sniffBudgetPerLoadMs
-                val skip = cached == null && (sniffHostOnCooldown(exUrl) || overBudget)
-                if (skip) log("step4: skipping sniff for $label (${if (overBudget) "episode sniff budget spent" else "host on cooldown"})")
-                val sniffed = cached ?: if (skip) null else try {
-                    val t0 = System.currentTimeMillis()
-                    sniffGate.withPermit {
-                        // v33: another source (or load) may have sniffed this page while we waited.
-                        sniffCache[exUrl]?.takeIf { System.currentTimeMillis() - it.second < sniffCacheTtlMs }?.first
-                            ?.also { log("step4: $label was sniffed meanwhile — reusing it") }
-                            ?: sniffHlsViaWebView(exUrl, "$mainUrl/")
-                    }
-                        .also {
-                            sniffSpentThisLoad += System.currentTimeMillis() - t0
-                            noteSniffResult(exUrl, it != null)
-                        }
-                }
-                catch (e: kotlinx.coroutines.CancellationException) { throw e }
-                catch (e: Exception) { log("step4: sniff failed: ${e.message}"); noteSniffResult(exUrl, false); null }
-                if (sniffed != null) {
-                    sniffCache[exUrl] = sniffed to System.currentTimeMillis()
-                    if (sniffCache.size > 60) {
-                        val now = System.currentTimeMillis()
-                        sniffCache.entries.removeAll { now - it.value.second > sniffCacheTtlMs }
-                    }
-                    // v19: the player gets its own HTTP stack, so everything the page had must
-                    // be spelled out on the link — UA, Referer, Origin, and any cookie the
-                    // stream host handed the hidden WebView.
-                    val pageUrl = exUrl.substringBefore('#')
-                    val origin = try { java.net.URI(pageUrl).let { "${it.scheme}://${it.host}" } } catch (_: Exception) { pageUrl }
-                    val sniffHeaders = mutableMapOf("User-Agent" to ua, "Referer" to pageUrl, "Origin" to origin).also { h ->
-                        // v27: whatever the page's own player sent for the stream wins (custom
-                        // headers included). Cookies aren't in that list, so they're added after.
-                        sniffedHeaders[sniffed]?.forEach { (k, v) ->
-                            h.keys.firstOrNull { it.equals(k, true) }?.let { h.remove(it) }
-                            h[k] = v
-                        }
-                        (cookiesFor(sniffed) ?: cookiesFor(pageUrl))?.let { h["Cookie"] = it }
-                    }.toMap()
-                    log("sniff: link headers = ${sniffHeaders.keys.joinToString()}${sniffedHeaders[sniffed]?.let { " (copied from the page's player)" } ?: ""}")
-                    val fetched = try { app.get(sniffed, headers = sniffHeaders, timeout = 6L).text }
-                    catch (e: kotlinx.coroutines.CancellationException) { throw e }
-                    catch (e: Exception) { log("step4: sniffed playlist fetch failed: ${e.message}"); "" }
-                    // v33: the host may ignore this client entirely; the page's own copy is as good.
-                    val body = if (fetched.trimStart().startsWith("#EXTM3U")) fetched
-                        else sniffedPlaylistTexts[sniffed.substringBefore('?')]?.also { log("sniff: using the master the page fetched itself") } ?: fetched
-                    val cleanLabel = cleanDisplayName(label)
-                    if (body.trimStart().startsWith("#EXTM3U")) {
-                        var variants = parseVariants(body, sniffed)
-                        var tokenQuery = ""
-                        // v29: if the page's player asked for its variant with a query string that
-                        // the master's own variant lines don't carry, the page's script added it —
-                        // most likely an access token. Put the same query on every variant.
-                        sniffedVariantUrls[sniffed]?.let { pv ->
-                            val q = pv.substringAfter('?', "")
-                            val sameFile = variants.firstOrNull { it.url.substringBefore('?') == pv.substringBefore('?') }
-                            log("sniff: master lists ${variants.joinToString { it.url.substringAfterLast('/').take(80) }}; player used ${pv.substringAfterLast('/').take(120)}" +
-                                (if (sameFile == null) " (not one of the listed variants)" else ""))
-                            if (q.isNotEmpty() && variants.none { it.url.contains('?') }) {
-                                variants = variants.map { it.copy(url = it.url + "?" + q) }
-                                tokenQuery = q
-                                log("sniff: copied the player's query onto the variants: ?${q.take(120)}")
-                            }
-                        }
-                        sniffedSegmentUrls[sniffed]?.let { log("sniff: player's first segment was ${it.substringAfterLast('/').take(160)}") }
-                        log("sniff: master has ${variants.size} variant(s): ${variants.joinToString(", ") { "${it.height}p/${(it.bandwidth ?: 0) / 1000}k" }}")
-                        // v28: the link's referer used to be exUrl — with its #fragment. CloudStream
-                        // sends that as the Referer header, which no browser ever does, and the
-                        // stream host answered the player with 403 (v27 log). Use the player's
-                        // origin, exactly what the page's own player sent.
-                        val linkReferer = sniffHeaders.entries.firstOrNull { it.key.equals("Referer", true) }?.value ?: "$origin/"
-                        // v28: find a header set the stream host accepts for a variant playlist
-                        // AND its first segment (the v27 log: segments 403 while playlists passed).
-                        val secFetch = mapOf("Sec-Fetch-Dest" to "empty", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Site" to "cross-site",
-                            "Accept-Language" to (try { java.util.Locale.getDefault().toLanguageTag() } catch (_: Throwable) { "en-US" }) + ",en;q=0.8")
-                        val minimal = mapOf("User-Agent" to ua, "Referer" to linkReferer, "Origin" to origin)
-                        val candidates = listOf(
-                            "player + browser fetch headers" to sniffHeaders + secFetch,
-                            "player" to sniffHeaders,
-                            "player, no cookies" to sniffHeaders.filterKeys { !it.equals("Cookie", true) } + secFetch,
-                            "minimal + fetch headers" to minimal + secFetch,
-                            "minimal" to minimal,
-                        )
-                        // v34: token links go through the local playlist server and the player fetches
-                        // segments itself, so this client's view of the host decides nothing; probing
-                        // only cost time (8s timeouts in the device logs).
-                        val picked = if (tokenQuery.isNotEmpty()) null
-                            else variants.lastOrNull()?.let { pickStreamHeaders(it.url, candidates, tokenQuery) }
-                        val linkHeaders = picked ?: candidates.first().second
-                        if (picked == null && tokenQuery.isEmpty()) log("sniff: no header set got a segment from this app's client — listing the links anyway (the player's own network stack may still get through)")
-                        // v34: if the page could fetch some variants but not others, the missing ones are
-                        // the ones the host stalls (1080p index-f2 in every log so far): don't list them.
-                        // v35: "hlsmod" streams (Sistenn serving a TikTok-CDN stream from its own host) disguise
-                        // every segment as an image; the page's player strips that, ExoPlayer can't
-                        // (UnrecognizedInputFormat, device log 2026-09-26). Those go through the local
-                        // server, which fetches each segment and cuts it down to the real media.
-                        val hlsmod = sniffed.contains("/hlsmod/", ignoreCase = true)
-                        val useProxy = tokenQuery.isNotEmpty() || hlsmod
-                        val captured = variants.filter { sniffedPlaylistTexts.containsKey(it.url.substringBefore('?')) }
-                        if (useProxy && captured.isNotEmpty() && captured.size < variants.size) {
-                            log("sniff: leaving out ${variants.filter { it !in captured }.joinToString { "${it.height}p" }} — the page could not fetch it")
-                            variants = captured
-                        }
-                        // v35: and only the qualities the page's player actually got segments for. The stream
-                        // hosts stall 1080p (index-f2) segments for the app as well (v34 log: Cronet
-                        // SocketTimeoutException) while the page only ever played f1.
-                        val segsSeen = sniffedSegmentSets[sniffed].orEmpty()
-                        val played = variants.filter { v -> variantTagRe.find(v.url)?.groupValues?.get(1)?.let { t -> segsSeen.any { it.contains("-$t.") } } == true }
-                        if (useProxy && played.isNotEmpty() && played.size < variants.size) {
-                            log("sniff: leaving out ${variants.filter { it !in played }.joinToString { "${it.height}p" }} — the page's player never loaded its segments")
-                            variants = played
-                        }
-                        // v32: segments need the token too. The variant playlists list them relative
-                        // and without it, so ExoPlayer asked for bare init/seg URLs and got Cloudflare
-                        // 403s (device log 2026-09-26: 35s of buffering, no error). Serve the player a
-                        // rewritten copy of each variant from 127.0.0.1 in which every segment is an
-                        // absolute URL carrying the token; the segments themselves still come
-                        // straight from the stream host.
-                        // v35: with the page's refresh call known, segments are served as redirects that carry a
-                        // token the local server keeps fresh (the one in the playlist expires 30 min after the sniff).
-                        val tokenState = if (tokenQuery.isNotEmpty() && !hlsmod) sniffedRefreshUrls[exUrl]?.let { ru ->
-                            LocalHlsServer.TokenState(tokenQuery, ru, mapOf("User-Agent" to ua, "Accept" to "*/*",
-                                "Referer" to (try { java.net.URI(ru).let { "${it.scheme}://${it.host}/" } } catch (_: Exception) { "$origin/" })))
-                        } else null
-                        if (tokenState != null) log("sniff: token will be renewed through the page's refresh call when it nears expiry")
-                        val proxied = if (useProxy && variants.isNotEmpty())
-                            variants.mapNotNull { v -> localHls.register(v.url, tokenQuery, linkHeaders, sniffedPlaylistTexts[v.url.substringBefore('?')],
-                                stripSegments = hlsmod, token = tokenState)?.let { v to it } } else emptyList()
-                        if (proxied.isNotEmpty()) log("sniff: serving ${proxied.size} tokenised playlist(s) via ${proxied.first().second.substringBeforeLast('/')}, " +
-                            "${variants.count { sniffedPlaylistTexts.containsKey(it.url.substringBefore('?')) }} from the page's own fetch")
-                        found = if (proxied.isNotEmpty()) {
-                            for ((v, local) in proxied) callback(newExtractorLink(source = cleanLabel, name = "$cleanLabel ${v.height}p",
-                                url = local, type = ExtractorLinkType.M3U8) { quality = v.height; referer = linkReferer; headers = linkHeaders })
-                            true
-                        } else if (variants.isNotEmpty())
-                            emitVariants(variants, cleanLabel, linkReferer, linkHeaders, callback, "sniff",
-                                "sn:${sniffed.substringBefore('?').takeLast(40)}", allowDeclaredFallback = true,
-                                trustPlaylists = picked == null)
-                        else {
-                            callback(newExtractorLink(source = cleanLabel, name = cleanLabel, url = sniffed, type = ExtractorLinkType.M3U8) {
-                                quality = Qualities.Unknown.value; referer = linkReferer; headers = linkHeaders })
-                            true
-                        }
-                    } else {
-                        // v20: this used to hand the URL to the player anyway. That is how a dead
-                        // link ended up in the list — ExoPlayer got a 404 and the episode looked
-                        // broken. If we cannot read it as a playlist ourselves, neither can the
-                        // player, so drop it and let the next source have its turn.
-                        log("sniff: ${sniffed.substringBefore('?').takeLast(50)} is not a playlist (${body.take(40).replace('\n', ' ')}) — discarding")
-                        sniffCache.remove(exUrl)
-                    }
-                }
-            }
-            return found
-        }
-
-        if (embed.startsWith("ap:")) {
-            val hash = embed.removePrefix("ap:")
-            // 4.0: the real player page is /video/{hash} — that's where /player/{numId}
-            // redirects, and it's what a browser has as Referer for everything after.
-            // The old warm-up hit $playerBase/player/{hash}, which is a 404 on
-            // anizmplayer.com (verified), so every Aincrad play started with a request
-            // no browser ever makes, and then used that 404 URL as the Referer.
-            val apBase = apDomains[hash] ?: playerBase
-            val playerRef = "$apBase/video/$hash"
-            val aHeaders = mapOf("User-Agent" to ua,
-                "X-Requested-With" to "XMLHttpRequest", "Accept" to "*/*",
-                "Referer" to playerRef, "Origin" to apBase)
-            val now = System.currentTimeMillis()
-            val cachedSource = aincradCache[hash]?.takeIf { it.validUntil > now }
-            val videoSource: String
-            val securedLink: String
-            // v32: the player's session cookies. The device log (2026-09-26) had master.txt
-            // answer this client with 200 "security error" while the browser, which sends the
-            // cookies the player page and getVideo set, got the playlist. The app's HTTP client
-            // keeps no cookie jar, so they are carried by hand, to getVideo and onto the link.
-            val cookieJar = LinkedHashMap<String, String>()
-            if (cachedSource != null) {
-                videoSource = cachedSource.videoSource; securedLink = cachedSource.securedLink
-                cachedSource.cookie.split("; ").filter { '=' in it }.forEach { cookieJar[it.substringBefore('=')] = it.substringAfter('=') }
-                log("aincrad: reusing signed URL for $apBase $hash (${(cachedSource.validUntil - now) / 1000}s left)")
-            } else {
-                try { app.get(playerRef, headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/"), timeout = 8).cookies.let { cookieJar.putAll(it) } }
-                catch (e: kotlinx.coroutines.CancellationException) { throw e }
-                catch (_: Exception) {}
-                // 4.0: FirePlayer's own call is $.ajax POST with data {hash: ID, r: document.referrer}.
-                val streamResp = try {
-                    app.post("$apBase/player/index.php?data=$hash&do=getVideo",
-                        headers = aHeaders + (if (cookieJar.isEmpty()) emptyMap() else mapOf("Cookie" to cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" })),
-                        data = mapOf("hash" to hash, "r" to "$mainUrl/"), timeout = 10).also { cookieJar.putAll(it.cookies) }
-                } catch (e: kotlinx.coroutines.CancellationException) { throw e }
-                  catch (e: Exception) { log("aincrad error: ${e.javaClass.simpleName}: ${e.message}"); return false }
-                val streamText = streamResp.text
-                // v31: these two exits used to be silent, so a changed answer from getVideo left
-                // nothing in the log but a missing source. Say what came back instead.
-                val json = try { JSONObject(streamText) } catch (_: Exception) {
-                    log("aincrad: getVideo not JSON (http ${streamResp.code}, ${streamResp.headers["Content-Type"]}, server=${streamResp.headers["server"]}, " +
-                        "cf-mitigated=${streamResp.headers["cf-mitigated"]}, final=${streamResp.url.take(80)}): ${streamText.replace(Regex("\\s+"), " ").take(200)}")
-                    return false
-                }
-                securedLink = json.optString("securedLink", "")
-                videoSource = json.optString("videoSource", "")
-                log("aincrad: hls=${json.optBoolean("hls")} secured=${securedLink.isNotBlank()} source=${videoSource.isNotBlank()} same=${securedLink == videoSource} dl=${json.optJSONArray("downloadLinks")?.length() ?: 0} " +
-                    "keys=${json.keys().asSequence().joinToString(",")} cookies=${cookieJar.keys.joinToString(",").ifEmpty { "none" }}")
-                if (videoSource.isBlank() && securedLink.isBlank())
-                    log("aincrad: getVideo gave no link (http ${streamResp.code}), keys=${json.keys().asSequence().joinToString()}: ${streamText.replace(Regex("\\s+"), " ").take(200)}")
-                else log("aincrad: link ${videoSource.ifBlank { securedLink }.substringBefore('?').take(120)}")
-                // Valid until 2 min before the URL's own expiry (seconds or ms epoch), max 30 min;
-                // 10 min if the URL doesn't say.
-                // v32: securedLink carries the expiry; videoSource (master.txt) has none since they split.
-                val exp = (expiresParamRe.find(securedLink) ?: expiresParamRe.find(videoSource))?.groupValues?.get(1)?.toLongOrNull()
-                    ?.let { if (it < 100_000_000_000L) it * 1000 else it }
-                val until = minOf(exp?.minus(120_000) ?: (now + 10 * 60_000), now + 30 * 60_000)
-                if (until > now && (videoSource.isNotBlank() || securedLink.isNotBlank())) {
-                    aincradCache[hash] = AincradSource(videoSource, securedLink, until,
-                        cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" })
-                    if (aincradCache.size > 200) aincradCache.entries.removeAll { it.value.validUntil <= now }
-                }
-            }
-            // Single entry per source, chosen by CONTENT, not by JSON field name — see git
-            // history for the 3003 error this avoids. NOTE ON DOWNLOADS: split-audio masters
-            // stream fine but CloudStream's downloader can't mux them (app limitation).
-            val hlsHeaders = mapOf("User-Agent" to ua, "Origin" to apBase, "Referer" to playerRef) +
-                (if (cookieJar.isEmpty()) emptyMap() else mapOf("Cookie" to cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" }))
-
-            var resolved = false
-            // v32: securedLink first. Until 2026-09 both fields held the same URL; now videoSource
-            // is a bare master.txt behind a session check ("security error"), and securedLink is
-            // the md5/expires-signed master.m3u8, which carries its own authorisation.
-            for (cand in listOf(securedLink, videoSource).filter { it.isNotBlank() }.distinct()) {
-                if (resolved) break
-                val head = try {
-                    app.get(cand, headers = hlsHeaders + mapOf("Range" to "bytes=0-4095"), timeout = 8)
-                } catch (e: kotlinx.coroutines.CancellationException) {
-                    throw e
-                } catch (e: Exception) { log("aincrad: probe failed: ${e.message}"); continue }
-                val t = head.text.trimStart()
-                log("aincrad: probe http ${head.code}, ${head.headers["Content-Type"]}, ${t.length}B, starts '${t.take(24).replace('\n', ' ')}'")
-                when {
-                    t.startsWith("#EXTM3U") -> {
-                        val cleanLabel = cleanDisplayName(label)
-                        val variants = parseVariants(t, cand)
-                        if (t.contains("TYPE=AUDIO") || variants.isEmpty()) {
-                            // Split audio (every Aincrad sample checked, 2026-09) or an
-                            // unparseable master: one master link, ExoPlayer does ABR + audio.
-                            // 4.0: this branch never showed a size before. Now it estimates the
-                            // top rendition (video + audio) by sampling real segment sizes.
-                            val h = variants.maxOfOrNull { it.height }
-                                ?: hlsResolutionRe.findAll(t).mapNotNull { it.groupValues[1].toIntOrNull() }.maxOrNull()
-                            val sizeKey = "ap:$hash"
-                            val est = if (estimateHlsSizes && variants.isNotEmpty()) {
-                                cachedSizes(sizeKey)?.get(0)
-                                    ?: withTimeoutOrNull(sizeEstimateBudgetMs) { estimateSplitAudioBytes(t, cand, variants, hlsHeaders) }
-                                        ?.also { storeSizes(sizeKey, mapOf(0 to it)) }
-                            } else null
-                            callback(newExtractorLink(source = cleanLabel, name = cleanLabel + formatSize(est, isEstimate = true), url = cand, type = ExtractorLinkType.M3U8) {
-                                quality = h ?: Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
-                            resolved = true
-                        } else {
-                            resolved = emitVariants(variants, cleanLabel, playerRef, hlsHeaders, callback, "aincrad", "ap:$hash")
-                        }
-                    }
-                    // v32: only a real media answer becomes a VIDEO link. A 14-byte text/html
-                    // "security error" used to land in the else branch and was listed as a video,
-                    // which ExoPlayer then failed on (UnrecognizedInputFormat, 3003).
-                    !looksLikeMedia(head, t) ->
-                        log("aincrad: candidate unusable (http ${head.code}, ${head.headers["Content-Type"]}): ${t.replace(Regex("\\s+"), " ").take(160)}")
-                    else -> {
-                        val cleanLabel = cleanDisplayName(label)
-                        val sizeBytes = parseContentRangeTotal(head.headers)
-                        callback(newExtractorLink(source = cleanLabel, name = cleanLabel + formatSize(sizeBytes), url = cand, type = ExtractorLinkType.VIDEO) {
-                            quality = Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
-                        resolved = true
-                    }
-                }
-            }
-            return resolved
-        }
-
-        if (embed.startsWith("gd:")) {
-            val fileId = embed.removePrefix("gd:")
-            log("gdrive: fileId=$fileId for $label")
-            // v35: stream first, the way Drive's own embedded player does. The download route below
-            // hits the file's download quota ("Quota exceeded") long before the streaming one runs
-            // out; the website kept playing files the app could not (2026-09-26).
-            val streams = try { gdriveGate.withPermit { resolveGDriveStreams(fileId) } }
-                catch (e: kotlinx.coroutines.CancellationException) { throw e }
-                catch (e: Exception) { log("gdrive: stream lookup error: ${e.message}"); emptyList() }
-            if (streams.isNotEmpty()) {
-                val cleanLabel = cleanDisplayName(label)
-                for (st in streams) callback(newExtractorLink(source = cleanLabel, name = "$cleanLabel ${st.height}p" + formatSize(st.sizeBytes),
-                    url = st.url, type = ExtractorLinkType.VIDEO) {
-                    quality = st.height; referer = "https://drive.google.com/"; headers = mapOf("User-Agent" to ua) })
-                return true
-            }
-            gdriveQuotaUntil[fileId]?.let { until ->
-                if (System.currentTimeMillis() < until) {
-                    log("gdrive: $fileId hit its download quota recently — not asking Google again for ${(until - System.currentTimeMillis()) / 60000} min")
-                    return false
-                }
-            }
-            val resolved = try {
-                gdriveGate.withPermit { resolveGDrive(fileId) }
-            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
-              catch (e: Exception) { log("gdrive: resolve error: ${e.message}"); null }
-            if (resolved != null && !gdriveReusable(resolved, fileId)) return false
-            if (resolved != null) {
-                val cleanLabel = cleanDisplayName(label)
-                val displayName = cleanLabel + formatSize(resolved.sizeBytes)
-                callback(newExtractorLink(source = cleanLabel, name = displayName, url = resolved.url, type = ExtractorLinkType.VIDEO) {
-                    quality = resolved.height ?: Qualities.Unknown.value; referer = "https://drive.google.com/"; headers = resolved.headers })
-                return true
-            }
-            log("gdrive: could not resolve a playable link for $fileId")
-            return false
-        }
-
-        if (embed.startsWith("bp:")) {
-            // Beta Player — puffytr.tr, unrelated to Aincrad. master.txt is a plain,
-            // unauthenticated standard HLS master.
-            val hash = embed.removePrefix("bp:")
-            log("beta: hash=$hash for $label")
-            val watchRef = "https://pl.puffytr.tr/watch/$hash"
-            val betaHeaders = mapOf("User-Agent" to ua, "Referer" to watchRef)
-            val masterUrl = "https://pl.puffytr.tr/stream/$hash/master.txt"
-            val body = try {
-                app.get(masterUrl, headers = betaHeaders, timeout = 10L).text
-            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
-            catch (e: Exception) { log("beta: master.txt fetch failed: ${e.message}"); return false }
-            if (!body.trimStart().startsWith("#EXTM3U")) { log("beta: master.txt not a valid playlist"); return false }
-            val variants = parseVariants(body, masterUrl)
-            if (variants.isEmpty()) { log("beta: no parseable variants in master.txt"); return false }
-            log("beta: master lists ${variants.joinToString { "${it.height}p ${it.url.substringAfterLast('/').substringBefore('?').take(40)}${if (it.url.contains('?')) "?…" else ""}" }}")
-            return coroutineScope {
-                // v31 diagnostic (playback stops after 7–8 min): runs alongside the probes.
-                launch { describeMediaPlaylist(variants.first().url, betaHeaders, "beta") }
-                emitVariants(variants, cleanDisplayName(label), watchRef, betaHeaders, callback, "beta", "bp:$hash")
-            }
-        }
-
+        if (embed.startsWith("ex:")) return processExtractorSource(vi, embed, data, label, callback, subtitleCallback, deferSniff)
+        if (embed.startsWith("ap:")) return processAincrad(vi, embed, data, label, callback, subtitleCallback, deferSniff)
+        if (embed.startsWith("gd:")) return processGDrive(vi, embed, data, label, callback, subtitleCallback, deferSniff)
+        if (embed.startsWith("bp:")) return processBeta(vi, embed, data, label, callback, subtitleCallback, deferSniff)
         return false
     }
+
+    // v38: split out of processSource, which had outgrown ART's compiler limit (17494 instructions,
+    // "Method exceeds compiler instruction limit" in the device log) and so always ran interpreted.
+    private suspend fun processExtractorSource(
+        vi: VidInfo, embed: String, data: String, label: String,
+        callback: (ExtractorLink) -> Unit, subtitleCallback: (SubtitleFile) -> Unit,
+        deferSniff: ((VidInfo, String) -> Unit)?,
+    ): Boolean {
+        val exUrl = embed.removePrefix("ex:")
+        log("step4: $label -> loadExtractor $exUrl")
+        var found = false
+        try {
+            // Collect, then re-emit with the fansub in the name — otherwise these
+            // links show only the extractor name ("Voe") with no fansub attribution
+            val collected = java.util.concurrent.CopyOnWriteArrayList<ExtractorLink>()
+            kotlinx.coroutines.withTimeoutOrNull(15_000) {
+                loadExtractor(exUrl, data, subtitleCallback) { collected.add(it) }
+            }
+            for (l in collected) {
+                // Some built-in extractors (StreamLare, Voe, etc.) already bake a
+                // quality tag onto the end of their own .name — e.g. "Voe 1080p".
+                // Strip it before appending ours below, or it shows as "Voe 1080p 1080p".
+                val cleanName = cleanDisplayName(l.name)
+                callback(newExtractorLink(source = "${vi.fansub} - $cleanName", name = "${vi.fansub} - $cleanName", url = l.url, type = l.type) {
+                    referer = l.referer; quality = l.quality; headers = l.headers; extractorData = l.extractorData })
+                found = true
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Exception) { log("step4: loadExtractor failed: ${e.message}") }
+
+        // v16: CloudStream had no extractor for this host (or it produced nothing).
+        // Load the player page in a hidden WebView and take the playlist it requests.
+        // v37: Sistenn-family pages (sistenn.uns.bio, rpmvid, strp2p: https://host/#id) are asked
+        // directly through their own API before any WebView is loaded — one to three small
+        // requests instead of a full page with ads, taps and a 10-25 s wait.
+        if (!found) {
+            val direct = try { trySistennApi(exUrl, cleanDisplayName(label), callback) }
+                catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (e: Exception) { log("sistenn-api: error ${e.javaClass.simpleName}: ${e.message?.take(100)}"); SistennResult.UNAVAILABLE }
+            when (direct) {
+                SistennResult.EMITTED -> return true
+                SistennResult.CAPACITY -> return false // the page would hit the same wall
+                SistennResult.UNAVAILABLE -> {}
+            }
+        }
+        if (!found && settings.browserSniff) {
+            val cached = sniffCache[exUrl]?.takeIf { System.currentTimeMillis() - it.second < sniffCacheTtlMs }?.first
+            if (cached != null) log("step4: reusing sniffed playlist for $label")
+            if (cached == null && deferSniff != null) {
+                log("step4: $label needs the browser — deferred until the cheap sources are done")
+                deferSniff(vi, embed)
+                return false
+            }
+            val overBudget = sniffSpentThisLoad >= sniffBudgetPerLoadMs
+            val skip = cached == null && (sniffHostOnCooldown(exUrl) || overBudget)
+            if (skip) log("step4: skipping sniff for $label (${if (overBudget) "episode sniff budget spent" else "host on cooldown"})")
+            val sniffed = cached ?: if (skip) null else try {
+                val t0 = System.currentTimeMillis()
+                sniffGate.withPermit {
+                    // v33: another source (or load) may have sniffed this page while we waited.
+                    sniffCache[exUrl]?.takeIf { System.currentTimeMillis() - it.second < sniffCacheTtlMs }?.first
+                        ?.also { log("step4: $label was sniffed meanwhile — reusing it") }
+                        ?: sniffHlsViaWebView(exUrl, "$mainUrl/")
+                }
+                    .also {
+                        sniffSpentThisLoad += System.currentTimeMillis() - t0
+                        noteSniffResult(exUrl, it != null)
+                    }
+            }
+            catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { log("step4: sniff failed: ${e.message}"); noteSniffResult(exUrl, false); null }
+            if (sniffed != null) found = emitSniffed(exUrl, sniffed, label, callback)
+        }
+        return found
+    }
+
+    // v38: split out of processExtractorSource (compiler instruction limit, see processSource).
+    private suspend fun emitSniffed(exUrl: String, sniffed: String, label: String, callback: (ExtractorLink) -> Unit): Boolean {
+        var found = false
+        sniffCache[exUrl] = sniffed to System.currentTimeMillis()
+        if (sniffCache.size > 60) {
+            val now = System.currentTimeMillis()
+            sniffCache.entries.removeAll { now - it.value.second > sniffCacheTtlMs }
+        }
+        // v19: the player gets its own HTTP stack, so everything the page had must
+        // be spelled out on the link — UA, Referer, Origin, and any cookie the
+        // stream host handed the hidden WebView.
+        val pageUrl = exUrl.substringBefore('#')
+        val origin = try { java.net.URI(pageUrl).let { "${it.scheme}://${it.host}" } } catch (_: Exception) { pageUrl }
+        val sniffHeaders = mutableMapOf("User-Agent" to ua, "Referer" to pageUrl, "Origin" to origin).also { h ->
+            // v27: whatever the page's own player sent for the stream wins (custom
+            // headers included). Cookies aren't in that list, so they're added after.
+            sniffedHeaders[sniffed]?.forEach { (k, v) ->
+                h.keys.firstOrNull { it.equals(k, true) }?.let { h.remove(it) }
+                h[k] = v
+            }
+            (cookiesFor(sniffed) ?: cookiesFor(pageUrl))?.let { h["Cookie"] = it }
+        }.toMap()
+        log("sniff: link headers = ${sniffHeaders.keys.joinToString()}${sniffedHeaders[sniffed]?.let { " (copied from the page's player)" } ?: ""}")
+        val fetched = try { app.get(sniffed, headers = sniffHeaders, timeout = 6L).text }
+        catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Exception) { log("step4: sniffed playlist fetch failed: ${e.message}"); "" }
+        // v33: the host may ignore this client entirely; the page's own copy is as good.
+        val body = if (fetched.trimStart().startsWith("#EXTM3U")) fetched
+            else sniffedPlaylistTexts[sniffed.substringBefore('?')]?.also { log("sniff: using the master the page fetched itself") } ?: fetched
+        val cleanLabel = cleanDisplayName(label)
+        if (body.trimStart().startsWith("#EXTM3U")) {
+            var variants = parseVariants(body, sniffed)
+            var tokenQuery = ""
+            // v29: if the page's player asked for its variant with a query string that
+            // the master's own variant lines don't carry, the page's script added it —
+            // most likely an access token. Put the same query on every variant.
+            sniffedVariantUrls[sniffed]?.let { pv ->
+                val q = pv.substringAfter('?', "")
+                val sameFile = variants.firstOrNull { it.url.substringBefore('?') == pv.substringBefore('?') }
+                log("sniff: master lists ${variants.joinToString { it.url.substringAfterLast('/').take(80) }}; player used ${pv.substringAfterLast('/').take(120)}" +
+                    (if (sameFile == null) " (not one of the listed variants)" else ""))
+                if (q.isNotEmpty() && variants.none { it.url.contains('?') }) {
+                    variants = variants.map { it.copy(url = it.url + "?" + q) }
+                    tokenQuery = q
+                    log("sniff: copied the player's query onto the variants: ?${q.take(120)}")
+                }
+            }
+            sniffedSegmentUrls[sniffed]?.let { log("sniff: player's first segment was ${it.substringAfterLast('/').take(160)}") }
+            log("sniff: master has ${variants.size} variant(s): ${variants.joinToString(", ") { "${it.height}p/${(it.bandwidth ?: 0) / 1000}k" }}")
+            // v28: the link's referer used to be exUrl — with its #fragment. CloudStream
+            // sends that as the Referer header, which no browser ever does, and the
+            // stream host answered the player with 403 (v27 log). Use the player's
+            // origin, exactly what the page's own player sent.
+            val linkReferer = sniffHeaders.entries.firstOrNull { it.key.equals("Referer", true) }?.value ?: "$origin/"
+            // v28: find a header set the stream host accepts for a variant playlist
+            // AND its first segment (the v27 log: segments 403 while playlists passed).
+            val secFetch = mapOf("Sec-Fetch-Dest" to "empty", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Site" to "cross-site",
+                "Accept-Language" to (try { java.util.Locale.getDefault().toLanguageTag() } catch (_: Throwable) { "en-US" }) + ",en;q=0.8")
+            val minimal = mapOf("User-Agent" to ua, "Referer" to linkReferer, "Origin" to origin)
+            val candidates = listOf(
+                "player + browser fetch headers" to sniffHeaders + secFetch,
+                "player" to sniffHeaders,
+                "player, no cookies" to sniffHeaders.filterKeys { !it.equals("Cookie", true) } + secFetch,
+                "minimal + fetch headers" to minimal + secFetch,
+                "minimal" to minimal,
+            )
+            // v34: token links go through the local playlist server and the player fetches
+            // segments itself, so this client's view of the host decides nothing; probing
+            // only cost time (8s timeouts in the device logs).
+            val picked = if (tokenQuery.isNotEmpty()) null
+                else variants.lastOrNull()?.let { pickStreamHeaders(it.url, candidates, tokenQuery) }
+            val linkHeaders = picked ?: candidates.first().second
+            if (picked == null && tokenQuery.isEmpty()) log("sniff: no header set got a segment from this app's client — listing the links anyway (the player's own network stack may still get through)")
+            // v34: if the page could fetch some variants but not others, the missing ones are
+            // the ones the host stalls (1080p index-f2 in every log so far): don't list them.
+            // v35: "hlsmod" streams (Sistenn serving a TikTok-CDN stream from its own host) disguise
+            // every segment as an image; the page's player strips that, ExoPlayer can't
+            // (UnrecognizedInputFormat, device log 2026-09-26). Those go through the local
+            // server, which fetches each segment and cuts it down to the real media.
+            val hlsmod = sniffed.contains("/hlsmod/", ignoreCase = true)
+            val useProxy = tokenQuery.isNotEmpty() || hlsmod
+            val captured = variants.filter { sniffedPlaylistTexts.containsKey(it.url.substringBefore('?')) }
+            if (useProxy && captured.isNotEmpty() && captured.size < variants.size) {
+                log("sniff: leaving out ${variants.filter { it !in captured }.joinToString { "${it.height}p" }} — the page could not fetch it")
+                variants = captured
+            }
+            // v35: and only the qualities the page's player actually got segments for. The stream
+            // hosts stall 1080p (index-f2) segments for the app as well (v34 log: Cronet
+            // SocketTimeoutException) while the page only ever played f1.
+            val segsSeen = sniffedSegmentSets[sniffed].orEmpty()
+            val played = variants.filter { v -> variantTagRe.find(v.url)?.groupValues?.get(1)?.let { t -> segsSeen.any { it.contains("-$t.") } } == true }
+            if (useProxy && played.isNotEmpty() && played.size < variants.size) {
+                log("sniff: leaving out ${variants.filter { it !in played }.joinToString { "${it.height}p" }} — the page's player never loaded its segments")
+                variants = played
+            }
+            // v32: segments need the token too. The variant playlists list them relative
+            // and without it, so ExoPlayer asked for bare init/seg URLs and got Cloudflare
+            // 403s (device log 2026-09-26: 35s of buffering, no error). Serve the player a
+            // rewritten copy of each variant from 127.0.0.1 in which every segment is an
+            // absolute URL carrying the token; the segments themselves still come
+            // straight from the stream host.
+            // v35: with the page's refresh call known, segments are served as redirects that carry a
+            // token the local server keeps fresh (the one in the playlist expires 30 min after the sniff).
+            val tokenState = if (tokenQuery.isNotEmpty() && !hlsmod) sniffedRefreshUrls[exUrl]?.let { ru ->
+                LocalHlsServer.TokenState(tokenQuery, ru, mapOf("User-Agent" to ua, "Accept" to "*/*",
+                    "Referer" to (try { java.net.URI(ru).let { "${it.scheme}://${it.host}/" } } catch (_: Exception) { "$origin/" })))
+            } else null
+            if (tokenState != null) log("sniff: token will be renewed through the page's refresh call when it nears expiry")
+            val proxied = if (useProxy && variants.isNotEmpty())
+                variants.mapNotNull { v -> localHls.register(v.url, tokenQuery, linkHeaders, sniffedPlaylistTexts[v.url.substringBefore('?')],
+                    stripSegments = hlsmod, token = tokenState)?.let { v to it } } else emptyList()
+            if (proxied.isNotEmpty()) log("sniff: serving ${proxied.size} tokenised playlist(s) via ${proxied.first().second.substringBeforeLast('/')}, " +
+                "${variants.count { sniffedPlaylistTexts.containsKey(it.url.substringBefore('?')) }} from the page's own fetch")
+            found = if (proxied.isNotEmpty()) {
+                for ((v, local) in proxied) callback(newExtractorLink(source = cleanLabel, name = "$cleanLabel ${v.height}p",
+                    url = local, type = ExtractorLinkType.M3U8) { quality = v.height; referer = linkReferer; headers = linkHeaders })
+                true
+            } else if (variants.isNotEmpty())
+                emitVariants(variants, cleanLabel, linkReferer, linkHeaders, callback, "sniff",
+                    "sn:${sniffed.substringBefore('?').takeLast(40)}", allowDeclaredFallback = true,
+                    trustPlaylists = picked == null)
+            else {
+                callback(newExtractorLink(source = cleanLabel, name = cleanLabel, url = sniffed, type = ExtractorLinkType.M3U8) {
+                    quality = Qualities.Unknown.value; referer = linkReferer; headers = linkHeaders })
+                true
+            }
+        } else {
+            // v20: this used to hand the URL to the player anyway. That is how a dead
+            // link ended up in the list — ExoPlayer got a 404 and the episode looked
+            // broken. If we cannot read it as a playlist ourselves, neither can the
+            // player, so drop it and let the next source have its turn.
+            log("sniff: ${sniffed.substringBefore('?').takeLast(50)} is not a playlist (${body.take(40).replace('\n', ' ')}) — discarding")
+            sniffCache.remove(exUrl)
+        }
+        return found
+    }
+
+    // v38: split out of processSource, which had outgrown ART's compiler limit (17494 instructions,
+    // "Method exceeds compiler instruction limit" in the device log) and so always ran interpreted.
+    private suspend fun processAincrad(
+        vi: VidInfo, embed: String, data: String, label: String,
+        callback: (ExtractorLink) -> Unit, subtitleCallback: (SubtitleFile) -> Unit,
+        deferSniff: ((VidInfo, String) -> Unit)?,
+    ): Boolean {
+        val hash = embed.removePrefix("ap:")
+        // 4.0: the real player page is /video/{hash} — that's where /player/{numId}
+        // redirects, and it's what a browser has as Referer for everything after.
+        // The old warm-up hit $playerBase/player/{hash}, which is a 404 on
+        // anizmplayer.com (verified), so every Aincrad play started with a request
+        // no browser ever makes, and then used that 404 URL as the Referer.
+        val apBase = apDomains[hash] ?: playerBase
+        val playerRef = "$apBase/video/$hash"
+        val aHeaders = mapOf("User-Agent" to ua,
+            "X-Requested-With" to "XMLHttpRequest", "Accept" to "*/*",
+            "Referer" to playerRef, "Origin" to apBase)
+        val now = System.currentTimeMillis()
+        val cachedSource = aincradCache[hash]?.takeIf { it.validUntil > now }
+        val videoSource: String
+        val securedLink: String
+        // v32: the player's session cookies. The device log (2026-09-26) had master.txt
+        // answer this client with 200 "security error" while the browser, which sends the
+        // cookies the player page and getVideo set, got the playlist. The app's HTTP client
+        // keeps no cookie jar, so they are carried by hand, to getVideo and onto the link.
+        val cookieJar = LinkedHashMap<String, String>()
+        if (cachedSource != null) {
+            videoSource = cachedSource.videoSource; securedLink = cachedSource.securedLink
+            cachedSource.cookie.split("; ").filter { '=' in it }.forEach { cookieJar[it.substringBefore('=')] = it.substringAfter('=') }
+            log("aincrad: reusing signed URL for $apBase $hash (${(cachedSource.validUntil - now) / 1000}s left)")
+        } else {
+            try { app.get(playerRef, headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/"), timeout = 8).cookies.let { cookieJar.putAll(it) } }
+            catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (_: Exception) {}
+            // 4.0: FirePlayer's own call is $.ajax POST with data {hash: ID, r: document.referrer}.
+            val streamResp = try {
+                app.post("$apBase/player/index.php?data=$hash&do=getVideo",
+                    headers = aHeaders + (if (cookieJar.isEmpty()) emptyMap() else mapOf("Cookie" to cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" })),
+                    data = mapOf("hash" to hash, "r" to "$mainUrl/"), timeout = 10).also { cookieJar.putAll(it.cookies) }
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+              catch (e: Exception) { log("aincrad error: ${e.javaClass.simpleName}: ${e.message}"); return false }
+            val streamText = streamResp.text
+            // v31: these two exits used to be silent, so a changed answer from getVideo left
+            // nothing in the log but a missing source. Say what came back instead.
+            val json = try { JSONObject(streamText) } catch (_: Exception) {
+                log("aincrad: getVideo not JSON (http ${streamResp.code}, ${streamResp.headers["Content-Type"]}, server=${streamResp.headers["server"]}, " +
+                    "cf-mitigated=${streamResp.headers["cf-mitigated"]}, final=${streamResp.url.take(80)}): ${streamText.replace(Regex("\\s+"), " ").take(200)}")
+                return false
+            }
+            securedLink = json.optString("securedLink", "")
+            videoSource = json.optString("videoSource", "")
+            log("aincrad: hls=${json.optBoolean("hls")} secured=${securedLink.isNotBlank()} source=${videoSource.isNotBlank()} same=${securedLink == videoSource} dl=${json.optJSONArray("downloadLinks")?.length() ?: 0} " +
+                "keys=${json.keys().asSequence().joinToString(",")} cookies=${cookieJar.keys.joinToString(",").ifEmpty { "none" }}")
+            if (videoSource.isBlank() && securedLink.isBlank())
+                log("aincrad: getVideo gave no link (http ${streamResp.code}), keys=${json.keys().asSequence().joinToString()}: ${streamText.replace(Regex("\\s+"), " ").take(200)}")
+            else log("aincrad: link ${videoSource.ifBlank { securedLink }.substringBefore('?').take(120)}")
+            // Valid until 2 min before the URL's own expiry (seconds or ms epoch), max 30 min;
+            // 10 min if the URL doesn't say.
+            // v32: securedLink carries the expiry; videoSource (master.txt) has none since they split.
+            val exp = (expiresParamRe.find(securedLink) ?: expiresParamRe.find(videoSource))?.groupValues?.get(1)?.toLongOrNull()
+                ?.let { if (it < 100_000_000_000L) it * 1000 else it }
+            val until = minOf(exp?.minus(120_000) ?: (now + 10 * 60_000), now + 30 * 60_000)
+            if (until > now && (videoSource.isNotBlank() || securedLink.isNotBlank())) {
+                aincradCache[hash] = AincradSource(videoSource, securedLink, until,
+                    cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" })
+                if (aincradCache.size > 200) aincradCache.entries.removeAll { it.value.validUntil <= now }
+            }
+        }
+        // Single entry per source, chosen by CONTENT, not by JSON field name — see git
+        // history for the 3003 error this avoids. NOTE ON DOWNLOADS: split-audio masters
+        // stream fine but CloudStream's downloader can't mux them (app limitation).
+        val hlsHeaders = mapOf("User-Agent" to ua, "Origin" to apBase, "Referer" to playerRef) +
+            (if (cookieJar.isEmpty()) emptyMap() else mapOf("Cookie" to cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" }))
+
+        var resolved = false
+        // v32: securedLink first. Until 2026-09 both fields held the same URL; now videoSource
+        // is a bare master.txt behind a session check ("security error"), and securedLink is
+        // the md5/expires-signed master.m3u8, which carries its own authorisation.
+        for (cand in listOf(securedLink, videoSource).filter { it.isNotBlank() }.distinct()) {
+            if (resolved) break
+            val head = try {
+                app.get(cand, headers = hlsHeaders + mapOf("Range" to "bytes=0-4095"), timeout = 8)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) { log("aincrad: probe failed: ${e.message}"); continue }
+            val t = head.text.trimStart()
+            log("aincrad: probe http ${head.code}, ${head.headers["Content-Type"]}, ${t.length}B, starts '${t.take(24).replace('\n', ' ')}'")
+            when {
+                t.startsWith("#EXTM3U") -> {
+                    val cleanLabel = cleanDisplayName(label)
+                    val variants = parseVariants(t, cand)
+                    if (t.contains("TYPE=AUDIO") || variants.isEmpty()) {
+                        // Split audio (every Aincrad sample checked, 2026-09) or an
+                        // unparseable master: one master link, ExoPlayer does ABR + audio.
+                        // 4.0: this branch never showed a size before. Now it estimates the
+                        // top rendition (video + audio) by sampling real segment sizes.
+                        val h = variants.maxOfOrNull { it.height }
+                            ?: hlsResolutionRe.findAll(t).mapNotNull { it.groupValues[1].toIntOrNull() }.maxOrNull()
+                        val sizeKey = "ap:$hash"
+                        val est = if (estimateHlsSizes && variants.isNotEmpty()) {
+                            cachedSizes(sizeKey)?.get(0)
+                                ?: withTimeoutOrNull(sizeEstimateBudgetMs) { estimateSplitAudioBytes(t, cand, variants, hlsHeaders) }
+                                    ?.also { storeSizes(sizeKey, mapOf(0 to it)) }
+                        } else null
+                        callback(newExtractorLink(source = cleanLabel, name = cleanLabel + formatSize(est, isEstimate = true), url = cand, type = ExtractorLinkType.M3U8) {
+                            quality = h ?: Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
+                        resolved = true
+                    } else {
+                        resolved = emitVariants(variants, cleanLabel, playerRef, hlsHeaders, callback, "aincrad", "ap:$hash")
+                    }
+                }
+                // v32: only a real media answer becomes a VIDEO link. A 14-byte text/html
+                // "security error" used to land in the else branch and was listed as a video,
+                // which ExoPlayer then failed on (UnrecognizedInputFormat, 3003).
+                !looksLikeMedia(head, t) ->
+                    log("aincrad: candidate unusable (http ${head.code}, ${head.headers["Content-Type"]}): ${t.replace(Regex("\\s+"), " ").take(160)}")
+                else -> {
+                    val cleanLabel = cleanDisplayName(label)
+                    val sizeBytes = parseContentRangeTotal(head.headers)
+                    callback(newExtractorLink(source = cleanLabel, name = cleanLabel + formatSize(sizeBytes), url = cand, type = ExtractorLinkType.VIDEO) {
+                        quality = Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
+                    resolved = true
+                }
+            }
+        }
+        return resolved
+    }
+
+    // v38: split out of processSource, which had outgrown ART's compiler limit (17494 instructions,
+    // "Method exceeds compiler instruction limit" in the device log) and so always ran interpreted.
+    private suspend fun processGDrive(
+        vi: VidInfo, embed: String, data: String, label: String,
+        callback: (ExtractorLink) -> Unit, subtitleCallback: (SubtitleFile) -> Unit,
+        deferSniff: ((VidInfo, String) -> Unit)?,
+    ): Boolean {
+        val fileId = embed.removePrefix("gd:")
+        log("gdrive: fileId=$fileId for $label")
+        // v35: stream first, the way Drive's own embedded player does. The download route below
+        // hits the file's download quota ("Quota exceeded") long before the streaming one runs
+        // out; the website kept playing files the app could not (2026-09-26).
+        val streams = try { gdriveGate.withPermit { resolveGDriveStreams(fileId) } }
+            catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { log("gdrive: stream lookup error: ${e.message}"); emptyList() }
+        if (streams.isNotEmpty()) {
+            val cleanLabel = cleanDisplayName(label)
+            for (st in streams) callback(newExtractorLink(source = cleanLabel, name = "$cleanLabel ${st.height}p" + formatSize(st.sizeBytes),
+                url = st.url, type = ExtractorLinkType.VIDEO) {
+                quality = st.height; referer = "https://drive.google.com/"; headers = mapOf("User-Agent" to ua) })
+            return true
+        }
+        gdriveQuotaUntil[fileId]?.let { until ->
+            if (System.currentTimeMillis() < until) {
+                log("gdrive: $fileId hit its download quota recently — not asking Google again for ${(until - System.currentTimeMillis()) / 60000} min")
+                return false
+            }
+        }
+        val resolved = try {
+            gdriveGate.withPermit { resolveGDrive(fileId) }
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+          catch (e: Exception) { log("gdrive: resolve error: ${e.message}"); null }
+        if (resolved != null && !gdriveReusable(resolved, fileId)) return false
+        if (resolved != null) {
+            val cleanLabel = cleanDisplayName(label)
+            val displayName = cleanLabel + formatSize(resolved.sizeBytes)
+            callback(newExtractorLink(source = cleanLabel, name = displayName, url = resolved.url, type = ExtractorLinkType.VIDEO) {
+                quality = resolved.height ?: Qualities.Unknown.value; referer = "https://drive.google.com/"; headers = resolved.headers })
+            return true
+        }
+        log("gdrive: could not resolve a playable link for $fileId")
+        return false
+    }
+
+    // v38: split out of processSource, which had outgrown ART's compiler limit (17494 instructions,
+    // "Method exceeds compiler instruction limit" in the device log) and so always ran interpreted.
+    private suspend fun processBeta(
+        vi: VidInfo, embed: String, data: String, label: String,
+        callback: (ExtractorLink) -> Unit, subtitleCallback: (SubtitleFile) -> Unit,
+        deferSniff: ((VidInfo, String) -> Unit)?,
+    ): Boolean {
+        // Beta Player — puffytr.tr, unrelated to Aincrad. master.txt is a plain,
+        // unauthenticated standard HLS master.
+        val hash = embed.removePrefix("bp:")
+        log("beta: hash=$hash for $label")
+        val watchRef = "https://pl.puffytr.tr/watch/$hash"
+        val betaHeaders = mapOf("User-Agent" to ua, "Referer" to watchRef)
+        val masterUrl = "https://pl.puffytr.tr/stream/$hash/master.txt"
+        val body = try {
+            app.get(masterUrl, headers = betaHeaders, timeout = 10L).text
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Exception) { log("beta: master.txt fetch failed: ${e.message}"); return false }
+        if (!body.trimStart().startsWith("#EXTM3U")) { log("beta: master.txt not a valid playlist"); return false }
+        val variants = parseVariants(body, masterUrl)
+        if (variants.isEmpty()) { log("beta: no parseable variants in master.txt"); return false }
+        log("beta: master lists ${variants.joinToString { "${it.height}p ${it.url.substringAfterLast('/').substringBefore('?').take(40)}${if (it.url.contains('?')) "?…" else ""}" }}")
+        return coroutineScope {
+            // v31 diagnostic (playback stops after 7–8 min): runs alongside the probes.
+            launch { describeMediaPlaylist(variants.first().url, betaHeaders, "beta") }
+            emitVariants(variants, cleanDisplayName(label), watchRef, betaHeaders, callback, "beta", "bp:$hash")
+        }
+    }
+
 
     /** v32: a 2xx answer that is actually media (by type, or binary content), not an error text. */
     private fun looksLikeMedia(r: NiceResponse, text: String): Boolean {
@@ -2610,8 +2644,14 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         val raw = mapOf("Cloudflare" to o.optString("cf"), "Tiktok" to o.optString("hlsVideoTiktok"),
             "Google" to o.optString("hlsVideoGoogle"), "In-House" to o.optString("source"))
         val out = ArrayList<SistennSource>()
-        abs(o.optString("cfNative"))?.let { out += SistennSource("cfNative", it, false) }
+        // v38: the site's own order, with cfNative (Cloudflare for native players) just ahead of
+        // Cloudflare. v37 tried cfNative first; its segments stalled for the app's player (device
+        // log 2026-09-26: Cronet SocketTimeoutException for 70 s) while the site's own first choice,
+        // Tiktok, is the source that already played in the app.
+        val cfNative = abs(o.optString("cfNative"))
+        var cfNativeAdded = false
         for (kind in order) {
+            if (kind == "Cloudflare" && cfNative != null) { out += SistennSource("cfNative", cfNative, false); cfNativeAdded = true }
             var url = abs(raw[kind] ?: "") ?: continue
             val adj = adjust?.optJSONObject(kind)
             if (adj?.optBoolean("disabled") == true) continue
@@ -2620,6 +2660,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             if (dom.isNotEmpty() && url.contains("/hls/")) url = url.replaceFirst("/hls/", "/hlsmod/$dom/")
             out += SistennSource(kind, url, kind == "Tiktok" || kind == "Google" || url.contains("/hlsmod/"))
         }
+        if (cfNative != null && !cfNativeAdded) out += SistennSource("cfNative", cfNative, false)
         return out
     }
 
@@ -2679,6 +2720,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         } catch (_: Exception) { null }
         log("sistenn-api: ${v.optString("title").take(60)} — sources ${sources.joinToString { it.kind }}")
         val streamHeaders = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin, "Accept" to "*/*")
+        var sourcesEmitted = 0
         for (src in sources) {
             // /v4/ hosts want the token on every request (the page's own rule); cfNative carries its own.
             val needsPk = src.url.contains("/v4/") && !Regex("""[?&]k=""").containsMatchIn(src.url) && pkQuery.isNotEmpty()
@@ -2696,24 +2738,46 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                     val t = if (vv.url == masterUrl) master else try {
                         withTimeoutOrNull(5_000L) { app.get(vv.url, headers = streamHeaders, timeout = 5L).takeIf { it.code in 200..299 }?.text }
                     } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { null }
-                    t?.takeIf { it.trimStart().startsWith("#EXTM3U") }?.let { vv to it }
+                    val text = t?.takeIf { it.trimStart().startsWith("#EXTM3U") } ?: return@async null
+                    // v38: and whose first segment answers. A playlist can load while its segments
+                    // stall (cfNative, the /v4/ hosts' 1080p), which hangs the player for a minute.
+                    val first = text.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
+                        ?: return@async (vv to text)
+                    val segUrl = (try { java.net.URI(vv.url).resolve(first).toString() } catch (_: Exception) { first })
+                        .let { u -> if (tokenQuery.isNotEmpty() && !u.contains('?')) "$u?$tokenQuery" else u }
+                    val segOk = try {
+                        withTimeoutOrNull(5_000L) {
+                            val r = app.get(segUrl, headers = streamHeaders + mapOf("Range" to "bytes=0-0"), timeout = 5L)
+                            val ok = r.code == 200 || r.code == 206
+                            try { r.okhttpResponse.close() } catch (_: Exception) {}
+                            if (!ok) log("sistenn-api: ${src.kind} ${vv.height}p segment answered http ${r.code}")
+                            ok
+                        } ?: false.also { log("sistenn-api: ${src.kind} ${vv.height}p segment did not answer in 5 s (${try { java.net.URI(segUrl).host } catch (_: Exception) { "?" }})") }
+                    } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { false }
+                    if (segOk) vv to text else null
                 } }.mapNotNull { it.await() }
             }
             if (loaded.isEmpty()) { log("sistenn-api: ${src.kind} variants not readable, next"); continue }
             val tokenState = if (tokenQuery.isNotEmpty() && tokenQuery.startsWith("k=${pk?.optString("k")}&") && refreshUrl != null)
                 LocalHlsServer.TokenState(tokenQuery, refreshUrl, apiHeaders) else null
             var emitted = 0
+            // v38: a second working source is listed as an alternative ("· 2"), so the app's
+            // automatic next-link fallback has another Sistenn route to try.
+            val tag = if (sourcesEmitted == 0) "" else " · ${sourcesEmitted + 1}"
             for ((vv, text) in loaded.sortedByDescending { it.first.height }) {
                 val local = localHls.register(vv.url, tokenQuery, streamHeaders, text, stripSegments = src.strip, token = tokenState) ?: continue
-                callback(newExtractorLink(source = label, name = if (vv.height > 0) "$label ${vv.height}p" else label, url = local, type = ExtractorLinkType.M3U8) {
+                callback(newExtractorLink(source = label, name = (if (vv.height > 0) "$label ${vv.height}p" else label) + tag, url = local, type = ExtractorLinkType.M3U8) {
                     quality = vv.height; referer = "$origin/"; headers = streamHeaders })
                 emitted++
             }
             if (emitted > 0) {
-                log("sistenn-api: ${src.kind} → ${loaded.joinToString { "${it.first.height}p" }}${if (variants.size > loaded.size) " (${variants.size - loaded.size} variant(s) did not load)" else ""}, no WebView needed")
-                return SistennResult.EMITTED
+                val segHost = try { java.net.URI(loaded.first().second.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
+                    ?.let { java.net.URI(loaded.first().first.url).resolve(it).toString() } ?: "").host } catch (_: Exception) { null }
+                log("sistenn-api: ${src.kind} → ${loaded.joinToString { "${it.first.height}p" }}${if (variants.size > loaded.size) " (${variants.size - loaded.size} variant(s) did not load)" else ""}, segments on ${segHost ?: "?"}, no WebView needed")
+                if (++sourcesEmitted >= 2) return SistennResult.EMITTED
             }
         }
+        if (sourcesEmitted > 0) return SistennResult.EMITTED
         log("sistenn-api: no source of $id was readable from here — falling back to the WebView")
         return SistennResult.UNAVAILABLE
     }
