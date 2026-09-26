@@ -31,6 +31,8 @@ class ReZeroIzleProvider : MainAPI() {
         private val GDRIVE_PARAM_RE = Regex("""[?&](?:amp;)?id=([A-Za-z0-9_-]{25,45})""")
         private val GDRIVE_URL_RE   = Regex("""drive\.google\.com/(?:uc|file/d)[?/][^\s"'<>]*?id[=/]([A-Za-z0-9_-]{25,45})""")
 
+        private val UC_SIZE_RE      = Regex("""\(\s*([\d.,]+)\s*([KMGT])B?\s*\)""", RegexOption.IGNORE_CASE)
+
         private const val CACHE_TTL_MS = 300_000L  // 5 min
     }
 
@@ -353,19 +355,90 @@ class ReZeroIzleProvider : MainAPI() {
         }
 
         ids.forEachIndexed { i, fileId ->
-            android.util.Log.d("ReZeroIzle", "GDrive fileId[$i]=$fileId")
+            val drive = resolveDrive(fileId)
+            android.util.Log.d("ReZeroIzle", "GDrive fileId[$i]=$fileId size=${drive.sizeBytes}")
+            val label = if (i == 0) "Google Drive" else "Google Drive ${i + 1}"
             callback(
                 newExtractorLink(
                     source = name,
-                    name   = if (i == 0) "Google Drive" else "Google Drive ${i + 1}",
-                    url    = "https://drive.usercontent.google.com/download?id=$fileId&export=download&confirm=t",
+                    name   = label + formatSize(drive.sizeBytes),
+                    url    = drive.url,
                     type   = ExtractorLinkType.VIDEO,
                 ) {
                     quality = Qualities.Unknown.value
                     referer = "https://drive.google.com/"
+                    headers = drive.headers
                 }
             )
         }
         return true
+    }
+
+    // ── Google Drive: playable URL and file size ─────────────────────────────
+    private data class DriveLink(val url: String, val headers: Map<String, String>, val sizeBytes: Long?)
+
+    // One ranged byte from Drive's download endpoint gives the size in Content-Range.
+    // Files past Google's virus-scan limit answer with an interstitial page instead; its
+    // "(1.4G)" text gives the size, and submitting its download form (as Anizm does) gives
+    // a URL that serves the video. confirm=t is the last resort, as before.
+    private suspend fun resolveDrive(fileId: String): DriveLink {
+        val base = "https://drive.usercontent.google.com/download?id=$fileId&export=download"
+        val ua = baseHeaders.getValue("User-Agent")
+        val fallback = DriveLink("$base&confirm=t", emptyMap(), null)
+        val h = mapOf("User-Agent" to ua, "Range" to "bytes=0-0")
+        return try {
+            val r1 = app.get(base, headers = h, timeout = 15)
+            if (!isHtml(r1)) return DriveLink(base, emptyMap(), rangedSize(r1))
+
+            val gdoc = org.jsoup.Jsoup.parse(r1.text, r1.url)
+            val pageSize = gdoc.selectFirst(".uc-name-size")?.text()?.let { UC_SIZE_RE.find(it) }?.let { m ->
+                val n = m.groupValues[1].replace(',', '.').toDoubleOrNull() ?: return@let null
+                val mult = when (m.groupValues[2].uppercase()) { "K" -> 1L shl 10; "M" -> 1L shl 20; "G" -> 1L shl 30; else -> 1L shl 40 }
+                (n * mult).toLong()
+            }
+            val form = gdoc.selectFirst("form#download-form")
+                ?: gdoc.select("form").firstOrNull { it.attr("action").contains("download") || it.selectFirst("input[name=id]") != null }
+            if (form != null) {
+                val action = form.attr("abs:action").ifBlank { "https://drive.usercontent.google.com/download" }
+                val params = form.select("input[name]").associate { it.attr("name") to it.attr("value") }
+                    .let { if ("id" !in it) it + ("id" to fileId) else it }
+                val query = params.entries.joinToString("&") {
+                    "${java.net.URLEncoder.encode(it.key, "UTF-8")}=${java.net.URLEncoder.encode(it.value, "UTF-8")}"
+                }
+                val url = if (action.contains('?')) "$action&$query" else "$action?$query"
+                val cookie = r1.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+                val playHeaders = mapOf("User-Agent" to ua) + (if (cookie.isNotBlank()) mapOf("Cookie" to cookie) else emptyMap())
+                val r2 = app.get(url, headers = h + playHeaders, timeout = 15)
+                if (!isHtml(r2)) return DriveLink(url, playHeaders, rangedSize(r2) ?: pageSize)
+                android.util.Log.w("ReZeroIzle", "GDrive $fileId: still HTML after the download form")
+            }
+            fallback.copy(sizeBytes = pageSize)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            android.util.Log.w("ReZeroIzle", "GDrive $fileId probe failed: ${e.message}")
+            fallback
+        }
+    }
+
+    private fun isHtml(r: com.lagradost.nicehttp.NiceResponse) =
+        (r.headers["Content-Type"] ?: "").contains("text/html", ignoreCase = true)
+
+    // Reads the size and closes the response, so the 1-byte body is never left open.
+    private fun rangedSize(r: com.lagradost.nicehttp.NiceResponse): Long? {
+        val size = when (r.code) {
+            206 -> r.headers["Content-Range"]?.substringAfterLast('/')?.trim()?.toLongOrNull()
+            200 -> r.headers["Content-Length"]?.toLongOrNull()
+            else -> null
+        }
+        try { r.okhttpResponse.close() } catch (_: Exception) {}
+        return size
+    }
+
+    // " [1.3GB]" / " [350MB]", the same format as Anizm.
+    private fun formatSize(bytes: Long?): String {
+        if (bytes == null || bytes <= 0) return ""
+        val gb = bytes / 1_073_741_824.0
+        return if (gb >= 1) " [%.1fGB]".format(gb) else " [%.0fMB]".format(bytes / 1_048_576.0)
     }
 }
