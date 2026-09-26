@@ -246,6 +246,9 @@ class AnizmSettings(private val prefs: SharedPreferences) {
     var siteHost: String?
         get() = prefs.getString("site_host", null)
         set(v) { prefs.edit().putString("site_host", v).apply() }
+    /** v42: the last player script name seen per Sistenn-family host (a change is logged). */
+    fun playerScript(host: String): String? = prefs.getString("player_script_$host", null)
+    fun setPlayerScript(host: String, name: String) { prefs.edit().putString("player_script_$host", name).apply() }
     /** 0 = any quality counts toward the lazy target. */
     val lazyMinQuality get() = prefs.getInt("lazy_min_quality", 1080)
 

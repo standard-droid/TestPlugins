@@ -414,7 +414,10 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                             conn.doOutput = true; conn.setFixedLengthStreamingMode(b.size); conn.outputStream.use { it.write(b) }
                         }
                         val code = conn.responseCode
-                        val bytes = (if (code >= 400) conn.errorStream else conn.inputStream)?.use { readUpTo(it, maxBytes) } ?: ByteArray(0)
+                        // v42: a 3xx has no body to read; Cronet throws if asked (device log: every
+                        // /player/ lookup fell back to OkHttp, and five of them switched Cronet off).
+                        val bytes = if (code in 300..399 || code == 204 || code == 304) ByteArray(0)
+                            else (if (code >= 400) conn.errorStream else conn.inputStream)?.use { readUpTo(it, maxBytes) } ?: ByteArray(0)
                         code to bytes
                     }
                 } catch (e: kotlinx.coroutines.CancellationException) { throw e }
@@ -552,9 +555,12 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         slots[order[2]] = "\"Google Chrome\";v=\"$major\""
         slots.joinToString(", ")
     }
-    private val clientHints get() = mapOf(
+    // v42: Chrome sends these from version 90 on. Android boxes often keep an old system WebView,
+    // whose version is what the UA carries; below 90 they would contradict it, so none are sent.
+    private val clientHints get() = if ((chromeMajor.toIntOrNull() ?: 152) < 90) emptyMap() else mapOf(
         "sec-ch-ua" to chromeBrandList,
-        "sec-ch-ua-mobile" to "?1",
+        // v42: from the UA. TV boxes and tablets have no "Mobile" in it and Chrome sends ?0 there.
+        "sec-ch-ua-mobile" to (if (ua.contains(" Mobile")) "?1" else "?0"),
         "sec-ch-ua-platform" to "\"Android\"")
     // v41: Chrome's own Accept for a document. The old value (…*/*;q=0.8 with nothing else) is
     // Firefox's, which contradicts a Chrome UA.
@@ -849,7 +855,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 // numIds, which shows up as the same stream listed twice under different
                 // labels (e.g. "Aincrad 1080p" and "GDrive 1080p" both playing the same
                 // Aincrad source). Fix: only ever act on a given matched value once.
-                val seenEmbeds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+                val seenEmbeds = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
 
                 fun resolveNext() {
                     perIdTimeout?.let { handler.removeCallbacks(it) }
@@ -1253,17 +1259,17 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // LinkedHashMap: O(1) dedup by URL while preserving on-page order.
         val translators = LinkedHashMap<String, String>()
         trRe1.findAll(epHtml).forEach { m ->
-            val u = m.groupValues[1]; if (u.isNotBlank()) translators.putIfAbsent(u, m.groupValues[2].ifBlank { "Fansub" })
+            val u = m.groupValues[1]; if (u.isNotBlank() && u !in translators) translators[u] = m.groupValues[2].ifBlank { "Fansub" }
         }
         if (translators.isEmpty()) trRe2.findAll(epHtml).forEach { m ->
-            val u = m.groupValues[2]; if (u.isNotBlank()) translators.putIfAbsent(u, m.groupValues[1].ifBlank { "Fansub" })
+            val u = m.groupValues[2]; if (u.isNotBlank() && u !in translators) translators[u] = m.groupValues[1].ifBlank { "Fansub" }
         }
         // v40: an HTML-parser fallback that doesn't care about attribute order or quoting, so a
         // template tweak on the site doesn't empty every episode.
         if (translators.isEmpty()) try {
             org.jsoup.Jsoup.parse(epHtml, onCurrentHost(data)).select("[translator]").forEach { e ->
                 val u = e.absUrl("translator").ifBlank { e.attr("translator") }
-                if (u.isNotBlank()) translators.putIfAbsent(u, e.attr("data-fansub-name").ifBlank { e.text().trim().ifBlank { "Fansub" } })
+                if (u.isNotBlank() && u !in translators) translators[u] = e.attr("data-fansub-name").ifBlank { e.text().trim().ifBlank { "Fansub" } }
             }
             if (translators.isNotEmpty()) logW("site-change warning: translators found only by the HTML parser (attribute layout changed)")
         } catch (_: Exception) {}
@@ -1431,7 +1437,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         val okSources = java.util.concurrent.atomic.AtomicInteger(0)       // working AND >= minQuality
         val belowMinSources = java.util.concurrent.atomic.AtomicInteger(0) // working, but too low / unknown
         // Guards the UI-visible symptom of two sources resolving to the same stream.
-        val seenLinks = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        val seenLinks = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
         val safeCallback: (ExtractorLink) -> Unit = { link ->
             val normalizedUrl = link.url.trim().substringBefore('#')
             val key = "$normalizedUrl|${link.quality}|${link.type}"
@@ -1851,7 +1857,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // missing an intermediate certificate. Once a host lands here, later requests to it
     // from the sniffer go through the app's HTTP client instead, which still validates
     // TLS fully — nothing is ever let through with a bad certificate.
-    private val sslBadHosts = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val sslBadHosts = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
     private val brokenTrackerHosts = listOf("mc.yandex.", "hdrc.yandex.net", "mdd.yandex.net", "an.yandex.")
     private val charsetRe = Regex("""charset=([^;\s]+)""", RegexOption.IGNORE_CASE)
 
@@ -2113,7 +2119,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         if (m0 != null && url != m0 && !notMedia && host.isNotEmpty() && host == (try { java.net.URI(m0).host } catch (_: Exception) { null })) {
                             val kept = cleanCapturedHeaders(request.requestHeaders ?: emptyMap())
                             val looksPlaylist = url.substringBefore('?').lowercase().let { it.endsWith(".m3u8") || it.endsWith(".txt") }
-                            if (!looksPlaylist) sniffedSegmentSets.getOrPut(m0) { java.util.concurrent.ConcurrentHashMap.newKeySet() }
+                            if (!looksPlaylist) sniffedSegmentSets.getOrPut(m0) { java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>()) }
                                 .let { if (it.size < 40) it.add(url.substringBefore('?')) }
                             // v29: v28's log had every header set refused on the variant playlist
                             // 200ms after the page's player opened the same one, while the master
@@ -2895,8 +2901,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
      * its API key could change, so that is logged.
      */
     private val sistennPageAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
-    private val sistennAssetsSeen = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-    private val sistennKnownScript = "index-DqFBtoPY.js"
+    private val sistennAssetsSeen = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
     private suspend fun visitSistennPage(origin: String) {
         val now = System.currentTimeMillis()
         if (now - (sistennPageAt[origin] ?: 0L) < 30 * 60_000L) return
@@ -2910,8 +2915,15 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         val html = page ?: return
         val script = Regex("""<script[^>]+type="module"[^>]+src="([^"]+)"""").find(html)?.groupValues?.get(1)
         val css = Regex("""<link[^>]+rel="stylesheet"[^>]+href="([^"]+)"""").find(html)?.groupValues?.get(1)
-        if (script != null && !script.endsWith("/$sistennKnownScript"))
-            logW("sistenn-api: $origin serves a new player script (${script.substringAfterLast('/')}, was $sistennKnownScript) — if Sistenn links stop, its API key may have changed")
+        // v42: remembered per host (rpmvid and strp2p run their own builds); only a change is news.
+        if (script != null) {
+            val name = script.substringAfterLast('/')
+            val host = origin.substringAfter("://")
+            val known = settings.playerScript(host) ?: if (host == "sistenn.uns.bio") "index-DqFBtoPY.js" else null
+            if (known != null && known != name)
+                logW("sistenn-api: $host has a new player script ($name, was $known) — if its links stop, its API key may have changed")
+            if (known != name) settings.setPlayerScript(host, name)
+        }
         for ((path, dest) in listOf(script to "script", css to "style")) {
             if (path == null || !sistennAssetsSeen.add("$origin$path")) continue
             val u = try { java.net.URI("$origin/").resolve(path).toString() } catch (_: Exception) { continue }
