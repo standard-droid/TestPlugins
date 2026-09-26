@@ -17,6 +17,8 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.nicehttp.NiceResponse
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
@@ -65,7 +67,31 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     private var playerBase = "https://anizmplayer.com"
     // Derived, not hardcoded — if the site ever moves domains, only mainUrl needs updating;
     // this and every check that uses it follow automatically instead of silently going stale.
-    private val mainHost by lazy { android.net.Uri.parse(mainUrl).host ?: "anizm.net" }
+    // v40: a getter, not lazy, so it follows a domain move (below).
+    private val mainHost: String get() = android.net.Uri.parse(mainUrl).host ?: "anizm.net"
+
+    // v40: domain moves. Turkish sites get blocked and move (anizm.net → anizm.tv, anizm2.net…),
+    // usually leaving a redirect behind. When an anizm request ends up on another anizm host, that
+    // host becomes mainUrl and is remembered across restarts; URLs saved under an old host
+    // (bookmarks, history, episode data) are sent to the current one. Only hosts named
+    // "anizm<digits>.<tld>" count — never anizmplayer.com or a block/notice page.
+    private val siteHostRe = Regex("""^(?:www\.)?anizm\d*\.[a-z]{2,10}(?:\.[a-z]{2,3})?$""")
+    init {
+        settings.siteHost?.takeIf { siteHostRe.matches(it) }?.let { mainUrl = "https://$it" }
+    }
+    private fun onCurrentHost(url: String): String {
+        val host = try { java.net.URI(url).host } catch (_: Exception) { null } ?: return url
+        if (host == mainHost || !siteHostRe.matches(host)) return url
+        return url.replaceFirst("//$host", "//$mainHost")
+    }
+    private fun noteFinalHost(requested: String, r: NiceResponse) {
+        val finalHost = try { r.okhttpResponse.request.url.host } catch (_: Exception) { return }
+        val reqHost = try { java.net.URI(requested).host } catch (_: Exception) { null }
+        if (r.code !in 200..299 || finalHost == mainHost || reqHost != mainHost || !siteHostRe.matches(finalHost)) return
+        log("site: $mainHost now redirects to $finalHost — using $finalHost from now on")
+        mainUrl = "https://$finalHost"
+        try { settings.siteHost = finalHost } catch (_: Exception) {}
+    }
     // Class-level, not per-loadLinks: every fansub group's GDrive source hits the same
     // Google endpoint regardless of episode, so two overlapping loadLinks calls (prefetch
     // + manual click) sharing this matters here in a way it doesn't for the other host
@@ -131,9 +157,11 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // resolveConcurrency = 1 is strictly sequential. Worst-case cost for a 16-source
     // episode with lazy resolve off: ~16 × avg gap (≈4.4s at 150–400ms), still faster than
     // the old WebView path (1.5s timeout per dead id + page/iframe load per id).
-    private val resolveConcurrency = 2
-    private val resolveGapMinMs = 150L
-    private val resolveGapMaxMs = 400L
+    // v41: one at a time, 0.5-1.2 s apart (was 2 at a time, 0.15-0.4 s). A person switching
+    // players doesn't open three within a second; about 1-2 s more per episode.
+    private val resolveConcurrency = 1
+    private val resolveGapMinMs = 500L
+    private val resolveGapMaxMs = 1200L
 
     // (2) Which players to use, (4) lazy loading and the size estimate are user settings
     // now — see AnizmSettings (Extensions screen → Anizm → settings). Read on every call.
@@ -311,6 +339,145 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         }
     }
 
+    // ── Chrome's network stack (v41) ─────────────────────────────────────────
+    // The UA and client hints say "Chrome on Android", but OkHttp's TLS handshake (cipher list,
+    // extensions, ALPN) and HTTP/2 settings are plainly not Chrome's: the mismatch Cloudflare's
+    // bot scoring (JA3/JA4, HTTP/2 fingerprint) exists to catch. CloudStream already ships
+    // Chrome's own network stack (Cronet from Google Play services; the device log shows
+    // "Cronet version: 151…", and ExoPlayer plays through it). Requests to the sites that can
+    // judge us (anizm, the players' APIs, Google Drive) now go through it. It is reached by
+    // reflection, so there is no build dependency on it; if it is missing or fails, the request
+    // goes out through OkHttp as before.
+    private val cronetEngine: Any? by lazy {
+        try {
+            val ctx = com.lagradost.cloudstream3.CloudStreamApp.context ?: return@lazy null
+            val bc = Class.forName("org.chromium.net.CronetEngine\$Builder")
+            val b = bc.getConstructor(android.content.Context::class.java).newInstance(ctx)
+            for (m in listOf("enableHttp2", "enableQuic", "enableBrotli"))
+                try { bc.getMethod(m, Boolean::class.javaPrimitiveType).invoke(b, true) } catch (_: Throwable) {}
+            try { bc.getMethod("setUserAgent", String::class.java).invoke(b, ua) } catch (_: Throwable) {}
+            val engine = bc.getMethod("build").invoke(b)
+            val ver = try { engine?.javaClass?.getMethod("getVersionString")?.invoke(engine) } catch (_: Throwable) { null }
+            log("net: Chrome network stack ready (${ver ?: "?"})")
+            engine
+        } catch (t: Throwable) { log("net: Chrome network stack unavailable (${t.javaClass.simpleName}: ${t.message?.take(80)}) — using OkHttp"); null }
+    }
+    private val cronetOpen: java.lang.reflect.Method? by lazy {
+        try { Class.forName("org.chromium.net.CronetEngine").getMethod("openConnection", java.net.URL::class.java) } catch (_: Throwable) { null }
+    }
+    // Five failures in a row (not timeouts) and the Chrome stack is left alone for this session.
+    @Volatile private var cronetFailures = 0
+
+    // Chrome's header order on the wire: one for navigations, one for fetch/XHR.
+    private val chromeNavOrder = listOf("sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "upgrade-insecure-requests", "user-agent",
+        "accept", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-user", "sec-fetch-dest", "referer", "accept-language", "cookie", "range")
+    private val chromeXhrOrder = listOf("sec-ch-ua-platform", "x-requested-with", "user-agent", "accept", "sec-ch-ua", "content-type",
+        "sec-ch-ua-mobile", "origin", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "referer", "accept-language", "cookie", "range")
+    private fun chromeOrdered(h: Map<String, String>): List<Pair<String, String>> {
+        val nav = h.entries.any { it.key.equals("Sec-Fetch-Mode", true) && it.value == "navigate" }
+        val order = if (nav) chromeNavOrder else chromeXhrOrder
+        return h.entries.map { it.key to it.value }.sortedBy { (k, _) -> order.indexOf(k.lowercase()).let { i -> if (i < 0) order.size else i } }
+    }
+
+    /**
+     * One request through Chrome's network stack. Null when the stack is unavailable or the
+     * request failed for a reason other than a timeout (the caller then uses OkHttp); a timeout
+     * throws SocketTimeoutException, as OkHttp would. Redirects are followed here, hop by hop,
+     * so the final URL is known. The body is read up to maxBytes.
+     */
+    private suspend fun chromeFetch(url: String, headers: Map<String, String>, timeoutSec: Long, allowRedirects: Boolean = true,
+                                    formBody: Map<String, String>? = null, maxBytes: Int = 6_000_000): NiceResponse? {
+        if (cronetFailures >= 5) return null
+        val engine = cronetEngine ?: return null
+        val open = cronetOpen ?: return null
+        val deadline = System.currentTimeMillis() + timeoutSec.coerceAtLeast(1L) * 1000
+        var current = url
+        var method = if (formBody != null) "POST" else "GET"
+        var body = formBody?.entries?.joinToString("&") { "${java.net.URLEncoder.encode(it.key, "UTF-8")}=${java.net.URLEncoder.encode(it.value, "UTF-8")}" }?.toByteArray()
+        for (hop in 0..5) {
+            val left = deadline - System.currentTimeMillis()
+            if (left <= 0) throw java.net.SocketTimeoutException("timeout")
+            val conn = try { open.invoke(engine, java.net.URL(current)) as java.net.HttpURLConnection }
+                catch (t: Throwable) { cronetFailures++; log("net: Chrome stack could not open ${current.substringBefore('?').takeLast(60)} (${t.javaClass.simpleName})"); return null }
+            var timedOut = false
+            val result: Pair<Int, ByteArray>? = coroutineScope {
+                val watchdog = launch { delay(left); timedOut = true; try { conn.disconnect() } catch (_: Throwable) {} }
+                try {
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        conn.requestMethod = method
+                        conn.instanceFollowRedirects = false
+                        conn.connectTimeout = left.toInt(); conn.readTimeout = left.toInt()
+                        for ((k, v) in chromeOrdered(headers))
+                            if (!k.equals("Accept-Encoding", true) && !k.equals("Content-Length", true)) conn.setRequestProperty(k, v)
+                        body?.let { b ->
+                            if (headers.keys.none { it.equals("Content-Type", true) }) conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+                            conn.doOutput = true; conn.setFixedLengthStreamingMode(b.size); conn.outputStream.use { it.write(b) }
+                        }
+                        val code = conn.responseCode
+                        val bytes = (if (code >= 400) conn.errorStream else conn.inputStream)?.use { readUpTo(it, maxBytes) } ?: ByteArray(0)
+                        code to bytes
+                    }
+                } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (e: Exception) {
+                    if (timedOut) throw java.net.SocketTimeoutException("timeout")
+                    cronetFailures++
+                    log("net: Chrome stack failed on ${current.substringBefore('?').takeLast(60)} (${e.javaClass.simpleName}: ${e.message?.take(60)}) — using OkHttp")
+                    null
+                } finally { watchdog.cancel() }
+            }
+            if (result == null) { try { conn.disconnect() } catch (_: Throwable) {}; return null }
+            val code = result.first
+            val loc = conn.getHeaderField("Location")
+            if (allowRedirects && code in 300..399 && !loc.isNullOrBlank()) {
+                try { conn.disconnect() } catch (_: Throwable) {}
+                current = try { java.net.URI(current).resolve(loc.trim()).toString() } catch (_: Exception) { return null }
+                if (code == 303 || ((code == 301 || code == 302) && method == "POST")) { method = "GET"; body = null }
+                continue
+            }
+            cronetFailures = 0
+            val hb = okhttp3.Headers.Builder()
+            conn.headerFields?.forEach { (k, vs) ->
+                if (k != null && !k.equals("content-encoding", true) && !k.equals("content-length", true))
+                    vs?.forEach { v -> if (v != null) try { hb.addUnsafeNonAscii(k, v) } catch (_: Exception) {} }
+            }
+            val ctype = conn.contentType
+            try { conn.disconnect() } catch (_: Throwable) {}
+            val resp = okhttp3.Response.Builder()
+                .request(okhttp3.Request.Builder().url(current).build())
+                .protocol(okhttp3.Protocol.HTTP_2).code(code).message("")
+                .headers(hb.build())
+                .body(result.second.toResponseBody(ctype?.toMediaTypeOrNull()))
+                .build()
+            return NiceResponse(resp, null)
+        }
+        return null // too many redirects: OkHttp reports it
+    }
+    private fun readUpTo(input: java.io.InputStream, max: Int): ByteArray {
+        val out = java.io.ByteArrayOutputStream(); val buf = ByteArray(16_384)
+        while (out.size() < max) { val n = input.read(buf, 0, minOf(buf.size, max - out.size())); if (n < 0) break; out.write(buf, 0, n) }
+        return out.toByteArray()
+    }
+    /** Chrome's network stack, or OkHttp when it is unavailable. */
+    private suspend fun browserGet(url: String, headers: Map<String, String>, timeoutSec: Long, allowRedirects: Boolean = true): NiceResponse =
+        chromeFetch(url, headers, timeoutSec, allowRedirects) ?: app.get(url, headers = headers, timeout = timeoutSec, allowRedirects = allowRedirects)
+    private fun withQuery(url: String, params: Map<String, String>): String = if (params.isEmpty()) url else
+        url + (if ('?' in url) "&" else "?") + params.entries.joinToString("&") { "${java.net.URLEncoder.encode(it.key, "UTF-8")}=${java.net.URLEncoder.encode(it.value, "UTF-8")}" }
+
+    // v41: one browser session. anizm requests carry the cookies the site set (and those the
+    // in-app WebView picked up, Cloudflare's included) and keep the ones it sets, in the WebView's
+    // own cookie store. Before, every request arrived with no cookies, so each one started a
+    // fresh server session, which is not what a browser does.
+    private fun withSiteCookies(url: String, headers: Map<String, String>): Map<String, String> {
+        if (headers.keys.any { it.equals("Cookie", true) }) return headers
+        val c = try { CookieManager.getInstance().getCookie(url) } catch (_: Throwable) { null }
+        return if (c.isNullOrBlank()) headers else headers + ("Cookie" to c)
+    }
+    private fun keepSiteCookies(r: NiceResponse) {
+        val set = try { r.headers.values("Set-Cookie") } catch (_: Exception) { emptyList() }
+        if (set.isEmpty()) return
+        try { val cm = CookieManager.getInstance(); val u = r.url; for (c in set) cm.setCookie(u, c) } catch (_: Throwable) {}
+    }
+
     // 4.0: every anizm.net request goes through here. Replaces getSession() + the
     // 403/419 "refresh session and retry" loop, which had a real bug: the refresh ran the
     // homepage through CloudflareKiller, but the retry itself did NOT use the interceptor,
@@ -326,17 +493,22 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         allowRedirects: Boolean = true,
     ): NiceResponse {
         val sticky = System.currentTimeMillis() < cfUntil
-        val first = app.get(url, headers = headers, params = params, timeout = timeout,
-            allowRedirects = allowRedirects, interceptor = if (sticky) cfKiller else null)
-        if (sticky || !looksCfBlocked(first)) return first
-        log("cf: challenge on ${url.substringBefore('?')} (${first.code}), retrying via CloudflareKiller")
+        val target = onCurrentHost(url)
+        val h = withSiteCookies(target, headers)
+        // v41: Chrome's network stack first; OkHttp (with CloudflareKiller while a solve is fresh) otherwise.
+        val first = (if (sticky) null else chromeFetch(withQuery(target, params), h, timeout, allowRedirects))
+            ?: app.get(target, headers = h, params = params, timeout = timeout,
+                allowRedirects = allowRedirects, interceptor = if (sticky) cfKiller else null)
+        keepSiteCookies(first)
+        if (sticky || !looksCfBlocked(first)) return first.also { if (allowRedirects) noteFinalHost(target, it) }
+        log("cf: challenge on ${target.substringBefore('?')} (${first.code}), retrying via CloudflareKiller")
         // v5: hard cap. CloudflareKiller's own WebView wait is 60s, which alone can eat half
         // of CloudStream's 120s loadLinks budget.
         val solved = withTimeoutOrNull(cfSolveBudgetMs) {
-            app.get(url, headers = headers, params = params, timeout = timeout,
+            app.get(target, headers = h, params = params, timeout = timeout,
                 allowRedirects = allowRedirects, interceptor = cfKiller)
-        }
-        if (solved == null || looksCfBlocked(solved)) { log("cf: solve failed/timed out for ${url.substringBefore('?')}"); return solved ?: first }
+        }?.also { keepSiteCookies(it) }
+        if (solved == null || looksCfBlocked(solved)) { log("cf: solve failed/timed out for ${target.substringBefore('?')}"); return solved ?: first }
         cfUntil = System.currentTimeMillis() + cfStickyMs // only sticky once a solve actually worked
         return solved
     }
@@ -384,14 +556,22 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         "sec-ch-ua" to chromeBrandList,
         "sec-ch-ua-mobile" to "?1",
         "sec-ch-ua-platform" to "\"Android\"")
+    // v41: Chrome's own Accept for a document. The old value (…*/*;q=0.8 with nothing else) is
+    // Firefox's, which contradicts a Chrome UA.
+    private val chromeDocAccept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
     private val navHints get() = clientHints + mapOf(
         "Sec-Fetch-Dest" to "iframe", "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-Site" to "same-origin",
         "Upgrade-Insecure-Requests" to "1",
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        "Accept" to chromeDocAccept)
 
     private val baseHeaders get() = clientHints + mapOf(
         "User-Agent" to ua,
         "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7", "Referer" to "$mainUrl/")
+    // v41: page loads (home, anime and episode pages) as Chrome sends them after a click. They
+    // used to go out with no Accept and no Sec-Fetch-* at all, beside a Chrome UA and client hints.
+    private val pageHeaders get() = baseHeaders + mapOf(
+        "Upgrade-Insecure-Requests" to "1", "Accept" to chromeDocAccept,
+        "Sec-Fetch-Site" to "same-origin", "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-User" to "?1", "Sec-Fetch-Dest" to "document")
     private val xhrHeaders get() = clientHints + mapOf(
         "Sec-Fetch-Dest" to "empty", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Site" to "same-origin",
         "User-Agent" to ua,
@@ -473,12 +653,12 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         val chromeHints = navHints
         val cases = listOf<Triple<String, String, Map<String, String>>>(
             Triple("player, minimal", playerUrl, mapOf("User-Agent" to ua, "Referer" to "$mainUrl/")),
-            Triple("player, episode referer", playerUrl, baseHeaders + mapOf("Referer" to episodeUrl)),
+            Triple("player, episode referer", playerUrl, baseHeaders + mapOf("Referer" to onCurrentHost(episodeUrl))),
             Triple("player, no user-agent", playerUrl, mapOf("Referer" to "$mainUrl/")),
-            Triple("player, chrome hints", playerUrl, baseHeaders + mapOf("Referer" to episodeUrl) + chromeHints),
-            Triple("player, webview cookies", playerUrl, baseHeaders + mapOf("Referer" to episodeUrl) +
+            Triple("player, chrome hints", playerUrl, baseHeaders + mapOf("Referer" to onCurrentHost(episodeUrl)) + chromeHints),
+            Triple("player, webview cookies", playerUrl, baseHeaders + mapOf("Referer" to onCurrentHost(episodeUrl)) +
                 (cookies?.let { mapOf("Cookie" to it) } ?: emptyMap())),
-            Triple("player, cookies + hints", playerUrl, baseHeaders + mapOf("Referer" to episodeUrl) + chromeHints +
+            Triple("player, cookies + hints", playerUrl, baseHeaders + mapOf("Referer" to onCurrentHost(episodeUrl)) + chromeHints +
                 (cookies?.let { mapOf("Cookie" to it) } ?: emptyMap())),
             Triple("episode page (control)", episodeUrl, baseHeaders),
             Triple("home page (control)", "$mainUrl/", baseHeaders),
@@ -502,7 +682,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         }
         // Same URL through CloudflareKiller, which replays the WebView's own cookies.
         val viaKiller = try {
-            val r = app.get(playerUrl, headers = baseHeaders + mapOf("Referer" to episodeUrl),
+            val r = app.get(playerUrl, headers = baseHeaders + mapOf("Referer" to onCurrentHost(episodeUrl)),
                 timeout = 20L, allowRedirects = false, interceptor = cfKiller)
             "${r.code}${r.headers["Location"]?.take(60)?.let { " → $it" } ?: ""}"
         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
@@ -515,20 +695,19 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // without Chrome's matching sec-ch-ua client hints is an inconsistent fingerprint —
         // a plausible reason Cloudflare singled these requests out.
         val cookieHeader = webViewCookies()?.let { mapOf("Cookie" to it) } ?: emptyMap()
-        val headers = baseHeaders + navHints + mapOf("Referer" to episodeUrl) + cookieHeader
+        val headers = baseHeaders + navHints + mapOf("Referer" to onCurrentHost(episodeUrl)) + cookieHeader
         val playerUrl = "$mainUrl/player/$nid"
         lastProbeTarget = nid to episodeUrl
         // Plain request, deliberately not siteGet(): CloudflareKiller can't help here (see
         // looksCfBlocked), and a block should switch strategy, not be retried.
-        var r = app.get(playerUrl, headers = headers, timeout = 8L, allowRedirects = false)
+        var r = browserGet(playerUrl, headers, 8L, allowRedirects = false).also { keepSiteCookies(it) }
         if (r.code == 403 && r.headers["cf-mitigated"]?.contains("challenge", true) == true) {
             // One retry with the hint values the self-test proved work, before giving up on
             // the fast path for 15 minutes.
             try { r.okhttpResponse.close() } catch (_: Exception) {}
             // Retry once without cookies: a stale __cf_bm from the WebView can itself be the
             // thing being challenged, and the self-test's cookieless variant passed.
-            r = app.get(playerUrl, headers = baseHeaders + navHints + mapOf("Referer" to episodeUrl),
-                timeout = 8L, allowRedirects = false)
+            r = browserGet(playerUrl, baseHeaders + navHints + mapOf("Referer" to onCurrentHost(episodeUrl)), 8L, allowRedirects = false)
             if (r.code in 300..399) log("resolve: retry without cookies worked for $nid")
         }
         if (r.code == 403 || r.code == 429 || r.code == 503) {
@@ -678,7 +857,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                     if (currentIdx == 1 && results.isEmpty() && !usedFallback) {
                         log("resolve: first failed, falling back to loadUrl")
                         usedFallback = true; currentIdx = -1; pageReady = false
-                        wv.loadUrl(episodeUrl)
+                        wv.loadUrl(onCurrentHost(episodeUrl))
                         return
                     }
                     if (currentIdx >= numIds.size || done) { handler.removeCallbacks(globalTimeout); finish(); return }
@@ -869,7 +1048,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             if (System.currentTimeMillis() - time < mainPageCacheTtlMs) return cached
         }
         val url = if (request.data == "anime-izle") "$mainUrl/anime-izle?sayfa=$page" else "$mainUrl?sayfa=$page"
-        val doc = siteDocument(url, baseHeaders, timeout = 12L)
+        val doc = siteDocument(url, pageHeaders, timeout = 12L)
             ?: return newHomePageResponse(request.name, emptyList(), hasNext = false)
         fun toAbs(src: String): String? {
             if (src.isBlank() || src.startsWith("data:")) return null
@@ -925,7 +1104,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val doc = siteDocument(url, baseHeaders, timeout = 12L)
+        val doc = siteDocument(url, pageHeaders, timeout = 12L)
             ?: return newAnimeLoadResponse(name = url.substringAfterLast('/'), url = url, type = TvType.Anime) { addEpisodes(DubStatus.Subbed, emptyList()) }
 
         val title = doc.selectFirst("h2.anizm_pageTitle, h2.page-title, h1, .anime-title")?.text()?.trim()
@@ -1066,7 +1245,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             if (System.currentTimeMillis() - t < sourceListTtlMs) { log("loadLinks: source list cache hit (${list.size})"); return list }
         }
         val epHtml = try {
-            siteText(data, baseHeaders) ?: run { log("loadLinks: page error"); return null }
+            siteText(data, pageHeaders) ?: run { log("loadLinks: page error"); return null }
         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
         catch (e: Exception) { log("loadLinks: page error: ${e.message}"); return null }
         log("loadLinks: page len=${epHtml.length}")
@@ -1079,6 +1258,15 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         if (translators.isEmpty()) trRe2.findAll(epHtml).forEach { m ->
             val u = m.groupValues[2]; if (u.isNotBlank()) translators.putIfAbsent(u, m.groupValues[1].ifBlank { "Fansub" })
         }
+        // v40: an HTML-parser fallback that doesn't care about attribute order or quoting, so a
+        // template tweak on the site doesn't empty every episode.
+        if (translators.isEmpty()) try {
+            org.jsoup.Jsoup.parse(epHtml, onCurrentHost(data)).select("[translator]").forEach { e ->
+                val u = e.absUrl("translator").ifBlank { e.attr("translator") }
+                if (u.isNotBlank()) translators.putIfAbsent(u, e.attr("data-fansub-name").ifBlank { e.text().trim().ifBlank { "Fansub" } })
+            }
+            if (translators.isNotEmpty()) logW("site-change warning: translators found only by the HTML parser (attribute layout changed)")
+        } catch (_: Exception) {}
         log("loadLinks: ${translators.size} translators: ${translators.values}")
         if (translators.isEmpty()) {
             if (epHtml.length > 5000) logW("site-change warning: no translators found on a normal-sized episode page")
@@ -1095,7 +1283,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 launch {
                     trGate.withPermit {
                         val trText = try {
-                            siteText(trUrl, xhrHeaders + mapOf("Referer" to data))
+                            siteText(trUrl, xhrHeaders + mapOf("Referer" to onCurrentHost(data)))
                                 ?: run { log("loadLinks: tr error ($fansubName)"); return@withPermit }
                         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
                         catch (e: Exception) { log("loadLinks: tr error ($fansubName): ${e.message}"); return@withPermit }
@@ -1105,6 +1293,12 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         val videos = mutableListOf<Pair<String, String>>()
                         vidRe1.findAll(trHtml).forEach { m -> videos += m.groupValues[1] to m.groupValues[2].ifBlank { "Player" } }
                         if (videos.isEmpty()) vidRe2.findAll(trHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
+                        if (videos.isEmpty()) try {
+                            org.jsoup.Jsoup.parse(trHtml).select("[video]").forEach { e ->
+                                val u = e.attr("video"); if (u.isNotBlank()) videos += u to e.attr("data-video-name").ifBlank { e.text().trim().ifBlank { "Player" } }
+                            }
+                            if (videos.isNotEmpty()) logW("site-change warning: players found only by the HTML parser (attribute layout changed)")
+                        } catch (_: Exception) {}
                         log("loadLinks: $fansubName: ${videos.map { it.second }}")
                         // 4.0: no name whitelist here anymore. It silently dropped every
                         // player it didn't recognise by label (live example: "LuluStream" on
@@ -1176,6 +1370,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
 
     private suspend fun loadLinksWork(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         log("loadLinks: $data")
+        trimSniffMaps()
         // v9: tell a real "reload links" apart from the app's own double call.
         // CloudStream calls loadLinks again a second or two after the first (preload, then
         // the actual open) — those should use the caches. A call that arrives much later for
@@ -1555,7 +1750,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // step4 limit) would mean five live WebViews with ad scripts running — the kind of thing
     // that makes a TV box stutter or get killed for memory.
     private val sniffGate = Semaphore(1)
-    private val localHls = LocalHlsServer { log(it) }
+    private val localHls = LocalHlsServer({ log(it) }, { u, h -> try { runBlocking { browserGet(u, h, 10L) } } catch (_: Exception) { null } })
     // Sniffed playlists are reused for 20 min: the URL carries its own ?v= stamp and the page
     // load is by far the most expensive thing this extension does.
     private val sniffCache = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
@@ -1712,6 +1907,15 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             note("sniff: via app $host failed too: ${e.javaClass.simpleName}: ${e.message?.take(90)}")
             null
         }
+    }
+
+    // v40: the per-stream maps the sniffer fills were never emptied — a small leak that grows
+    // with every episode in a long session. They only matter for minutes after a sniff.
+    private fun trimSniffMaps() {
+        for (m in listOf<MutableMap<String, *>>(sniffedHeaders, sniffedVariantUrls, sniffedSegmentUrls, sniffedSegmentSets, sniffedRefreshUrls))
+            if (m.size > 60) m.clear()
+        val now = System.currentTimeMillis()
+        for (m in listOf(sistennApiOffUntil, driveStreamQuotaUntil, gdriveQuotaUntil)) m.entries.removeAll { it.value < now }
     }
 
     private suspend fun sniffHlsViaWebView(pageUrl: String, referer: String, budgetMs: Long = 24_000L): String? =
@@ -2345,14 +2549,19 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             // straight from the stream host.
             // v35: with the page's refresh call known, segments are served as redirects that carry a
             // token the local server keeps fresh (the one in the playlist expires 30 min after the sniff).
+            // v41: the page's own fetch headers for its refresh / playing call.
+            fun refreshHeaders(ru: String) = clientHints + mapOf("User-Agent" to ua, "Accept" to "*/*",
+                "Referer" to (try { java.net.URI(ru).let { "${it.scheme}://${it.host}/" } } catch (_: Exception) { "$origin/" }),
+                "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Sec-Fetch-Site" to "same-origin", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Dest" to "empty")
             val tokenState = if (tokenQuery.isNotEmpty() && !hlsmod) sniffedRefreshUrls[exUrl]?.let { ru ->
-                LocalHlsServer.TokenState(tokenQuery, ru, mapOf("User-Agent" to ua, "Accept" to "*/*",
-                    "Referer" to (try { java.net.URI(ru).let { "${it.scheme}://${it.host}/" } } catch (_: Exception) { "$origin/" })))
+                LocalHlsServer.TokenState(tokenQuery, ru, refreshHeaders(ru))
             } else null
+            val beat = sniffedRefreshUrls[exUrl]?.let { ru -> LocalHlsServer.Heartbeat(ru, refreshHeaders(ru), tokenState) }
             if (tokenState != null) log("sniff: token will be renewed through the page's refresh call when it nears expiry")
             val proxied = if (useProxy && variants.isNotEmpty())
                 variants.mapNotNull { v -> localHls.register(v.url, tokenQuery, linkHeaders, sniffedPlaylistTexts[v.url.substringBefore('?')],
-                    stripSegments = hlsmod, token = tokenState)?.let { v to it } } else emptyList()
+                    stripSegments = hlsmod, token = tokenState, beat = beat)?.let { v to it } } else emptyList()
             if (proxied.isNotEmpty()) log("sniff: serving ${proxied.size} tokenised playlist(s) via ${proxied.first().second.substringBeforeLast('/')}, " +
                 "${variants.count { sniffedPlaylistTexts.containsKey(it.url.substringBefore('?')) }} from the page's own fetch")
             found = if (proxied.isNotEmpty()) {
@@ -2394,9 +2603,15 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // no browser ever makes, and then used that 404 URL as the Referer.
         val apBase = apDomains[hash] ?: playerBase
         val playerRef = "$apBase/video/$hash"
-        val aHeaders = mapOf("User-Agent" to ua,
+        // v41: what the player page's own $.ajax sends (client hints, Sec-Fetch-*, language).
+        val aHeaders = clientHints + mapOf("User-Agent" to ua,
             "X-Requested-With" to "XMLHttpRequest", "Accept" to "*/*",
-            "Referer" to playerRef, "Origin" to apBase)
+            "Referer" to playerRef, "Origin" to apBase, "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Sec-Fetch-Site" to "same-origin", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Dest" to "empty")
+        // The player page itself, loaded the way anizm's iframe loads it.
+        val aPageHeaders = clientHints + mapOf("Upgrade-Insecure-Requests" to "1", "User-Agent" to ua, "Accept" to chromeDocAccept,
+            "Sec-Fetch-Site" to "cross-site", "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-Dest" to "iframe",
+            "Referer" to "$mainUrl/", "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7")
         val now = System.currentTimeMillis()
         val cachedSource = aincradCache[hash]?.takeIf { it.validUntil > now }
         val videoSource: String
@@ -2411,14 +2626,16 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             cachedSource.cookie.split("; ").filter { '=' in it }.forEach { cookieJar[it.substringBefore('=')] = it.substringAfter('=') }
             log("aincrad: reusing signed URL for $apBase $hash (${(cachedSource.validUntil - now) / 1000}s left)")
         } else {
-            try { app.get(playerRef, headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/"), timeout = 8).cookies.let { cookieJar.putAll(it) } }
+            try { browserGet(playerRef, aPageHeaders, 8L).cookies.let { cookieJar.putAll(it) } }
             catch (e: kotlinx.coroutines.CancellationException) { throw e }
             catch (_: Exception) {}
             // 4.0: FirePlayer's own call is $.ajax POST with data {hash: ID, r: document.referrer}.
             val streamResp = try {
-                app.post("$apBase/player/index.php?data=$hash&do=getVideo",
-                    headers = aHeaders + (if (cookieJar.isEmpty()) emptyMap() else mapOf("Cookie" to cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" })),
-                    data = mapOf("hash" to hash, "r" to "$mainUrl/"), timeout = 10).also { cookieJar.putAll(it.cookies) }
+                val gvUrl = "$apBase/player/index.php?data=$hash&do=getVideo"
+                val gvHeaders = aHeaders + (if (cookieJar.isEmpty()) emptyMap() else mapOf("Cookie" to cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" }))
+                val gvData = mapOf("hash" to hash, "r" to "$mainUrl/")
+                (chromeFetch(gvUrl, gvHeaders, 10L, formBody = gvData) ?: app.post(gvUrl, headers = gvHeaders, data = gvData, timeout = 10))
+                    .also { cookieJar.putAll(it.cookies) }
             } catch (e: kotlinx.coroutines.CancellationException) { throw e }
               catch (e: Exception) { log("aincrad error: ${e.javaClass.simpleName}: ${e.message}"); return false }
             val streamText = streamResp.text
@@ -2664,6 +2881,48 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         return out
     }
 
+    // v41: the phone's screen as window.screen reports it (CSS pixels, current orientation).
+    private fun deviceScreenCss(): Pair<Int, Int> = try {
+        val dm = com.lagradost.cloudstream3.CloudStreamApp.context!!.resources.displayMetrics
+        val w = (dm.widthPixels / dm.density).toInt(); val h = (dm.heightPixels / dm.density).toInt()
+        if (w in 200..4000 && h in 200..4000) w to h else 412 to 915
+    } catch (_: Throwable) { 412 to 915 }
+
+    /**
+     * v41: what a browser fetches before the player's API calls: the page (an iframe opened from
+     * anizm) at most every 30 min per host, and its script and stylesheet once per session (a
+     * browser caches them). A renamed script means Sistenn shipped a new player, which is when
+     * its API key could change, so that is logged.
+     */
+    private val sistennPageAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val sistennAssetsSeen = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val sistennKnownScript = "index-DqFBtoPY.js"
+    private suspend fun visitSistennPage(origin: String) {
+        val now = System.currentTimeMillis()
+        if (now - (sistennPageAt[origin] ?: 0L) < 30 * 60_000L) return
+        sistennPageAt[origin] = now
+        val lang = "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"
+        val page = try {
+            browserGet("$origin/", clientHints + mapOf("Upgrade-Insecure-Requests" to "1", "User-Agent" to ua, "Accept" to chromeDocAccept,
+                "Sec-Fetch-Site" to "cross-site", "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-Dest" to "iframe",
+                "Referer" to "$mainUrl/", "Accept-Language" to lang), 8L).takeIf { it.code in 200..299 }?.text
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { null }
+        val html = page ?: return
+        val script = Regex("""<script[^>]+type="module"[^>]+src="([^"]+)"""").find(html)?.groupValues?.get(1)
+        val css = Regex("""<link[^>]+rel="stylesheet"[^>]+href="([^"]+)"""").find(html)?.groupValues?.get(1)
+        if (script != null && !script.endsWith("/$sistennKnownScript"))
+            logW("sistenn-api: $origin serves a new player script (${script.substringAfterLast('/')}, was $sistennKnownScript) — if Sistenn links stop, its API key may have changed")
+        for ((path, dest) in listOf(script to "script", css to "style")) {
+            if (path == null || !sistennAssetsSeen.add("$origin$path")) continue
+            val u = try { java.net.URI("$origin/").resolve(path).toString() } catch (_: Exception) { continue }
+            try {
+                browserGet(u, clientHints + mapOf("User-Agent" to ua, "Accept" to (if (dest == "style") "text/css,*/*;q=0.1" else "*/*"),
+                    "Origin" to origin, "Sec-Fetch-Site" to "same-origin", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Dest" to dest,
+                    "Referer" to "$origin/", "Accept-Language" to lang), 15L).let { r -> try { r.okhttpResponse.close() } catch (_: Exception) {} }
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) {}
+        }
+    }
+
     suspend fun trySistennApi(exUrl: String, label: String, callback: (ExtractorLink) -> Unit): SistennResult {
         val m = sistennPageRe.find(exUrl) ?: return SistennResult.UNAVAILABLE
         val host = m.groupValues[1]; val id = m.groupValues[2]
@@ -2674,15 +2933,24 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
             "Sec-Fetch-Site" to "same-origin", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Dest" to "empty")
         fun off(why: String) { sistennApiOffUntil[host] = System.currentTimeMillis() + 60 * 60_000L; log("sistenn-api: $host not usable ($why) — WebView for 1 h") }
+        // v41: a visit starts with the page and its script, as it does in a browser.
+        visitSistennPage(origin)
         // The page asks /info first; so do we (it also says early if the id is gone).
-        try { app.get("$origin/api/v1/info?id=$id", headers = apiHeaders, timeout = 8L).let { r -> try { r.okhttpResponse.close() } catch (_: Exception) {} } }
+        try { browserGet("$origin/api/v1/info?id=$id", apiHeaders, 8L).let { r -> try { r.okhttpResponse.close() } catch (_: Exception) {} } }
         catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) {}
+        // v41: window.screen, as the page reports it (the server logs it beside the OS it reads
+        // from the UA). The phone's real screen in CSS pixels; 1920x1080 contradicted the Android
+        // UA. The server does not pick qualities by it (a 1280x720 browser got 1080p too); the
+        // page's player caps quality to its own size, which this app's player doesn't.
+        val (screenW, screenH) = deviceScreenCss()
         var capacity: Pair<String, String>? = null
         var video: JSONObject? = null
         var sources: List<SistennSource> = emptyList()
-        for (attempt in 0 until 3) {
+        // v39: one capacity retry, not two. rpmvid and strp2p stayed full through both (device
+        // log 2026-09-26), which cost 9 s per host at the end of the episode's link loading.
+        for (attempt in 0 until 2) {
             val capQ = capacity?.let { "&capacityToken=${java.net.URLEncoder.encode(it.first, "UTF-8")}&capacityTokenExpire=${java.net.URLEncoder.encode(it.second, "UTF-8")}" }.orEmpty()
-            val r = app.get("$origin/api/v1/video?id=$id&w=1920&h=1080&r=$mainHost$capQ", headers = apiHeaders, timeout = 10L)
+            val r = browserGet("$origin/api/v1/video?id=$id&w=$screenW&h=$screenH&r=$mainHost$capQ", apiHeaders, 10L)
             val body = r.text
             if (r.code !in 200..299) {
                 val plainErr = sistennDecrypt(body) ?: body
@@ -2697,9 +2965,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             val d = o.optJSONObject("delivery") ?: JSONObject()
             val saturated = d.optString("inHouse") == "saturated"
             val capToken = d.optString("capacityToken")
-            if (saturated && capToken.isNotEmpty() && attempt < 2) {
-                val wait = (d.optInt("retryAfter", 3).coerceIn(2, 6) * (1 shl attempt)).coerceAtMost(8)
-                log("sistenn-api: $host is at capacity — retrying in ${wait}s (${attempt + 1}/2)")
+            if (saturated && capToken.isNotEmpty() && attempt < 1) {
+                val wait = d.optInt("retryAfter", 3).coerceIn(2, 4)
+                log("sistenn-api: $host is at capacity — retrying once in ${wait}s")
                 capacity = capToken to d.optString("capacityTokenExpire")
                 delay(wait * 1000L)
                 continue
@@ -2712,7 +2980,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         val pkQuery = pk?.optString("k")?.takeIf { it.isNotEmpty() }?.let { "k=$it&kx=${pk.optLong("kx")}" }.orEmpty()
         // Our own refresh call, the way the page builds it.
         val metric = v.optJSONObject("metric")
-        val refreshUrl = if (pkQuery.isEmpty()) null else try {
+        // v41: built for every stream (it is also the playing signal), not only for pk tokens.
+        val refreshUrl = try {
             "$origin/api/v1/player?t=" + sistennEncrypt(JSONObject().apply {
                 put("website", mainHost); put("playing", true); put("sessionId", sistennSessionId)
                 for (k in listOf("userId", "playerId", "videoId", "country", "platform", "browser", "os")) put(k, metric?.optString(k) ?: "")
@@ -2720,66 +2989,117 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         } catch (_: Exception) { null }
         log("sistenn-api: ${v.optString("title").take(60)} — sources ${sources.joinToString { it.kind }}")
         val streamHeaders = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin, "Accept" to "*/*")
+        // v39: every source is checked at once. One after another, the backup search took 16 s
+        // after Tiktok was already found (device log 2026-09-26, build 31), and held up the
+        // episode's next wave of sources. The first working source is still awaited in full;
+        // a second one only if it is ready within sistennBackupWaitMs of the start.
+        val t0 = System.currentTimeMillis()
         var sourcesEmitted = 0
-        for (src in sources) {
-            // /v4/ hosts want the token on every request (the page's own rule); cfNative carries its own.
-            val needsPk = src.url.contains("/v4/") && !Regex("""[?&]k=""").containsMatchIn(src.url) && pkQuery.isNotEmpty()
-            val masterUrl = if (needsPk) src.url + (if (src.url.contains('?')) "&" else "?") + pkQuery else src.url
-            val tokenQuery = Regex("""(?:^|&)(k=[^&]+&kx=\d+)""").find(masterUrl.substringAfter('?', ""))?.groupValues?.get(1).orEmpty()
-            val master = try { app.get(masterUrl, headers = streamHeaders, timeout = 6L).takeIf { it.code in 200..299 }?.text }
-                catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { null }
-            if (master == null || !master.trimStart().startsWith("#EXTM3U")) { log("sistenn-api: ${src.kind} master not readable, next"); continue }
-            val variants = parseVariants(master, masterUrl).map { vv ->
-                if (tokenQuery.isNotEmpty() && !vv.url.contains('?')) vv.copy(url = vv.url + "?" + tokenQuery) else vv
-            }.ifEmpty { listOf(Variant(Qualities.Unknown.value, null, masterUrl)) } // a media playlist itself
-            // Only qualities whose playlist actually loads (the /v4/ hosts stall some 1080p variants).
-            val loaded = coroutineScope {
-                variants.map { vv -> async {
-                    val t = if (vv.url == masterUrl) master else try {
-                        withTimeoutOrNull(5_000L) { app.get(vv.url, headers = streamHeaders, timeout = 5L).takeIf { it.code in 200..299 }?.text }
-                    } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { null }
-                    val text = t?.takeIf { it.trimStart().startsWith("#EXTM3U") } ?: return@async null
-                    // v38: and whose first segment answers. A playlist can load while its segments
-                    // stall (cfNative, the /v4/ hosts' 1080p), which hangs the player for a minute.
-                    val first = text.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
-                        ?: return@async (vv to text)
-                    val segUrl = (try { java.net.URI(vv.url).resolve(first).toString() } catch (_: Exception) { first })
-                        .let { u -> if (tokenQuery.isNotEmpty() && !u.contains('?')) "$u?$tokenQuery" else u }
-                    val segOk = try {
-                        withTimeoutOrNull(5_000L) {
-                            val r = app.get(segUrl, headers = streamHeaders + mapOf("Range" to "bytes=0-0"), timeout = 5L)
-                            val ok = r.code == 200 || r.code == 206
-                            try { r.okhttpResponse.close() } catch (_: Exception) {}
-                            if (!ok) log("sistenn-api: ${src.kind} ${vv.height}p segment answered http ${r.code}")
-                            ok
-                        } ?: false.also { log("sistenn-api: ${src.kind} ${vv.height}p segment did not answer in 5 s (${try { java.net.URI(segUrl).host } catch (_: Exception) { "?" }})") }
-                    } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { false }
-                    if (segOk) vv to text else null
-                } }.mapNotNull { it.await() }
+        coroutineScope {
+            val checks = sources.map { src -> src to async {
+                try { checkSistennSource(src, pkQuery, streamHeaders) }
+                catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (e: Exception) { log("sistenn-api: ${src.kind} check failed: ${e.javaClass.simpleName}"); null }
+            } }
+            for ((src, job) in checks) {
+                if (sourcesEmitted >= 2) break
+                val c = if (sourcesEmitted == 0) job.await()
+                    else withTimeoutOrNull((t0 + sistennBackupWaitMs - System.currentTimeMillis()).coerceAtLeast(1L)) { job.await() }
+                if (c == null) {
+                    if (!job.isCompleted) log("sistenn-api: ${src.kind} still checking — not waiting for it as a backup")
+                    continue
+                }
+                val tokenState = if (c.tokenQuery.isNotEmpty() && c.tokenQuery.startsWith("k=${pk?.optString("k")}&") && refreshUrl != null)
+                    LocalHlsServer.TokenState(c.tokenQuery, refreshUrl, apiHeaders) else null
+                val beat = refreshUrl?.let { LocalHlsServer.Heartbeat(it, apiHeaders, tokenState) }
+                // v39: sizes, like Beta and Aincrad. Same episode, same length, so a bigger size
+                // means more data per second of video.
+                val sizeKey = "sistenn:$host:$id:${src.kind}"
+                val sizes = if (estimateHlsSizes) cachedSizes(sizeKey)
+                    ?: (withTimeoutOrNull(5_000L) { sistennSizes(src.kind, c, streamHeaders) } ?: emptyMap()).also { storeSizes(sizeKey, it) }
+                    else emptyMap()
+                var emitted = 0
+                // v38: a second working source is listed as an alternative ("· 2"), so the app's
+                // automatic next-link fallback has another Sistenn route to try.
+                val tag = if (sourcesEmitted == 0) "" else " · ${sourcesEmitted + 1}"
+                for ((vv, text) in c.loaded.sortedByDescending { it.first.height }) {
+                    val local = localHls.register(vv.url, c.tokenQuery, streamHeaders, text, stripSegments = src.strip, token = tokenState, beat = beat) ?: continue
+                    callback(newExtractorLink(source = label,
+                        name = (if (vv.height > 0) "$label ${vv.height}p" else label) + tag + formatSize(sizes[vv.height], isEstimate = true),
+                        url = local, type = ExtractorLinkType.M3U8) { quality = vv.height; referer = "$origin/"; headers = streamHeaders })
+                    emitted++
+                }
+                if (emitted > 0) {
+                    val segHost = try { java.net.URI(c.loaded.first().second.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
+                        ?.let { java.net.URI(c.loaded.first().first.url).resolve(it).toString() } ?: "").host } catch (_: Exception) { null }
+                    log("sistenn-api: ${src.kind} → ${c.loaded.joinToString { "${it.first.height}p" }}${if (c.variantCount > c.loaded.size) " (${c.variantCount - c.loaded.size} variant(s) did not load)" else ""}, segments on ${segHost ?: "?"}, no WebView needed")
+                    sourcesEmitted++
+                }
             }
-            if (loaded.isEmpty()) { log("sistenn-api: ${src.kind} variants not readable, next"); continue }
-            val tokenState = if (tokenQuery.isNotEmpty() && tokenQuery.startsWith("k=${pk?.optString("k")}&") && refreshUrl != null)
-                LocalHlsServer.TokenState(tokenQuery, refreshUrl, apiHeaders) else null
-            var emitted = 0
-            // v38: a second working source is listed as an alternative ("· 2"), so the app's
-            // automatic next-link fallback has another Sistenn route to try.
-            val tag = if (sourcesEmitted == 0) "" else " · ${sourcesEmitted + 1}"
-            for ((vv, text) in loaded.sortedByDescending { it.first.height }) {
-                val local = localHls.register(vv.url, tokenQuery, streamHeaders, text, stripSegments = src.strip, token = tokenState) ?: continue
-                callback(newExtractorLink(source = label, name = (if (vv.height > 0) "$label ${vv.height}p" else label) + tag, url = local, type = ExtractorLinkType.M3U8) {
-                    quality = vv.height; referer = "$origin/"; headers = streamHeaders })
-                emitted++
-            }
-            if (emitted > 0) {
-                val segHost = try { java.net.URI(loaded.first().second.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
-                    ?.let { java.net.URI(loaded.first().first.url).resolve(it).toString() } ?: "").host } catch (_: Exception) { null }
-                log("sistenn-api: ${src.kind} → ${loaded.joinToString { "${it.first.height}p" }}${if (variants.size > loaded.size) " (${variants.size - loaded.size} variant(s) did not load)" else ""}, segments on ${segHost ?: "?"}, no WebView needed")
-                if (++sourcesEmitted >= 2) return SistennResult.EMITTED
-            }
+            checks.forEach { it.second.cancel() }
         }
         if (sourcesEmitted > 0) return SistennResult.EMITTED
         log("sistenn-api: no source of $id was readable from here — falling back to the WebView")
         return SistennResult.UNAVAILABLE
+    }
+
+    private val sistennBackupWaitMs = 9_000L
+    private class SistennChecked(val tokenQuery: String, val variantCount: Int, val loaded: List<Pair<Variant, String>>)
+
+    /** One Sistenn source: its master, and the variants whose playlist loads and whose first segment answers. */
+    private suspend fun checkSistennSource(src: SistennSource, pkQuery: String, streamHeaders: Map<String, String>): SistennChecked? {
+        // /v4/ hosts want the token on every request (the page's own rule); cfNative carries its own.
+        val needsPk = src.url.contains("/v4/") && !Regex("""[?&]k=""").containsMatchIn(src.url) && pkQuery.isNotEmpty()
+        val masterUrl = if (needsPk) src.url + (if (src.url.contains('?')) "&" else "?") + pkQuery else src.url
+        val tokenQuery = Regex("""(?:^|&)(k=[^&]+&kx=\d+)""").find(masterUrl.substringAfter('?', ""))?.groupValues?.get(1).orEmpty()
+        val master = try { app.get(masterUrl, headers = streamHeaders, timeout = 6L).takeIf { it.code in 200..299 }?.text }
+            catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { null }
+        if (master == null || !master.trimStart().startsWith("#EXTM3U")) { log("sistenn-api: ${src.kind} master not readable, next"); return null }
+        val variants = parseVariants(master, masterUrl).map { vv ->
+            if (tokenQuery.isNotEmpty() && !vv.url.contains('?')) vv.copy(url = vv.url + "?" + tokenQuery) else vv
+        }.ifEmpty { listOf(Variant(Qualities.Unknown.value, null, masterUrl)) } // a media playlist itself
+        // Only qualities whose playlist actually loads (the /v4/ hosts stall some 1080p variants).
+        val loaded = coroutineScope {
+            variants.map { vv -> async {
+                val t = if (vv.url == masterUrl) master else try {
+                    withTimeoutOrNull(5_000L) { app.get(vv.url, headers = streamHeaders, timeout = 5L).takeIf { it.code in 200..299 }?.text }
+                } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { null }
+                val text = t?.takeIf { it.trimStart().startsWith("#EXTM3U") } ?: return@async null
+                // v38: and whose first segment answers. A playlist can load while its segments
+                // stall (cfNative, the /v4/ hosts' 1080p), which hangs the player for a minute.
+                val first = text.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
+                    ?: return@async (vv to text)
+                val segUrl = (try { java.net.URI(vv.url).resolve(first).toString() } catch (_: Exception) { first })
+                    .let { u -> if (tokenQuery.isNotEmpty() && !u.contains('?')) "$u?$tokenQuery" else u }
+                val segOk = try {
+                    withTimeoutOrNull(5_000L) {
+                        val r = app.get(segUrl, headers = streamHeaders + mapOf("Range" to "bytes=0-0"), timeout = 5L)
+                        val ok = r.code == 200 || r.code == 206
+                        try { r.okhttpResponse.close() } catch (_: Exception) {}
+                        if (!ok) log("sistenn-api: ${src.kind} ${vv.height}p segment answered http ${r.code}")
+                        ok
+                    } ?: false.also { log("sistenn-api: ${src.kind} ${vv.height}p segment did not answer in 5 s (${try { java.net.URI(segUrl).host } catch (_: Exception) { "?" }})") }
+                } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { false }
+                if (segOk) vv to text else null
+            } }.mapNotNull { it.await() }
+        }
+        if (loaded.isEmpty()) { log("sistenn-api: ${src.kind} variants not readable, next"); return null }
+        return SistennChecked(tokenQuery, variants.size, loaded)
+    }
+
+    /** Measured size per quality of a checked Sistenn source, from the playlists already in hand. */
+    private suspend fun sistennSizes(kind: String, c: SistennChecked, headers: Map<String, String>): Map<Int, Long> {
+        val out = java.util.concurrent.ConcurrentHashMap<Int, Long>()
+        coroutineScope {
+            for ((vv, text) in c.loaded) launch {
+                val measured = try { sampleSegments(text, vv.url, headers, 8, c.tokenQuery) }
+                    catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { null }
+                val s = measured ?: return@launch
+                out[vv.height] = (s.bytesPerSec * s.durationSec).toLong()
+                log("size: sistenn $kind ${vv.height}p ≈ ${out[vv.height]!! / 1_048_576}MB (${(s.bytesPerSec * 8 / 1000).toLong()} kbps measured, ${(s.durationSec / 60).toInt()} min)")
+            }
+        }
+        return out
     }
 
     // ── HLS helpers (4.0) ────────────────────────────────────────────────────
@@ -2906,6 +3226,11 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         val text = try { app.get(playlistUrl, headers = headers, timeout = 8L).text }
             catch (e: kotlinx.coroutines.CancellationException) { throw e }
             catch (_: Exception) { return null }
+        return sampleSegments(text, playlistUrl, headers, samples)
+    }
+
+    /** As sampleRendition, for a playlist already in hand; segQuery is added to query-less segment URLs. */
+    private suspend fun sampleSegments(text: String, playlistUrl: String, headers: Map<String, String>, samples: Int, segQuery: String = ""): RenditionStats? {
         if (!text.trimStart().startsWith("#EXTM3U")) return null
         val segs = ArrayList<Seg>()
         var dur: Double? = null
@@ -2920,7 +3245,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 else -> {
                     val d = dur
                     if (d != null) {
-                        val u = try { java.net.URI(playlistUrl).resolve(line).toString() } catch (_: Exception) { line }
+                        val u = (try { java.net.URI(playlistUrl).resolve(line).toString() } catch (_: Exception) { line })
+                            .let { if (segQuery.isNotEmpty() && !it.contains('?')) "$it?$segQuery" else it }
                         segs += Seg(d, u, byteLen)
                     }
                     dur = null; byteLen = null
@@ -3329,17 +3655,22 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         driveStreamCache[fileId]?.takeIf { now - it.second < driveStreamTtlMs }?.let { log("gdrive: reusing stream links for $fileId"); return it.first }
         driveStreamQuotaUntil[fileId]?.takeIf { now < it }?.let { log("gdrive: $fileId is over its streaming limit (recently) — skipping the stream lookup"); return emptyList() }
         val keys = driveApiKey?.let { listOf(it) } ?: run {
-            val html = try { app.get("https://drive.google.com/file/d/$fileId/preview", headers = mapOf("User-Agent" to ua,
-                "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"), timeout = 12L).text } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { "" }
+            // v41: the preview as anizm's player frame opens it (Chrome headers and network stack).
+            val html = try { browserGet("https://drive.google.com/file/d/$fileId/preview", clientHints + mapOf("Upgrade-Insecure-Requests" to "1",
+                "User-Agent" to ua, "Accept" to chromeDocAccept, "Sec-Fetch-Site" to "cross-site", "Sec-Fetch-Mode" to "navigate",
+                "Sec-Fetch-Dest" to "iframe", "Referer" to "$mainUrl/", "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"), 12L).text }
+                catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { "" }
             driveKeyRe.findAll(html).map { it.value }.distinct().toList().also { log("gdrive: preview page has ${it.size} API key candidate(s)") }
         }
         if (keys.isEmpty()) return emptyList()
-        val apiHeaders = mapOf("User-Agent" to ua, "Origin" to "https://drive.google.com", "Referer" to "https://drive.google.com/",
-            "Accept" to "*/*", "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7")
+        // v41: the preview page's own fetch to the playback API (a different site: googleapis.com).
+        val apiHeaders = clientHints + mapOf("User-Agent" to ua, "Origin" to "https://drive.google.com", "Referer" to "https://drive.google.com/",
+            "Accept" to "*/*", "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Sec-Fetch-Site" to "cross-site", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Dest" to "empty")
         var body: String? = null
         for (key in keys.take(6)) {
-            val r = try { app.get("https://content-workspacevideo-pa.googleapis.com/v1/drive/media/$fileId/playback?key=$key&auditContext=forDisplay",
-                headers = apiHeaders, timeout = 12L) } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            val r = try { browserGet("https://content-workspacevideo-pa.googleapis.com/v1/drive/media/$fileId/playback?key=$key&auditContext=forDisplay",
+                apiHeaders, 12L) } catch (e: kotlinx.coroutines.CancellationException) { throw e }
                 catch (e: Exception) { log("gdrive: playback API error: ${e.message}"); return emptyList() }
             when (r.code) {
                 200 -> { body = r.text; driveApiKey = key; break }
@@ -3481,9 +3812,51 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
  * the stream host to the player directly. CloudStream allows cleartext traffic
  * (usesCleartextTraffic="true"), so http://127.0.0.1 is permitted.
  */
-internal class LocalHlsServer(private val log: (String) -> Unit) {
+internal class LocalHlsServer(
+    private val log: (String) -> Unit,
+    // v41: how the server talks to the stream's site (Chrome's network stack when available).
+    private val fetch: (String, Map<String, String>) -> NiceResponse? = { u, h ->
+        try { kotlinx.coroutines.runBlocking { app.get(u, headers = h, timeout = 10L) } } catch (_: Exception) { null } },
+) {
     private data class Entry(val url: String, val query: String, val headers: Map<String, String>, val created: Long,
-                             val cached: String? = null, val strip: Boolean = false, val token: TokenState? = null)
+                             val cached: String? = null, val strip: Boolean = false, val token: TokenState? = null,
+                             val beat: Heartbeat? = null)
+
+    /**
+     * v41: the page's "playing" signal. Sistenn's player calls /api/v1/player?t=… every 10 s
+     * while the video plays (the same t each time; the answer is a fresh k/kx) and stops while
+     * it is paused. Streams listed from the API now do the same: the signal runs while the app's
+     * player is fetching this stream (playlist or segments within the last 30 s), pauses when
+     * it stops, and ends after 5 idle minutes. A fresh k/kx also renews the stream token.
+     */
+    class Heartbeat(val url: String, val headers: Map<String, String>, val token: TokenState?) {
+        @Volatile var lastUse = 0L
+        @Volatile var running = false
+    }
+    private fun touch(b: Heartbeat) {
+        b.lastUse = System.currentTimeMillis()
+        synchronized(b) { if (b.running) return; b.running = true }
+        Thread({
+            var beats = 0
+            try {
+                while (true) {
+                    Thread.sleep(10_000)
+                    val idle = System.currentTimeMillis() - b.lastUse
+                    if (idle > 5 * 60_000L) break
+                    if (idle > 30_000L) continue
+                    val r = fetch(b.url, b.headers) ?: continue
+                    beats++
+                    val o = try { org.json.JSONObject(r.text) } catch (_: Exception) { null }
+                    val k = o?.optString("k").orEmpty(); val kx = o?.optLong("kx") ?: 0L
+                    val t = b.token
+                    if (t != null && r.code in 200..299 && k.isNotBlank() && kx > 0) { t.query = "k=$k&kx=$kx"; t.expiresAtMs = TokenState.expiry(t.query) }
+                    if (beats == 1) log("hls-proxy: playing signal sent (every 10 s while playing)")
+                }
+            } catch (_: InterruptedException) {
+            } catch (e: Exception) { log("hls-proxy: playing signal stopped: ${e.javaClass.simpleName}") }
+            finally { b.running = false }
+        }, "anizm-hls-beat").apply { isDaemon = true }.start()
+    }
 
     /** v35: a stream token shared by all qualities of one stream, renewed via the page's refresh URL. */
     class TokenState(initialQuery: String, val refreshUrl: String, val headers: Map<String, String>) {
@@ -3504,7 +3877,7 @@ internal class LocalHlsServer(private val log: (String) -> Unit) {
             if (t.expiresAtMs - System.currentTimeMillis() > 5 * 60_000L || now - t.lastTryMs < 30_000L) return
             t.lastTryMs = now
             try {
-                val r = kotlinx.coroutines.runBlocking { app.get(t.refreshUrl, headers = t.headers, timeout = 10L) }
+                val r = fetch(t.refreshUrl, t.headers) ?: throw java.io.IOException("no answer")
                 val o = org.json.JSONObject(r.text)
                 val k = o.optString("k"); val kx = o.optLong("kx")
                 if (r.code in 200..299 && k.isNotBlank() && kx > 0) {
@@ -3521,12 +3894,12 @@ internal class LocalHlsServer(private val log: (String) -> Unit) {
 
     /** Returns the local URL for this playlist, or null if the server could not start. */
     fun register(url: String, query: String, headers: Map<String, String>, cachedText: String? = null, stripSegments: Boolean = false,
-                 token: TokenState? = null): String? {
+                 token: TokenState? = null, beat: Heartbeat? = null): String? {
         val port = ensureStarted() ?: return null
         val now = System.currentTimeMillis()
         entries.entries.removeAll { now - it.value.created > entryTtlMs }
         val key = java.util.UUID.randomUUID().toString().replace("-", "").take(16)
-        entries[key] = Entry(url, query, headers, now, cachedText?.takeIf { it.trimStart().startsWith("#EXTM3U") }, stripSegments, token)
+        entries[key] = Entry(url, query, headers, now, cachedText?.takeIf { it.trimStart().startsWith("#EXTM3U") }, stripSegments, token, beat)
         return "http://127.0.0.1:$port/hls/$key.m3u8"
     }
 
@@ -3568,13 +3941,16 @@ internal class LocalHlsServer(private val log: (String) -> Unit) {
                     out.flush()
                 }
                 if (entry == null) { reply(404, "Not Found", ByteArray(0), "text/plain"); return }
+                entry.beat?.let { touch(it) }
                 if (isSeg) {
                     val segUrl = try { java.net.URLDecoder.decode(target.substringAfter("?u=", ""), "UTF-8") } catch (_: Exception) { "" }
                     if (!segUrl.startsWith("http")) { reply(400, "Bad Request", ByteArray(0), "text/plain"); return }
                     // v35: tokenised streams: send the player straight to the host with the current token.
-                    entry.token?.takeIf { !entry.strip }?.let { t ->
-                        ensureFresh(t)
-                        val loc = segUrl.substringBefore('?') + "?" + t.query
+                    // v41: streams with a playing signal come through here too (so it knows they are
+                    // playing) and are sent on unchanged.
+                    if (!entry.strip) {
+                        val t = entry.token
+                        val loc = if (t != null) { ensureFresh(t); segUrl.substringBefore('?') + "?" + t.query } else segUrl
                         out.write(("HTTP/1.1 302 Found\r\nLocation: $loc\r\nContent-Length: 0\r\nCache-Control: no-store\r\n" +
                             "Connection: close\r\n\r\n").toByteArray(Charsets.ISO_8859_1))
                         out.flush(); return
@@ -3584,7 +3960,16 @@ internal class LocalHlsServer(private val log: (String) -> Unit) {
                     // "seeked 10 minutes forward and it didn't play"). Now only the head is read until
                     // the real media start is found, then the rest is piped through as it arrives.
                     // timeout = 0: no whole-call timeout, which would cut long transfers off.
-                    val r = try { kotlinx.coroutines.runBlocking { app.get(segUrl, headers = entry.headers, timeout = 0L) } } catch (e: Exception) { null }
+                    // v40: one retry on a network error or a 5xx/429 from the CDN, so a single hiccup
+                    // doesn't reach the player as a failed segment.
+                    var r: NiceResponse? = null
+                    for (attempt in 0 until 2) {
+                        r = try { kotlinx.coroutines.runBlocking { app.get(segUrl, headers = entry.headers, timeout = 0L) } } catch (e: Exception) { null }
+                        val code = r?.code ?: 0
+                        if (code in 200..299 || (code in 400..499 && code != 429) || attempt == 1) break
+                        try { r?.okhttpResponse?.close() } catch (_: Exception) {}
+                        Thread.sleep(400)
+                    }
                     val src = try { r?.okhttpResponse?.body?.byteStream() } catch (_: Exception) { null }
                     if (r == null || r.code !in 200..299 || src == null) {
                         log("hls-proxy: segment ${segUrl.substringBefore('?').takeLast(50)} -> ${r?.code ?: "error"}")
@@ -3671,12 +4056,12 @@ internal class LocalHlsServer(private val log: (String) -> Unit) {
         val line = raw.trimEnd('\r')
         when {
             line.isBlank() -> line
-            line.startsWith("#") && entry.token != null && !entry.strip -> uriAttrRe.replace(line) { m ->
+            line.startsWith("#") && (entry.token != null || entry.beat != null) && !entry.strip -> uriAttrRe.replace(line) { m ->
                 "URI=\"http://127.0.0.1:$port/seg/$key?u=" + java.net.URLEncoder.encode(tokenised(m.groupValues[1], entry), "UTF-8") + "\"" }
             line.startsWith("#") -> uriAttrRe.replace(line) { m -> "URI=\"${tokenised(m.groupValues[1], entry)}\"" }
             // v35: disguised segments come back through here to be cut down to the real media;
             // tokenised ones come back to be redirected with a fresh token.
-            entry.strip || entry.token != null -> "http://127.0.0.1:$port/seg/$key?u=" + java.net.URLEncoder.encode(tokenised(line, entry), "UTF-8")
+            entry.strip || entry.token != null || entry.beat != null -> "http://127.0.0.1:$port/seg/$key?u=" + java.net.URLEncoder.encode(tokenised(line, entry), "UTF-8")
             else -> tokenised(line, entry)
         }
     }
