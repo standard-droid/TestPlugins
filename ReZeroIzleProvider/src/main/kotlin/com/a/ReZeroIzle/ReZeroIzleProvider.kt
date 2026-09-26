@@ -9,8 +9,10 @@ import com.lagradost.cloudstream3.utils.*
  * Site structure:
  *   Homepage nav:   p.subtitle a[href] — lists all seasons and OVAs
  *   Season index:   <div class="hub-card"><ul><li><a href="...">
- *   Episode page:   <a id="downloadBtn" href="...&amp;id=FILE_ID">
- *   JS data file:   seasons-data.js → SEASON_CONFIGS with driveIds[EPISODE_INDEX]
+ *   Episode page:   /sezon/N/bolum/M.html or /sezon/N/ozel/SLUG.html; downloadBtn is "#"
+ *                   until player.js fills it in
+ *   JS data file:   seasons-data.js → SEASON_CONFIGS[N].episodeDriveIds[M-1] (+ episodeDriveIds2/3),
+ *                   specials[].driveId for OVAs; read by SeasonsData
  */
 class ReZeroIzleProvider : MainAPI() {
 
@@ -24,8 +26,8 @@ class ReZeroIzleProvider : MainAPI() {
     companion object {
         private val SEASON_NUM_RE    = Regex("""/sezon/(\d+)/""")
         private val EPISODE_HREF_RE  = Regex("""/(bolum|arabolum|ozel)/""")
-        private val EPISODE_INDEX_RE = Regex("""window\.EPISODE_INDEX\s*=\s*(\d+)""")
-        private val GDRIVE_ID_RE    = Regex("""["'`]([A-Za-z0-9_-]{25,45})["'`]""")
+        private val EPISODE_URL_RE   = Regex("""/sezon/(\d+)/bolum/(\d+)\.html""")
+        private val SPECIAL_URL_RE   = Regex("""/sezon/(\d+)/ozel/([^/?#]+?)\.html""")
         private val GDRIVE_PARAM_RE = Regex("""[?&](?:amp;)?id=([A-Za-z0-9_-]{25,45})""")
         private val GDRIVE_URL_RE   = Regex("""drive\.google\.com/(?:uc|file/d)[?/][^\s"'<>]*?id[=/]([A-Za-z0-9_-]{25,45})""")
 
@@ -306,101 +308,64 @@ class ReZeroIzleProvider : MainAPI() {
     ): Boolean {
         android.util.Log.d("ReZeroIzle", "loadLinks url=$data")
 
-        val html = try {
-            app.get(data, headers = baseHeaders).text
+        // The episode HTML ships with downloadBtn href="#"; the site's player.js fills it
+        // in from seasons-data.js. Read the page only to find that script's URL.
+        val doc = try {
+            fetchDocument(data)
         } catch (e: Exception) {
-            android.util.Log.e("ReZeroIzle", "Episode fetch error: ${e.message}")
+            android.util.Log.w("ReZeroIzle", "Episode fetch error: ${e.message}")
+            null
+        }
+        val dataJsUrl = doc?.select("script[src]")
+            ?.map { it.attr("abs:src") }
+            ?.firstOrNull { it.contains("seasons-data") }
+            ?: "$mainUrl/seasons-data.js"
+
+        val ids = try {
+            val js = fetchScript(dataJsUrl)
+            val episode = EPISODE_URL_RE.find(data)
+            val special = SPECIAL_URL_RE.find(data)
+            when {
+                episode != null -> SeasonsData.episodeIds(
+                    js, episode.groupValues[1].toInt(), episode.groupValues[2].toInt(),
+                )
+                special != null -> SeasonsData.specialIds(
+                    js, special.groupValues[1].toInt(), special.groupValues[2],
+                )
+                else -> emptyList()
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("ReZeroIzle", "seasons-data.js failed: ${e.message}")
+            emptyList()
+        }.toMutableList()
+
+        // Fallback: a real Drive link in the page itself, should the site ever inline one.
+        if (ids.isEmpty() && doc != null) {
+            val dlHref = doc.selectFirst("a#downloadBtn[href]")?.attr("href").orEmpty()
+            val html = doc.outerHtml()
+            (GDRIVE_PARAM_RE.find(dlHref) ?: GDRIVE_URL_RE.find(html) ?: GDRIVE_PARAM_RE.find(html))
+                ?.let { ids.add(it.groupValues[1]) }
+        }
+
+        if (ids.isEmpty()) {
+            android.util.Log.w("ReZeroIzle", "No GDrive ID for $data (episode not uploaded yet?)")
             return false
         }
 
-        val doc2 = org.jsoup.Jsoup.parse(html)
-        var fileId: String? = null
-
-        // ── Step 1: download button (direct GDrive link in HTML) ────────────
-        val downloadBtn = doc2.selectFirst("a#downloadBtn[href]")
-        if (downloadBtn != null) {
-            val dlHref = downloadBtn.attr("href")
-            if (dlHref != "#") {
-                fileId = GDRIVE_PARAM_RE.find(dlHref)?.groupValues?.get(1)
-                    ?: GDRIVE_URL_RE.find(dlHref)?.groupValues?.get(1)
-                if (fileId != null) {
-                    android.util.Log.d("ReZeroIzle", "Got fileId from downloadBtn: $fileId")
+        ids.forEachIndexed { i, fileId ->
+            android.util.Log.d("ReZeroIzle", "GDrive fileId[$i]=$fileId")
+            callback(
+                newExtractorLink(
+                    source = name,
+                    name   = if (i == 0) "Google Drive" else "Google Drive ${i + 1}",
+                    url    = "https://drive.usercontent.google.com/download?id=$fileId&export=download&confirm=t",
+                    type   = ExtractorLinkType.VIDEO,
+                ) {
+                    quality = Qualities.Unknown.value
+                    referer = "https://drive.google.com/"
                 }
-            }
+            )
         }
-
-        // ── Step 2: seasons-data.js via EPISODE_INDEX ────────────────────────
-        if (fileId == null) {
-            var episodeIndex = -1
-            doc2.select("script:not([src])").forEach { el ->
-                val m = EPISODE_INDEX_RE.find(el.html())
-                if (m != null) episodeIndex = m.groupValues[1].toInt()
-            }
-
-            val extScripts = doc2.select("script[src]")
-                .map { it.attr("abs:src").ifBlank { it.attr("src") } }
-                .filter { it.isNotBlank() }
-
-            for (scriptUrl in extScripts) {
-                val absUrl = when {
-                    scriptUrl.startsWith("http") -> scriptUrl
-                    scriptUrl.startsWith("/")    -> "$mainUrl$scriptUrl"
-                    else                         -> "$mainUrl/$scriptUrl"
-                }
-
-                val jsText = try {
-                    fetchScript(absUrl)
-                } catch (e: Exception) {
-                    android.util.Log.w("ReZeroIzle", "Script fetch failed: ${e.message}")
-                    continue
-                }
-
-                val ids = GDRIVE_ID_RE.findAll(jsText)
-                    .map { it.groupValues[1] }
-                    .toList()
-
-                if (ids.isNotEmpty()) {
-                    fileId = if (episodeIndex in ids.indices) {
-                        android.util.Log.d("ReZeroIzle", "Using EPISODE_INDEX $episodeIndex: ${ids[episodeIndex]}")
-                        ids[episodeIndex]
-                    } else {
-                        android.util.Log.d("ReZeroIzle", "Index $episodeIndex out of range (${ids.size}), using first")
-                        ids[0]
-                    }
-                    break
-                }
-            }
-        }
-
-        // ── Step 3: inline HTML regex (last resort) ─────────────────────────
-        if (fileId == null) {
-            fileId = GDRIVE_URL_RE.find(html)?.groupValues?.get(1)
-                ?: GDRIVE_PARAM_RE.find(html)?.groupValues?.get(1)
-        }
-
-        // ── No ID found ─────────────────────────────────────────────────────
-        if (fileId == null || fileId.isBlank()) {
-            if (html.contains("henüz tamamlamadım") || html.contains("yakında")) {
-                android.util.Log.w("ReZeroIzle", "Episode not yet translated")
-            } else {
-                android.util.Log.w("ReZeroIzle", "No GDrive ID found")
-            }
-            return false
-        }
-
-        android.util.Log.d("ReZeroIzle", "GDrive fileId=$fileId")
-
-        callback(
-            newExtractorLink(
-                source = name,
-                name   = "Google Drive",
-                url    = "https://drive.usercontent.google.com/download?id=$fileId&export=download&confirm=t",
-                type   = ExtractorLinkType.VIDEO,
-            ) {
-                quality = Qualities.Unknown.value
-                referer = "https://drive.google.com/"
-            }
-        )
         return true
     }
 }
