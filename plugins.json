@@ -1,27 +1,5 @@
 [
     {
-        "url": "https://raw.githubusercontent.com/standard-droid/TestPlugins/builds/AnizleProvider.cs3",
-        "status": 1,
-        "version": 102,
-        "name": "AnizleProvider",
-        "internalName": "AnizleProvider",
-        "authors": [
-            " "
-        ],
-        "description": "Anizle / Anizm",
-        "fileSize": 79994,
-        "repositoryUrl": "https://github.com/standard-droid/TestPlugins",
-        "language": "tr",
-        "tvTypes": [
-            "Anime",
-            "AnimeMovie",
-            "OVA"
-        ],
-        "iconUrl": "https://anizm.pro/favicon.ico",
-        "apiVersion": 1,
-        "fileHash": "sha256-18b44d41a880bf7dbc821e61a69952660f5f3e42af5a3f6252002d056aa0805d"
-    },
-    {
         "url": "https://raw.githubusercontent.com/standard-droid/TestPlugins/builds/AnizmProvider.cs3",
         "status": 1,
         "version": 34,
