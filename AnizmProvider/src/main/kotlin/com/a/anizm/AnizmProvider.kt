@@ -2680,7 +2680,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         var capacity: Pair<String, String>? = null
         var video: JSONObject? = null
         var sources: List<SistennSource> = emptyList()
-        for (attempt in 0 until 3) {
+        // v39: one capacity retry, not two. rpmvid and strp2p stayed full through both (device
+        // log 2026-09-26), which cost 9 s per host at the end of the episode's link loading.
+        for (attempt in 0 until 2) {
             val capQ = capacity?.let { "&capacityToken=${java.net.URLEncoder.encode(it.first, "UTF-8")}&capacityTokenExpire=${java.net.URLEncoder.encode(it.second, "UTF-8")}" }.orEmpty()
             val r = app.get("$origin/api/v1/video?id=$id&w=1920&h=1080&r=$mainHost$capQ", headers = apiHeaders, timeout = 10L)
             val body = r.text
@@ -2697,9 +2699,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             val d = o.optJSONObject("delivery") ?: JSONObject()
             val saturated = d.optString("inHouse") == "saturated"
             val capToken = d.optString("capacityToken")
-            if (saturated && capToken.isNotEmpty() && attempt < 2) {
-                val wait = (d.optInt("retryAfter", 3).coerceIn(2, 6) * (1 shl attempt)).coerceAtMost(8)
-                log("sistenn-api: $host is at capacity — retrying in ${wait}s (${attempt + 1}/2)")
+            if (saturated && capToken.isNotEmpty() && attempt < 1) {
+                val wait = d.optInt("retryAfter", 3).coerceIn(2, 4)
+                log("sistenn-api: $host is at capacity — retrying once in ${wait}s")
                 capacity = capToken to d.optString("capacityTokenExpire")
                 delay(wait * 1000L)
                 continue
@@ -2720,66 +2722,116 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         } catch (_: Exception) { null }
         log("sistenn-api: ${v.optString("title").take(60)} — sources ${sources.joinToString { it.kind }}")
         val streamHeaders = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin, "Accept" to "*/*")
+        // v39: every source is checked at once. One after another, the backup search took 16 s
+        // after Tiktok was already found (device log 2026-09-26, build 31), and held up the
+        // episode's next wave of sources. The first working source is still awaited in full;
+        // a second one only if it is ready within sistennBackupWaitMs of the start.
+        val t0 = System.currentTimeMillis()
         var sourcesEmitted = 0
-        for (src in sources) {
-            // /v4/ hosts want the token on every request (the page's own rule); cfNative carries its own.
-            val needsPk = src.url.contains("/v4/") && !Regex("""[?&]k=""").containsMatchIn(src.url) && pkQuery.isNotEmpty()
-            val masterUrl = if (needsPk) src.url + (if (src.url.contains('?')) "&" else "?") + pkQuery else src.url
-            val tokenQuery = Regex("""(?:^|&)(k=[^&]+&kx=\d+)""").find(masterUrl.substringAfter('?', ""))?.groupValues?.get(1).orEmpty()
-            val master = try { app.get(masterUrl, headers = streamHeaders, timeout = 6L).takeIf { it.code in 200..299 }?.text }
-                catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { null }
-            if (master == null || !master.trimStart().startsWith("#EXTM3U")) { log("sistenn-api: ${src.kind} master not readable, next"); continue }
-            val variants = parseVariants(master, masterUrl).map { vv ->
-                if (tokenQuery.isNotEmpty() && !vv.url.contains('?')) vv.copy(url = vv.url + "?" + tokenQuery) else vv
-            }.ifEmpty { listOf(Variant(Qualities.Unknown.value, null, masterUrl)) } // a media playlist itself
-            // Only qualities whose playlist actually loads (the /v4/ hosts stall some 1080p variants).
-            val loaded = coroutineScope {
-                variants.map { vv -> async {
-                    val t = if (vv.url == masterUrl) master else try {
-                        withTimeoutOrNull(5_000L) { app.get(vv.url, headers = streamHeaders, timeout = 5L).takeIf { it.code in 200..299 }?.text }
-                    } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { null }
-                    val text = t?.takeIf { it.trimStart().startsWith("#EXTM3U") } ?: return@async null
-                    // v38: and whose first segment answers. A playlist can load while its segments
-                    // stall (cfNative, the /v4/ hosts' 1080p), which hangs the player for a minute.
-                    val first = text.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
-                        ?: return@async (vv to text)
-                    val segUrl = (try { java.net.URI(vv.url).resolve(first).toString() } catch (_: Exception) { first })
-                        .let { u -> if (tokenQuery.isNotEmpty() && !u.contains('?')) "$u?$tokenQuery" else u }
-                    val segOk = try {
-                        withTimeoutOrNull(5_000L) {
-                            val r = app.get(segUrl, headers = streamHeaders + mapOf("Range" to "bytes=0-0"), timeout = 5L)
-                            val ok = r.code == 200 || r.code == 206
-                            try { r.okhttpResponse.close() } catch (_: Exception) {}
-                            if (!ok) log("sistenn-api: ${src.kind} ${vv.height}p segment answered http ${r.code}")
-                            ok
-                        } ?: false.also { log("sistenn-api: ${src.kind} ${vv.height}p segment did not answer in 5 s (${try { java.net.URI(segUrl).host } catch (_: Exception) { "?" }})") }
-                    } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { false }
-                    if (segOk) vv to text else null
-                } }.mapNotNull { it.await() }
+        coroutineScope {
+            val checks = sources.map { src -> src to async {
+                try { checkSistennSource(src, pkQuery, streamHeaders) }
+                catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (e: Exception) { log("sistenn-api: ${src.kind} check failed: ${e.javaClass.simpleName}"); null }
+            } }
+            for ((src, job) in checks) {
+                if (sourcesEmitted >= 2) break
+                val c = if (sourcesEmitted == 0) job.await()
+                    else withTimeoutOrNull((t0 + sistennBackupWaitMs - System.currentTimeMillis()).coerceAtLeast(1L)) { job.await() }
+                if (c == null) {
+                    if (!job.isCompleted) log("sistenn-api: ${src.kind} still checking — not waiting for it as a backup")
+                    continue
+                }
+                val tokenState = if (c.tokenQuery.isNotEmpty() && c.tokenQuery.startsWith("k=${pk?.optString("k")}&") && refreshUrl != null)
+                    LocalHlsServer.TokenState(c.tokenQuery, refreshUrl, apiHeaders) else null
+                // v39: sizes, like Beta and Aincrad. Same episode, same length, so a bigger size
+                // means more data per second of video.
+                val sizeKey = "sistenn:$host:$id:${src.kind}"
+                val sizes = if (estimateHlsSizes) cachedSizes(sizeKey)
+                    ?: (withTimeoutOrNull(5_000L) { sistennSizes(src.kind, c, streamHeaders) } ?: emptyMap()).also { storeSizes(sizeKey, it) }
+                    else emptyMap()
+                var emitted = 0
+                // v38: a second working source is listed as an alternative ("· 2"), so the app's
+                // automatic next-link fallback has another Sistenn route to try.
+                val tag = if (sourcesEmitted == 0) "" else " · ${sourcesEmitted + 1}"
+                for ((vv, text) in c.loaded.sortedByDescending { it.first.height }) {
+                    val local = localHls.register(vv.url, c.tokenQuery, streamHeaders, text, stripSegments = src.strip, token = tokenState) ?: continue
+                    callback(newExtractorLink(source = label,
+                        name = (if (vv.height > 0) "$label ${vv.height}p" else label) + tag + formatSize(sizes[vv.height], isEstimate = true),
+                        url = local, type = ExtractorLinkType.M3U8) { quality = vv.height; referer = "$origin/"; headers = streamHeaders })
+                    emitted++
+                }
+                if (emitted > 0) {
+                    val segHost = try { java.net.URI(c.loaded.first().second.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
+                        ?.let { java.net.URI(c.loaded.first().first.url).resolve(it).toString() } ?: "").host } catch (_: Exception) { null }
+                    log("sistenn-api: ${src.kind} → ${c.loaded.joinToString { "${it.first.height}p" }}${if (c.variantCount > c.loaded.size) " (${c.variantCount - c.loaded.size} variant(s) did not load)" else ""}, segments on ${segHost ?: "?"}, no WebView needed")
+                    sourcesEmitted++
+                }
             }
-            if (loaded.isEmpty()) { log("sistenn-api: ${src.kind} variants not readable, next"); continue }
-            val tokenState = if (tokenQuery.isNotEmpty() && tokenQuery.startsWith("k=${pk?.optString("k")}&") && refreshUrl != null)
-                LocalHlsServer.TokenState(tokenQuery, refreshUrl, apiHeaders) else null
-            var emitted = 0
-            // v38: a second working source is listed as an alternative ("· 2"), so the app's
-            // automatic next-link fallback has another Sistenn route to try.
-            val tag = if (sourcesEmitted == 0) "" else " · ${sourcesEmitted + 1}"
-            for ((vv, text) in loaded.sortedByDescending { it.first.height }) {
-                val local = localHls.register(vv.url, tokenQuery, streamHeaders, text, stripSegments = src.strip, token = tokenState) ?: continue
-                callback(newExtractorLink(source = label, name = (if (vv.height > 0) "$label ${vv.height}p" else label) + tag, url = local, type = ExtractorLinkType.M3U8) {
-                    quality = vv.height; referer = "$origin/"; headers = streamHeaders })
-                emitted++
-            }
-            if (emitted > 0) {
-                val segHost = try { java.net.URI(loaded.first().second.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
-                    ?.let { java.net.URI(loaded.first().first.url).resolve(it).toString() } ?: "").host } catch (_: Exception) { null }
-                log("sistenn-api: ${src.kind} → ${loaded.joinToString { "${it.first.height}p" }}${if (variants.size > loaded.size) " (${variants.size - loaded.size} variant(s) did not load)" else ""}, segments on ${segHost ?: "?"}, no WebView needed")
-                if (++sourcesEmitted >= 2) return SistennResult.EMITTED
-            }
+            checks.forEach { it.second.cancel() }
         }
         if (sourcesEmitted > 0) return SistennResult.EMITTED
         log("sistenn-api: no source of $id was readable from here — falling back to the WebView")
         return SistennResult.UNAVAILABLE
+    }
+
+    private val sistennBackupWaitMs = 9_000L
+    private class SistennChecked(val tokenQuery: String, val variantCount: Int, val loaded: List<Pair<Variant, String>>)
+
+    /** One Sistenn source: its master, and the variants whose playlist loads and whose first segment answers. */
+    private suspend fun checkSistennSource(src: SistennSource, pkQuery: String, streamHeaders: Map<String, String>): SistennChecked? {
+        // /v4/ hosts want the token on every request (the page's own rule); cfNative carries its own.
+        val needsPk = src.url.contains("/v4/") && !Regex("""[?&]k=""").containsMatchIn(src.url) && pkQuery.isNotEmpty()
+        val masterUrl = if (needsPk) src.url + (if (src.url.contains('?')) "&" else "?") + pkQuery else src.url
+        val tokenQuery = Regex("""(?:^|&)(k=[^&]+&kx=\d+)""").find(masterUrl.substringAfter('?', ""))?.groupValues?.get(1).orEmpty()
+        val master = try { app.get(masterUrl, headers = streamHeaders, timeout = 6L).takeIf { it.code in 200..299 }?.text }
+            catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { null }
+        if (master == null || !master.trimStart().startsWith("#EXTM3U")) { log("sistenn-api: ${src.kind} master not readable, next"); return null }
+        val variants = parseVariants(master, masterUrl).map { vv ->
+            if (tokenQuery.isNotEmpty() && !vv.url.contains('?')) vv.copy(url = vv.url + "?" + tokenQuery) else vv
+        }.ifEmpty { listOf(Variant(Qualities.Unknown.value, null, masterUrl)) } // a media playlist itself
+        // Only qualities whose playlist actually loads (the /v4/ hosts stall some 1080p variants).
+        val loaded = coroutineScope {
+            variants.map { vv -> async {
+                val t = if (vv.url == masterUrl) master else try {
+                    withTimeoutOrNull(5_000L) { app.get(vv.url, headers = streamHeaders, timeout = 5L).takeIf { it.code in 200..299 }?.text }
+                } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { null }
+                val text = t?.takeIf { it.trimStart().startsWith("#EXTM3U") } ?: return@async null
+                // v38: and whose first segment answers. A playlist can load while its segments
+                // stall (cfNative, the /v4/ hosts' 1080p), which hangs the player for a minute.
+                val first = text.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
+                    ?: return@async (vv to text)
+                val segUrl = (try { java.net.URI(vv.url).resolve(first).toString() } catch (_: Exception) { first })
+                    .let { u -> if (tokenQuery.isNotEmpty() && !u.contains('?')) "$u?$tokenQuery" else u }
+                val segOk = try {
+                    withTimeoutOrNull(5_000L) {
+                        val r = app.get(segUrl, headers = streamHeaders + mapOf("Range" to "bytes=0-0"), timeout = 5L)
+                        val ok = r.code == 200 || r.code == 206
+                        try { r.okhttpResponse.close() } catch (_: Exception) {}
+                        if (!ok) log("sistenn-api: ${src.kind} ${vv.height}p segment answered http ${r.code}")
+                        ok
+                    } ?: false.also { log("sistenn-api: ${src.kind} ${vv.height}p segment did not answer in 5 s (${try { java.net.URI(segUrl).host } catch (_: Exception) { "?" }})") }
+                } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { false }
+                if (segOk) vv to text else null
+            } }.mapNotNull { it.await() }
+        }
+        if (loaded.isEmpty()) { log("sistenn-api: ${src.kind} variants not readable, next"); return null }
+        return SistennChecked(tokenQuery, variants.size, loaded)
+    }
+
+    /** Measured size per quality of a checked Sistenn source, from the playlists already in hand. */
+    private suspend fun sistennSizes(kind: String, c: SistennChecked, headers: Map<String, String>): Map<Int, Long> {
+        val out = java.util.concurrent.ConcurrentHashMap<Int, Long>()
+        coroutineScope {
+            for ((vv, text) in c.loaded) launch {
+                val measured = try { sampleSegments(text, vv.url, headers, 8, c.tokenQuery) }
+                    catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { null }
+                val s = measured ?: return@launch
+                out[vv.height] = (s.bytesPerSec * s.durationSec).toLong()
+                log("size: sistenn $kind ${vv.height}p ≈ ${out[vv.height]!! / 1_048_576}MB (${(s.bytesPerSec * 8 / 1000).toLong()} kbps measured, ${(s.durationSec / 60).toInt()} min)")
+            }
+        }
+        return out
     }
 
     // ── HLS helpers (4.0) ────────────────────────────────────────────────────
@@ -2906,6 +2958,11 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         val text = try { app.get(playlistUrl, headers = headers, timeout = 8L).text }
             catch (e: kotlinx.coroutines.CancellationException) { throw e }
             catch (_: Exception) { return null }
+        return sampleSegments(text, playlistUrl, headers, samples)
+    }
+
+    /** As sampleRendition, for a playlist already in hand; segQuery is added to query-less segment URLs. */
+    private suspend fun sampleSegments(text: String, playlistUrl: String, headers: Map<String, String>, samples: Int, segQuery: String = ""): RenditionStats? {
         if (!text.trimStart().startsWith("#EXTM3U")) return null
         val segs = ArrayList<Seg>()
         var dur: Double? = null
@@ -2920,7 +2977,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 else -> {
                     val d = dur
                     if (d != null) {
-                        val u = try { java.net.URI(playlistUrl).resolve(line).toString() } catch (_: Exception) { line }
+                        val u = (try { java.net.URI(playlistUrl).resolve(line).toString() } catch (_: Exception) { line })
+                            .let { if (segQuery.isNotEmpty() && !it.contains('?')) "$it?$segQuery" else it }
                         segs += Seg(d, u, byteLen)
                     }
                     dur = null; byteLen = null
