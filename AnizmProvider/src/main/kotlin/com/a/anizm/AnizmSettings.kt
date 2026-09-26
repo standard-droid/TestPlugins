@@ -242,6 +242,10 @@ class AnizmSettings(private val prefs: SharedPreferences) {
     val browserSniff get() = prefs.getBoolean("browser_sniff", true)
     /** Put browser-only sources (Sistenn…) after the rest while lazy loading. */
     val deferBrowserSources get() = prefs.getBoolean("defer_browser_sources", true)
+    /** v40: the site's current host after a domain move (null = the built-in anizm.net). */
+    var siteHost: String?
+        get() = prefs.getString("site_host", null)
+        set(v) { prefs.edit().putString("site_host", v).apply() }
     /** 0 = any quality counts toward the lazy target. */
     val lazyMinQuality get() = prefs.getInt("lazy_min_quality", 1080)
 

@@ -65,7 +65,31 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     private var playerBase = "https://anizmplayer.com"
     // Derived, not hardcoded — if the site ever moves domains, only mainUrl needs updating;
     // this and every check that uses it follow automatically instead of silently going stale.
-    private val mainHost by lazy { android.net.Uri.parse(mainUrl).host ?: "anizm.net" }
+    // v40: a getter, not lazy, so it follows a domain move (below).
+    private val mainHost: String get() = android.net.Uri.parse(mainUrl).host ?: "anizm.net"
+
+    // v40: domain moves. Turkish sites get blocked and move (anizm.net → anizm.tv, anizm2.net…),
+    // usually leaving a redirect behind. When an anizm request ends up on another anizm host, that
+    // host becomes mainUrl and is remembered across restarts; URLs saved under an old host
+    // (bookmarks, history, episode data) are sent to the current one. Only hosts named
+    // "anizm<digits>.<tld>" count — never anizmplayer.com or a block/notice page.
+    private val siteHostRe = Regex("""^(?:www\.)?anizm\d*\.[a-z]{2,10}(?:\.[a-z]{2,3})?$""")
+    init {
+        settings.siteHost?.takeIf { siteHostRe.matches(it) }?.let { mainUrl = "https://$it" }
+    }
+    private fun onCurrentHost(url: String): String {
+        val host = try { java.net.URI(url).host } catch (_: Exception) { null } ?: return url
+        if (host == mainHost || !siteHostRe.matches(host)) return url
+        return url.replaceFirst("//$host", "//$mainHost")
+    }
+    private fun noteFinalHost(requested: String, r: NiceResponse) {
+        val finalHost = try { r.okhttpResponse.request.url.host } catch (_: Exception) { return }
+        val reqHost = try { java.net.URI(requested).host } catch (_: Exception) { null }
+        if (r.code !in 200..299 || finalHost == mainHost || reqHost != mainHost || !siteHostRe.matches(finalHost)) return
+        log("site: $mainHost now redirects to $finalHost — using $finalHost from now on")
+        mainUrl = "https://$finalHost"
+        try { settings.siteHost = finalHost } catch (_: Exception) {}
+    }
     // Class-level, not per-loadLinks: every fansub group's GDrive source hits the same
     // Google endpoint regardless of episode, so two overlapping loadLinks calls (prefetch
     // + manual click) sharing this matters here in a way it doesn't for the other host
@@ -326,17 +350,18 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         allowRedirects: Boolean = true,
     ): NiceResponse {
         val sticky = System.currentTimeMillis() < cfUntil
-        val first = app.get(url, headers = headers, params = params, timeout = timeout,
+        val target = onCurrentHost(url)
+        val first = app.get(target, headers = headers, params = params, timeout = timeout,
             allowRedirects = allowRedirects, interceptor = if (sticky) cfKiller else null)
-        if (sticky || !looksCfBlocked(first)) return first
-        log("cf: challenge on ${url.substringBefore('?')} (${first.code}), retrying via CloudflareKiller")
+        if (sticky || !looksCfBlocked(first)) return first.also { if (allowRedirects) noteFinalHost(target, it) }
+        log("cf: challenge on ${target.substringBefore('?')} (${first.code}), retrying via CloudflareKiller")
         // v5: hard cap. CloudflareKiller's own WebView wait is 60s, which alone can eat half
         // of CloudStream's 120s loadLinks budget.
         val solved = withTimeoutOrNull(cfSolveBudgetMs) {
-            app.get(url, headers = headers, params = params, timeout = timeout,
+            app.get(target, headers = headers, params = params, timeout = timeout,
                 allowRedirects = allowRedirects, interceptor = cfKiller)
         }
-        if (solved == null || looksCfBlocked(solved)) { log("cf: solve failed/timed out for ${url.substringBefore('?')}"); return solved ?: first }
+        if (solved == null || looksCfBlocked(solved)) { log("cf: solve failed/timed out for ${target.substringBefore('?')}"); return solved ?: first }
         cfUntil = System.currentTimeMillis() + cfStickyMs // only sticky once a solve actually worked
         return solved
     }
@@ -473,12 +498,12 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         val chromeHints = navHints
         val cases = listOf<Triple<String, String, Map<String, String>>>(
             Triple("player, minimal", playerUrl, mapOf("User-Agent" to ua, "Referer" to "$mainUrl/")),
-            Triple("player, episode referer", playerUrl, baseHeaders + mapOf("Referer" to episodeUrl)),
+            Triple("player, episode referer", playerUrl, baseHeaders + mapOf("Referer" to onCurrentHost(episodeUrl))),
             Triple("player, no user-agent", playerUrl, mapOf("Referer" to "$mainUrl/")),
-            Triple("player, chrome hints", playerUrl, baseHeaders + mapOf("Referer" to episodeUrl) + chromeHints),
-            Triple("player, webview cookies", playerUrl, baseHeaders + mapOf("Referer" to episodeUrl) +
+            Triple("player, chrome hints", playerUrl, baseHeaders + mapOf("Referer" to onCurrentHost(episodeUrl)) + chromeHints),
+            Triple("player, webview cookies", playerUrl, baseHeaders + mapOf("Referer" to onCurrentHost(episodeUrl)) +
                 (cookies?.let { mapOf("Cookie" to it) } ?: emptyMap())),
-            Triple("player, cookies + hints", playerUrl, baseHeaders + mapOf("Referer" to episodeUrl) + chromeHints +
+            Triple("player, cookies + hints", playerUrl, baseHeaders + mapOf("Referer" to onCurrentHost(episodeUrl)) + chromeHints +
                 (cookies?.let { mapOf("Cookie" to it) } ?: emptyMap())),
             Triple("episode page (control)", episodeUrl, baseHeaders),
             Triple("home page (control)", "$mainUrl/", baseHeaders),
@@ -502,7 +527,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         }
         // Same URL through CloudflareKiller, which replays the WebView's own cookies.
         val viaKiller = try {
-            val r = app.get(playerUrl, headers = baseHeaders + mapOf("Referer" to episodeUrl),
+            val r = app.get(playerUrl, headers = baseHeaders + mapOf("Referer" to onCurrentHost(episodeUrl)),
                 timeout = 20L, allowRedirects = false, interceptor = cfKiller)
             "${r.code}${r.headers["Location"]?.take(60)?.let { " → $it" } ?: ""}"
         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
@@ -515,7 +540,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // without Chrome's matching sec-ch-ua client hints is an inconsistent fingerprint —
         // a plausible reason Cloudflare singled these requests out.
         val cookieHeader = webViewCookies()?.let { mapOf("Cookie" to it) } ?: emptyMap()
-        val headers = baseHeaders + navHints + mapOf("Referer" to episodeUrl) + cookieHeader
+        val headers = baseHeaders + navHints + mapOf("Referer" to onCurrentHost(episodeUrl)) + cookieHeader
         val playerUrl = "$mainUrl/player/$nid"
         lastProbeTarget = nid to episodeUrl
         // Plain request, deliberately not siteGet(): CloudflareKiller can't help here (see
@@ -527,7 +552,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             try { r.okhttpResponse.close() } catch (_: Exception) {}
             // Retry once without cookies: a stale __cf_bm from the WebView can itself be the
             // thing being challenged, and the self-test's cookieless variant passed.
-            r = app.get(playerUrl, headers = baseHeaders + navHints + mapOf("Referer" to episodeUrl),
+            r = app.get(playerUrl, headers = baseHeaders + navHints + mapOf("Referer" to onCurrentHost(episodeUrl)),
                 timeout = 8L, allowRedirects = false)
             if (r.code in 300..399) log("resolve: retry without cookies worked for $nid")
         }
@@ -678,7 +703,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                     if (currentIdx == 1 && results.isEmpty() && !usedFallback) {
                         log("resolve: first failed, falling back to loadUrl")
                         usedFallback = true; currentIdx = -1; pageReady = false
-                        wv.loadUrl(episodeUrl)
+                        wv.loadUrl(onCurrentHost(episodeUrl))
                         return
                     }
                     if (currentIdx >= numIds.size || done) { handler.removeCallbacks(globalTimeout); finish(); return }
@@ -1079,6 +1104,15 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         if (translators.isEmpty()) trRe2.findAll(epHtml).forEach { m ->
             val u = m.groupValues[2]; if (u.isNotBlank()) translators.putIfAbsent(u, m.groupValues[1].ifBlank { "Fansub" })
         }
+        // v40: an HTML-parser fallback that doesn't care about attribute order or quoting, so a
+        // template tweak on the site doesn't empty every episode.
+        if (translators.isEmpty()) try {
+            org.jsoup.Jsoup.parse(epHtml, onCurrentHost(data)).select("[translator]").forEach { e ->
+                val u = e.absUrl("translator").ifBlank { e.attr("translator") }
+                if (u.isNotBlank()) translators.putIfAbsent(u, e.attr("data-fansub-name").ifBlank { e.text().trim().ifBlank { "Fansub" } })
+            }
+            if (translators.isNotEmpty()) logW("site-change warning: translators found only by the HTML parser (attribute layout changed)")
+        } catch (_: Exception) {}
         log("loadLinks: ${translators.size} translators: ${translators.values}")
         if (translators.isEmpty()) {
             if (epHtml.length > 5000) logW("site-change warning: no translators found on a normal-sized episode page")
@@ -1095,7 +1129,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 launch {
                     trGate.withPermit {
                         val trText = try {
-                            siteText(trUrl, xhrHeaders + mapOf("Referer" to data))
+                            siteText(trUrl, xhrHeaders + mapOf("Referer" to onCurrentHost(data)))
                                 ?: run { log("loadLinks: tr error ($fansubName)"); return@withPermit }
                         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
                         catch (e: Exception) { log("loadLinks: tr error ($fansubName): ${e.message}"); return@withPermit }
@@ -1105,6 +1139,12 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         val videos = mutableListOf<Pair<String, String>>()
                         vidRe1.findAll(trHtml).forEach { m -> videos += m.groupValues[1] to m.groupValues[2].ifBlank { "Player" } }
                         if (videos.isEmpty()) vidRe2.findAll(trHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
+                        if (videos.isEmpty()) try {
+                            org.jsoup.Jsoup.parse(trHtml).select("[video]").forEach { e ->
+                                val u = e.attr("video"); if (u.isNotBlank()) videos += u to e.attr("data-video-name").ifBlank { e.text().trim().ifBlank { "Player" } }
+                            }
+                            if (videos.isNotEmpty()) logW("site-change warning: players found only by the HTML parser (attribute layout changed)")
+                        } catch (_: Exception) {}
                         log("loadLinks: $fansubName: ${videos.map { it.second }}")
                         // 4.0: no name whitelist here anymore. It silently dropped every
                         // player it didn't recognise by label (live example: "LuluStream" on
@@ -1176,6 +1216,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
 
     private suspend fun loadLinksWork(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         log("loadLinks: $data")
+        trimSniffMaps()
         // v9: tell a real "reload links" apart from the app's own double call.
         // CloudStream calls loadLinks again a second or two after the first (preload, then
         // the actual open) — those should use the caches. A call that arrives much later for
@@ -1712,6 +1753,15 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             note("sniff: via app $host failed too: ${e.javaClass.simpleName}: ${e.message?.take(90)}")
             null
         }
+    }
+
+    // v40: the per-stream maps the sniffer fills were never emptied — a small leak that grows
+    // with every episode in a long session. They only matter for minutes after a sniff.
+    private fun trimSniffMaps() {
+        for (m in listOf<MutableMap<String, *>>(sniffedHeaders, sniffedVariantUrls, sniffedSegmentUrls, sniffedSegmentSets, sniffedRefreshUrls))
+            if (m.size > 60) m.clear()
+        val now = System.currentTimeMillis()
+        for (m in listOf(sistennApiOffUntil, driveStreamQuotaUntil, gdriveQuotaUntil)) m.entries.removeAll { it.value < now }
     }
 
     private suspend fun sniffHlsViaWebView(pageUrl: String, referer: String, budgetMs: Long = 24_000L): String? =
@@ -3642,7 +3692,16 @@ internal class LocalHlsServer(private val log: (String) -> Unit) {
                     // "seeked 10 minutes forward and it didn't play"). Now only the head is read until
                     // the real media start is found, then the rest is piped through as it arrives.
                     // timeout = 0: no whole-call timeout, which would cut long transfers off.
-                    val r = try { kotlinx.coroutines.runBlocking { app.get(segUrl, headers = entry.headers, timeout = 0L) } } catch (e: Exception) { null }
+                    // v40: one retry on a network error or a 5xx/429 from the CDN, so a single hiccup
+                    // doesn't reach the player as a failed segment.
+                    var r: NiceResponse? = null
+                    for (attempt in 0 until 2) {
+                        r = try { kotlinx.coroutines.runBlocking { app.get(segUrl, headers = entry.headers, timeout = 0L) } } catch (e: Exception) { null }
+                        val code = r?.code ?: 0
+                        if (code in 200..299 || (code in 400..499 && code != 429) || attempt == 1) break
+                        try { r?.okhttpResponse?.close() } catch (_: Exception) {}
+                        Thread.sleep(400)
+                    }
                     val src = try { r?.okhttpResponse?.body?.byteStream() } catch (_: Exception) { null }
                     if (r == null || r.code !in 200..299 || src == null) {
                         log("hls-proxy: segment ${segUrl.substringBefore('?').takeLast(50)} -> ${r?.code ?: "error"}")
