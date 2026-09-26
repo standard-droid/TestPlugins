@@ -3910,10 +3910,17 @@ internal class LocalHlsServer(
         val port = ensureStarted() ?: return null
         val now = System.currentTimeMillis()
         entries.entries.removeAll { now - it.value.created > entryTtlMs }
+        rewritten.keys.retainAll(entries.keys)
         val key = java.util.UUID.randomUUID().toString().replace("-", "").take(16)
         entries[key] = Entry(url, query, headers, now, cachedText?.takeIf { it.trimStart().startsWith("#EXTM3U") }, stripSegments, token, beat)
         return "http://127.0.0.1:$port/hls/$key.m3u8"
     }
+
+    // v43: pooled threads. One new thread per request (the player makes one per 2-6 s segment)
+    // is churn a TV box's CPU notices; idle threads are reused, and dropped after 60 s.
+    private val pool = java.util.concurrent.Executors.newCachedThreadPool { r -> Thread(r, "anizm-hls-conn").apply { isDaemon = true } }
+    // v43: a VOD playlist the page fetched never changes, so it is rewritten once per entry.
+    private val rewritten = java.util.concurrent.ConcurrentHashMap<String, Pair<Int, ByteArray>>() // key -> (port, body)
 
     @Synchronized private fun ensureStarted(): Int? {
         socket?.takeIf { !it.isClosed }?.let { return it.localPort }
@@ -3923,7 +3930,7 @@ internal class LocalHlsServer(
             Thread({
                 while (!ss.isClosed) {
                     val c = try { ss.accept() } catch (_: Exception) { break }
-                    Thread({ handle(c) }, "anizm-hls-conn").apply { isDaemon = true }.start()
+                    try { pool.execute { handle(c) } } catch (_: Exception) { try { c.close() } catch (_: Exception) {} }
                 }
             }, "anizm-hls").apply { isDaemon = true }.start()
             log("hls-proxy: listening on 127.0.0.1:${ss.localPort}")
@@ -3935,6 +3942,9 @@ internal class LocalHlsServer(
         try {
             c.use { sock ->
                 sock.soTimeout = 15_000
+                // v43: headers and body are separate writes; without this, Nagle's algorithm can hold
+                // the body back ~40 ms per segment waiting for an ACK.
+                try { sock.tcpNoDelay = true } catch (_: Exception) {}
                 val input = sock.getInputStream().bufferedReader(Charsets.ISO_8859_1)
                 val requestLine = input.readLine() ?: return
                 while (true) { val l = input.readLine() ?: break; if (l.isEmpty()) break }
@@ -3990,7 +4000,7 @@ internal class LocalHlsServer(
                     }
                     try {
                         val headBuf = java.io.ByteArrayOutputStream()
-                        val buf = ByteArray(16_384)
+                        val buf = ByteArray(65_536)
                         var start: Int? = null
                         while (headBuf.size() < 262_144) {
                             val n = src.read(buf); if (n < 0) break
@@ -4016,8 +4026,12 @@ internal class LocalHlsServer(
                 // v33: VOD playlists (ENDLIST) don't change, so the copy the sniff page fetched
                 // through the WebView is served as-is; only without one is the host asked.
                 entry.cached?.let {
-                    log("hls-proxy: served ${entry.url.substringBefore('?').substringAfterLast('/')} from the page's copy")
-                    reply(200, "OK", rewrite(it, entry, key, sock.localPort).toByteArray(Charsets.UTF_8), "application/vnd.apple.mpegurl"); return
+                    val port = sock.localPort
+                    val body = rewritten[key]?.takeIf { c -> c.first == port }?.second ?: rewrite(it, entry, key, port).toByteArray(Charsets.UTF_8).also { b ->
+                        rewritten[key] = port to b
+                        log("hls-proxy: served ${entry.url.substringBefore('?').substringAfterLast('/')} from the page's copy")
+                    }
+                    reply(200, "OK", body, "application/vnd.apple.mpegurl"); return
                 }
                 var failure = ""
                 val upstream = try {
@@ -4046,7 +4060,14 @@ internal class LocalHlsServer(
     private fun findMediaStart(b: ByteArray): Int? = mediaStart(b).takeIf { it > 0 || looksLikeMediaAt0(b) }
     private fun looksLikeMediaAt0(b: ByteArray): Boolean =
         (b.size > 376 && b[0] == 0x47.toByte() && b[188] == 0x47.toByte() && b[376] == 0x47.toByte()) ||
-            (b.size >= 8 && String(b, 4, 4, Charsets.ISO_8859_1).let { it == "ftyp" || it == "styp" || it == "moof" })
+            (b.size >= 8 && isMp4Box(b, 4))
+
+    /** v43: "ftyp", "styp" or "moof" at i, compared byte by byte (was a new String per position). */
+    private fun isMp4Box(b: ByteArray, i: Int): Boolean {
+        val c0 = b[i].toInt(); val c1 = b[i + 1].toInt(); val c2 = b[i + 2].toInt(); val c3 = b[i + 3].toInt()
+        return (c1 == 't'.code && c2 == 'y'.code && c3 == 'p'.code && (c0 == 'f'.code || c0 == 's'.code)) ||
+            (c0 == 'm'.code && c1 == 'o'.code && c2 == 'o'.code && c3 == 'f'.code)
+    }
 
     private fun mediaStart(b: ByteArray): Int {
         val limit = minOf(b.size, 262_144)
@@ -4057,8 +4078,7 @@ internal class LocalHlsServer(
         }
         i = 4
         while (i + 4 <= limit) {
-            val t = String(b, i, 4, Charsets.ISO_8859_1)
-            if (t == "ftyp" || t == "styp" || t == "moof") return i - 4
+            if (isMp4Box(b, i)) return i - 4
             i++
         }
         return 0
