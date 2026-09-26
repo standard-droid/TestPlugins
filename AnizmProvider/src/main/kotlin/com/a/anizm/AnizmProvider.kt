@@ -3313,17 +3313,42 @@ internal class LocalHlsServer(private val log: (String) -> Unit) {
                             "Connection: close\r\n\r\n").toByteArray(Charsets.ISO_8859_1))
                         out.flush(); return
                     }
-                    val r = try { kotlinx.coroutines.runBlocking { app.get(segUrl, headers = entry.headers, timeout = 20L) } } catch (e: Exception) { null }
-                    val bytes = try { r?.okhttpResponse?.body?.bytes() } catch (_: Exception) { null }
-                    if (r == null || r.code !in 200..299 || bytes == null) {
+                    // v36: streamed, not buffered. v35 downloaded the whole disguised segment before
+                    // sending a byte; after a seek the player gave up waiting (device log 2026-09-26:
+                    // "seeked 10 minutes forward and it didn't play"). Now only the head is read until
+                    // the real media start is found, then the rest is piped through as it arrives.
+                    // timeout = 0: no whole-call timeout, which would cut long transfers off.
+                    val r = try { kotlinx.coroutines.runBlocking { app.get(segUrl, headers = entry.headers, timeout = 0L) } } catch (e: Exception) { null }
+                    val src = try { r?.okhttpResponse?.body?.byteStream() } catch (_: Exception) { null }
+                    if (r == null || r.code !in 200..299 || src == null) {
                         log("hls-proxy: segment ${segUrl.substringBefore('?').takeLast(50)} -> ${r?.code ?: "error"}")
+                        try { r?.okhttpResponse?.close() } catch (_: Exception) {}
                         reply(502, "Bad Gateway", ByteArray(0), "text/plain"); return
                     }
-                    val start = mediaStart(bytes)
-                    if (start > 0 && !loggedStrip) { loggedStrip = true; log("hls-proxy: segments carry a ${start}-byte disguise (${bytes.take(4).joinToString("") { "%02x".format(it) }}…), stripping it") }
-                    val body = if (start > 0) bytes.copyOfRange(start, bytes.size) else bytes
-                    val type = if (body.isNotEmpty() && body[0] == 0x47.toByte()) "video/mp2t" else "video/mp4"
-                    reply(200, "OK", body, type); return
+                    try {
+                        val headBuf = java.io.ByteArrayOutputStream()
+                        val buf = ByteArray(16_384)
+                        var start: Int? = null
+                        while (headBuf.size() < 262_144) {
+                            val n = src.read(buf); if (n < 0) break
+                            headBuf.write(buf, 0, n)
+                            if (headBuf.size() >= 1_024) { start = findMediaStart(headBuf.toByteArray()); if (start != null) break }
+                        }
+                        val head = headBuf.toByteArray()
+                        val at = start ?: findMediaStart(head) ?: 0
+                        if (at > 0 && !loggedStrip) { loggedStrip = true; log("hls-proxy: segments carry a ${at}-byte disguise (${head.take(4).joinToString("") { "%02x".format(it) }}…), stripping it") }
+                        val type = if (head.size > at && head[at] == 0x47.toByte()) "video/mp2t" else "video/mp4"
+                        val total = try { r.okhttpResponse.body?.contentLength() ?: -1L } catch (_: Exception) { -1L }
+                        val lengthHeader = if (total > at) "Content-Length: ${total - at}\r\n" else ""
+                        out.write(("HTTP/1.1 200 OK\r\nContent-Type: $type\r\n$lengthHeader" +
+                            "Cache-Control: no-store\r\nConnection: close\r\n\r\n").toByteArray(Charsets.ISO_8859_1))
+                        if (method != "HEAD") {
+                            out.write(head, at, head.size - at)
+                            while (true) { val n = src.read(buf); if (n < 0) break; out.write(buf, 0, n) }
+                        }
+                        out.flush()
+                    } finally { try { r.okhttpResponse.close() } catch (_: Exception) {} }
+                    return
                 }
                 // v33: VOD playlists (ENDLIST) don't change, so the copy the sniff page fetched
                 // through the WebView is served as-is; only without one is the host asked.
@@ -3342,6 +3367,8 @@ internal class LocalHlsServer(private val log: (String) -> Unit) {
                 }
                 reply(200, "OK", rewrite(text, entry, key, sock.localPort).toByteArray(Charsets.UTF_8), "application/vnd.apple.mpegurl")
             }
+        } catch (e: java.net.SocketException) {
+            // The player closed the connection (seek, quality switch): routine, not an error.
         } catch (e: Exception) { log("hls-proxy: ${e.javaClass.simpleName}: ${e.message}") }
     }
 
@@ -3352,7 +3379,12 @@ internal class LocalHlsServer(private val log: (String) -> Unit) {
 
     @Volatile private var loggedStrip = false
 
-    /** Where the real media starts: 3 MPEG-TS sync bytes 188 apart, or an MP4 ftyp/styp/moof box. */
+    /** Where the real media starts: 3 MPEG-TS sync bytes 188 apart, or an MP4 ftyp/styp/moof box; null if neither. */
+    private fun findMediaStart(b: ByteArray): Int? = mediaStart(b).takeIf { it > 0 || looksLikeMediaAt0(b) }
+    private fun looksLikeMediaAt0(b: ByteArray): Boolean =
+        (b.size > 376 && b[0] == 0x47.toByte() && b[188] == 0x47.toByte() && b[376] == 0x47.toByte()) ||
+            (b.size >= 8 && String(b, 4, 4, Charsets.ISO_8859_1).let { it == "ftyp" || it == "styp" || it == "moof" })
+
     private fun mediaStart(b: ByteArray): Int {
         val limit = minOf(b.size, 262_144)
         var i = 0
