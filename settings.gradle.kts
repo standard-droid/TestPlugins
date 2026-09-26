@@ -3,9 +3,7 @@ rootProject.name = "CloudstreamPlugins"
 // This file sets what projects are included.
 // All new projects should get automatically included unless specified in the "disabled" variable.
 
-// AnizleProvider: retired 2026-09-26. An older build of the same anizm.net extension,
-// superseded by AnizmProvider; its last published version (102) is on master at eddf1ef.
-val disabled = listOf<String>("AnizleProvider")
+val disabled = listOf<String>()
 
 File(rootDir, ".").eachDir { dir ->
     if (!disabled.contains(dir.name) && File(dir, "build.gradle.kts").exists()) {
