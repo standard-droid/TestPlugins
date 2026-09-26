@@ -361,8 +361,27 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // looked inconsistent — exactly backwards. They're on every anizm request now.
     // Mobile hints, matching the Android UA above — and the exact shape the device self-test
     // got its 302 with. Version comes from the real Chrome version in the UA.
+    // v36: the brand list is built the way Chrome builds it (GREASE brand, version and order all
+    // depend on the major version). v12–v35 sent "Chromium", "Google Chrome", "Not?A_Brand";v="24"
+    // for every version — for Chrome 153 real Chrome sends "Google Chrome", "Not_A Brand";v="8",
+    // "Chromium". The algorithm reproduces this device's own WebView header exactly
+    // ("Android WebView";v="153", "Not_A Brand";v="8", "Chromium";v="153", log 2026-09-26), so
+    // the app's requests and the WebView's no longer disagree about what browser this is.
+    private val chromeBrandList: String by lazy {
+        val major = chromeMajor.toIntOrNull() ?: 152
+        val chars = listOf(" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_")
+        val versions = listOf("8", "99", "24")
+        val grease = "Not" + chars[major % chars.size] + "A" + chars[(major + 1) % chars.size] + "Brand"
+        val orders = listOf(listOf(0, 1, 2), listOf(0, 2, 1), listOf(1, 0, 2), listOf(1, 2, 0), listOf(2, 0, 1), listOf(2, 1, 0))
+        val order = orders[major % orders.size]
+        val slots = arrayOfNulls<String>(3)
+        slots[order[0]] = "\"$grease\";v=\"${versions[major % versions.size]}\""
+        slots[order[1]] = "\"Chromium\";v=\"$major\""
+        slots[order[2]] = "\"Google Chrome\";v=\"$major\""
+        slots.joinToString(", ")
+    }
     private val clientHints get() = mapOf(
-        "sec-ch-ua" to "\"Chromium\";v=\"$chromeMajor\", \"Google Chrome\";v=\"$chromeMajor\", \"Not?A_Brand\";v=\"24\"",
+        "sec-ch-ua" to chromeBrandList,
         "sec-ch-ua-mobile" to "?1",
         "sec-ch-ua-platform" to "\"Android\"")
     private val navHints get() = clientHints + mapOf(
@@ -1495,7 +1514,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             if (fo) {
               window.fetch = function(i){
                 var p = fo.apply(this, arguments);
-                try { var u = (typeof i === 'string') ? i : (i && i.url);
+                try { var u = (typeof i === 'string') ? i : (i && (i.url || i.href));
                   if (u && isPl(u)) p.then(function(r){ try { r.clone().text().then(function(t){ keep(r.url || u, t); }); } catch(e){} }, function(){});
                 } catch(e){}
                 return p;
@@ -2033,6 +2052,16 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         val code = errorResponse?.statusCode ?: 0
                         if (request.isForMainFrame && code >= 500 && !done && h.equals(pageHost, true)) {
                             parkSniffHost(pageUrl, "http $code")
+                            handler.post { finish(null) }
+                        }
+                        // v36: the stream's own master playlist answered 5xx (rpmvid hlsmod: 530 on the
+                        // master and every segment, device log 2026-09-26) — the page loaded, the stream is
+                        // down. Stop now instead of waiting out the budget; park the host only when the
+                        // stream lives on the page's own host (a separate stream host rotates).
+                        val master = masterRef.get()
+                        if (master != null && code >= 500 && !done && request.url?.toString() == master) {
+                            if (h.equals(pageHost, true)) parkSniffHost(pageUrl, "stream master http $code")
+                            else log("sniff: stream master answered http $code — giving up on this one")
                             handler.post { finish(null) }
                         }
                     }
