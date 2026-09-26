@@ -157,9 +157,11 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // resolveConcurrency = 1 is strictly sequential. Worst-case cost for a 16-source
     // episode with lazy resolve off: ~16 × avg gap (≈4.4s at 150–400ms), still faster than
     // the old WebView path (1.5s timeout per dead id + page/iframe load per id).
-    private val resolveConcurrency = 2
-    private val resolveGapMinMs = 150L
-    private val resolveGapMaxMs = 400L
+    // v41: one at a time, 0.5-1.2 s apart (was 2 at a time, 0.15-0.4 s). A person switching
+    // players doesn't open three within a second; about 1-2 s more per episode.
+    private val resolveConcurrency = 1
+    private val resolveGapMinMs = 500L
+    private val resolveGapMaxMs = 1200L
 
     // (2) Which players to use, (4) lazy loading and the size estimate are user settings
     // now — see AnizmSettings (Extensions screen → Anizm → settings). Read on every call.
@@ -1748,7 +1750,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // step4 limit) would mean five live WebViews with ad scripts running — the kind of thing
     // that makes a TV box stutter or get killed for memory.
     private val sniffGate = Semaphore(1)
-    private val localHls = LocalHlsServer { log(it) }
+    private val localHls = LocalHlsServer({ log(it) }, { u, h -> try { runBlocking { browserGet(u, h, 10L) } } catch (_: Exception) { null } })
     // Sniffed playlists are reused for 20 min: the URL carries its own ?v= stamp and the page
     // load is by far the most expensive thing this extension does.
     private val sniffCache = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
@@ -2547,14 +2549,19 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             // straight from the stream host.
             // v35: with the page's refresh call known, segments are served as redirects that carry a
             // token the local server keeps fresh (the one in the playlist expires 30 min after the sniff).
+            // v41: the page's own fetch headers for its refresh / playing call.
+            fun refreshHeaders(ru: String) = clientHints + mapOf("User-Agent" to ua, "Accept" to "*/*",
+                "Referer" to (try { java.net.URI(ru).let { "${it.scheme}://${it.host}/" } } catch (_: Exception) { "$origin/" }),
+                "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Sec-Fetch-Site" to "same-origin", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Dest" to "empty")
             val tokenState = if (tokenQuery.isNotEmpty() && !hlsmod) sniffedRefreshUrls[exUrl]?.let { ru ->
-                LocalHlsServer.TokenState(tokenQuery, ru, mapOf("User-Agent" to ua, "Accept" to "*/*",
-                    "Referer" to (try { java.net.URI(ru).let { "${it.scheme}://${it.host}/" } } catch (_: Exception) { "$origin/" })))
+                LocalHlsServer.TokenState(tokenQuery, ru, refreshHeaders(ru))
             } else null
+            val beat = sniffedRefreshUrls[exUrl]?.let { ru -> LocalHlsServer.Heartbeat(ru, refreshHeaders(ru), tokenState) }
             if (tokenState != null) log("sniff: token will be renewed through the page's refresh call when it nears expiry")
             val proxied = if (useProxy && variants.isNotEmpty())
                 variants.mapNotNull { v -> localHls.register(v.url, tokenQuery, linkHeaders, sniffedPlaylistTexts[v.url.substringBefore('?')],
-                    stripSegments = hlsmod, token = tokenState)?.let { v to it } } else emptyList()
+                    stripSegments = hlsmod, token = tokenState, beat = beat)?.let { v to it } } else emptyList()
             if (proxied.isNotEmpty()) log("sniff: serving ${proxied.size} tokenised playlist(s) via ${proxied.first().second.substringBeforeLast('/')}, " +
                 "${variants.count { sniffedPlaylistTexts.containsKey(it.url.substringBefore('?')) }} from the page's own fetch")
             found = if (proxied.isNotEmpty()) {
@@ -2596,9 +2603,15 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // no browser ever makes, and then used that 404 URL as the Referer.
         val apBase = apDomains[hash] ?: playerBase
         val playerRef = "$apBase/video/$hash"
-        val aHeaders = mapOf("User-Agent" to ua,
+        // v41: what the player page's own $.ajax sends (client hints, Sec-Fetch-*, language).
+        val aHeaders = clientHints + mapOf("User-Agent" to ua,
             "X-Requested-With" to "XMLHttpRequest", "Accept" to "*/*",
-            "Referer" to playerRef, "Origin" to apBase)
+            "Referer" to playerRef, "Origin" to apBase, "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Sec-Fetch-Site" to "same-origin", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Dest" to "empty")
+        // The player page itself, loaded the way anizm's iframe loads it.
+        val aPageHeaders = clientHints + mapOf("Upgrade-Insecure-Requests" to "1", "User-Agent" to ua, "Accept" to chromeDocAccept,
+            "Sec-Fetch-Site" to "cross-site", "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-Dest" to "iframe",
+            "Referer" to "$mainUrl/", "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7")
         val now = System.currentTimeMillis()
         val cachedSource = aincradCache[hash]?.takeIf { it.validUntil > now }
         val videoSource: String
@@ -2613,14 +2626,16 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             cachedSource.cookie.split("; ").filter { '=' in it }.forEach { cookieJar[it.substringBefore('=')] = it.substringAfter('=') }
             log("aincrad: reusing signed URL for $apBase $hash (${(cachedSource.validUntil - now) / 1000}s left)")
         } else {
-            try { app.get(playerRef, headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/"), timeout = 8).cookies.let { cookieJar.putAll(it) } }
+            try { browserGet(playerRef, aPageHeaders, 8L).cookies.let { cookieJar.putAll(it) } }
             catch (e: kotlinx.coroutines.CancellationException) { throw e }
             catch (_: Exception) {}
             // 4.0: FirePlayer's own call is $.ajax POST with data {hash: ID, r: document.referrer}.
             val streamResp = try {
-                app.post("$apBase/player/index.php?data=$hash&do=getVideo",
-                    headers = aHeaders + (if (cookieJar.isEmpty()) emptyMap() else mapOf("Cookie" to cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" })),
-                    data = mapOf("hash" to hash, "r" to "$mainUrl/"), timeout = 10).also { cookieJar.putAll(it.cookies) }
+                val gvUrl = "$apBase/player/index.php?data=$hash&do=getVideo"
+                val gvHeaders = aHeaders + (if (cookieJar.isEmpty()) emptyMap() else mapOf("Cookie" to cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" }))
+                val gvData = mapOf("hash" to hash, "r" to "$mainUrl/")
+                (chromeFetch(gvUrl, gvHeaders, 10L, formBody = gvData) ?: app.post(gvUrl, headers = gvHeaders, data = gvData, timeout = 10))
+                    .also { cookieJar.putAll(it.cookies) }
             } catch (e: kotlinx.coroutines.CancellationException) { throw e }
               catch (e: Exception) { log("aincrad error: ${e.javaClass.simpleName}: ${e.message}"); return false }
             val streamText = streamResp.text
@@ -2866,6 +2881,48 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         return out
     }
 
+    // v41: the phone's screen as window.screen reports it (CSS pixels, current orientation).
+    private fun deviceScreenCss(): Pair<Int, Int> = try {
+        val dm = com.lagradost.cloudstream3.CloudStreamApp.context!!.resources.displayMetrics
+        val w = (dm.widthPixels / dm.density).toInt(); val h = (dm.heightPixels / dm.density).toInt()
+        if (w in 200..4000 && h in 200..4000) w to h else 412 to 915
+    } catch (_: Throwable) { 412 to 915 }
+
+    /**
+     * v41: what a browser fetches before the player's API calls: the page (an iframe opened from
+     * anizm) at most every 30 min per host, and its script and stylesheet once per session (a
+     * browser caches them). A renamed script means Sistenn shipped a new player, which is when
+     * its API key could change, so that is logged.
+     */
+    private val sistennPageAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val sistennAssetsSeen = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val sistennKnownScript = "index-DqFBtoPY.js"
+    private suspend fun visitSistennPage(origin: String) {
+        val now = System.currentTimeMillis()
+        if (now - (sistennPageAt[origin] ?: 0L) < 30 * 60_000L) return
+        sistennPageAt[origin] = now
+        val lang = "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"
+        val page = try {
+            browserGet("$origin/", clientHints + mapOf("Upgrade-Insecure-Requests" to "1", "User-Agent" to ua, "Accept" to chromeDocAccept,
+                "Sec-Fetch-Site" to "cross-site", "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-Dest" to "iframe",
+                "Referer" to "$mainUrl/", "Accept-Language" to lang), 8L).takeIf { it.code in 200..299 }?.text
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { null }
+        val html = page ?: return
+        val script = Regex("""<script[^>]+type="module"[^>]+src="([^"]+)"""").find(html)?.groupValues?.get(1)
+        val css = Regex("""<link[^>]+rel="stylesheet"[^>]+href="([^"]+)"""").find(html)?.groupValues?.get(1)
+        if (script != null && !script.endsWith("/$sistennKnownScript"))
+            logW("sistenn-api: $origin serves a new player script (${script.substringAfterLast('/')}, was $sistennKnownScript) — if Sistenn links stop, its API key may have changed")
+        for ((path, dest) in listOf(script to "script", css to "style")) {
+            if (path == null || !sistennAssetsSeen.add("$origin$path")) continue
+            val u = try { java.net.URI("$origin/").resolve(path).toString() } catch (_: Exception) { continue }
+            try {
+                browserGet(u, clientHints + mapOf("User-Agent" to ua, "Accept" to (if (dest == "style") "text/css,*/*;q=0.1" else "*/*"),
+                    "Origin" to origin, "Sec-Fetch-Site" to "same-origin", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Dest" to dest,
+                    "Referer" to "$origin/", "Accept-Language" to lang), 15L).let { r -> try { r.okhttpResponse.close() } catch (_: Exception) {} }
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) {}
+        }
+    }
+
     suspend fun trySistennApi(exUrl: String, label: String, callback: (ExtractorLink) -> Unit): SistennResult {
         val m = sistennPageRe.find(exUrl) ?: return SistennResult.UNAVAILABLE
         val host = m.groupValues[1]; val id = m.groupValues[2]
@@ -2876,9 +2933,16 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
             "Sec-Fetch-Site" to "same-origin", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Dest" to "empty")
         fun off(why: String) { sistennApiOffUntil[host] = System.currentTimeMillis() + 60 * 60_000L; log("sistenn-api: $host not usable ($why) — WebView for 1 h") }
+        // v41: a visit starts with the page and its script, as it does in a browser.
+        visitSistennPage(origin)
         // The page asks /info first; so do we (it also says early if the id is gone).
-        try { app.get("$origin/api/v1/info?id=$id", headers = apiHeaders, timeout = 8L).let { r -> try { r.okhttpResponse.close() } catch (_: Exception) {} } }
+        try { browserGet("$origin/api/v1/info?id=$id", apiHeaders, 8L).let { r -> try { r.okhttpResponse.close() } catch (_: Exception) {} } }
         catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) {}
+        // v41: window.screen, as the page reports it (the server logs it beside the OS it reads
+        // from the UA). The phone's real screen in CSS pixels; 1920x1080 contradicted the Android
+        // UA. The server does not pick qualities by it (a 1280x720 browser got 1080p too); the
+        // page's player caps quality to its own size, which this app's player doesn't.
+        val (screenW, screenH) = deviceScreenCss()
         var capacity: Pair<String, String>? = null
         var video: JSONObject? = null
         var sources: List<SistennSource> = emptyList()
@@ -2886,7 +2950,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // log 2026-09-26), which cost 9 s per host at the end of the episode's link loading.
         for (attempt in 0 until 2) {
             val capQ = capacity?.let { "&capacityToken=${java.net.URLEncoder.encode(it.first, "UTF-8")}&capacityTokenExpire=${java.net.URLEncoder.encode(it.second, "UTF-8")}" }.orEmpty()
-            val r = app.get("$origin/api/v1/video?id=$id&w=1920&h=1080&r=$mainHost$capQ", headers = apiHeaders, timeout = 10L)
+            val r = browserGet("$origin/api/v1/video?id=$id&w=$screenW&h=$screenH&r=$mainHost$capQ", apiHeaders, 10L)
             val body = r.text
             if (r.code !in 200..299) {
                 val plainErr = sistennDecrypt(body) ?: body
@@ -2916,7 +2980,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         val pkQuery = pk?.optString("k")?.takeIf { it.isNotEmpty() }?.let { "k=$it&kx=${pk.optLong("kx")}" }.orEmpty()
         // Our own refresh call, the way the page builds it.
         val metric = v.optJSONObject("metric")
-        val refreshUrl = if (pkQuery.isEmpty()) null else try {
+        // v41: built for every stream (it is also the playing signal), not only for pk tokens.
+        val refreshUrl = try {
             "$origin/api/v1/player?t=" + sistennEncrypt(JSONObject().apply {
                 put("website", mainHost); put("playing", true); put("sessionId", sistennSessionId)
                 for (k in listOf("userId", "playerId", "videoId", "country", "platform", "browser", "os")) put(k, metric?.optString(k) ?: "")
@@ -2946,6 +3011,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 }
                 val tokenState = if (c.tokenQuery.isNotEmpty() && c.tokenQuery.startsWith("k=${pk?.optString("k")}&") && refreshUrl != null)
                     LocalHlsServer.TokenState(c.tokenQuery, refreshUrl, apiHeaders) else null
+                val beat = refreshUrl?.let { LocalHlsServer.Heartbeat(it, apiHeaders, tokenState) }
                 // v39: sizes, like Beta and Aincrad. Same episode, same length, so a bigger size
                 // means more data per second of video.
                 val sizeKey = "sistenn:$host:$id:${src.kind}"
@@ -2957,7 +3023,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 // automatic next-link fallback has another Sistenn route to try.
                 val tag = if (sourcesEmitted == 0) "" else " · ${sourcesEmitted + 1}"
                 for ((vv, text) in c.loaded.sortedByDescending { it.first.height }) {
-                    val local = localHls.register(vv.url, c.tokenQuery, streamHeaders, text, stripSegments = src.strip, token = tokenState) ?: continue
+                    val local = localHls.register(vv.url, c.tokenQuery, streamHeaders, text, stripSegments = src.strip, token = tokenState, beat = beat) ?: continue
                     callback(newExtractorLink(source = label,
                         name = (if (vv.height > 0) "$label ${vv.height}p" else label) + tag + formatSize(sizes[vv.height], isEstimate = true),
                         url = local, type = ExtractorLinkType.M3U8) { quality = vv.height; referer = "$origin/"; headers = streamHeaders })
@@ -3589,17 +3655,22 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         driveStreamCache[fileId]?.takeIf { now - it.second < driveStreamTtlMs }?.let { log("gdrive: reusing stream links for $fileId"); return it.first }
         driveStreamQuotaUntil[fileId]?.takeIf { now < it }?.let { log("gdrive: $fileId is over its streaming limit (recently) — skipping the stream lookup"); return emptyList() }
         val keys = driveApiKey?.let { listOf(it) } ?: run {
-            val html = try { app.get("https://drive.google.com/file/d/$fileId/preview", headers = mapOf("User-Agent" to ua,
-                "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"), timeout = 12L).text } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { "" }
+            // v41: the preview as anizm's player frame opens it (Chrome headers and network stack).
+            val html = try { browserGet("https://drive.google.com/file/d/$fileId/preview", clientHints + mapOf("Upgrade-Insecure-Requests" to "1",
+                "User-Agent" to ua, "Accept" to chromeDocAccept, "Sec-Fetch-Site" to "cross-site", "Sec-Fetch-Mode" to "navigate",
+                "Sec-Fetch-Dest" to "iframe", "Referer" to "$mainUrl/", "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"), 12L).text }
+                catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { "" }
             driveKeyRe.findAll(html).map { it.value }.distinct().toList().also { log("gdrive: preview page has ${it.size} API key candidate(s)") }
         }
         if (keys.isEmpty()) return emptyList()
-        val apiHeaders = mapOf("User-Agent" to ua, "Origin" to "https://drive.google.com", "Referer" to "https://drive.google.com/",
-            "Accept" to "*/*", "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7")
+        // v41: the preview page's own fetch to the playback API (a different site: googleapis.com).
+        val apiHeaders = clientHints + mapOf("User-Agent" to ua, "Origin" to "https://drive.google.com", "Referer" to "https://drive.google.com/",
+            "Accept" to "*/*", "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Sec-Fetch-Site" to "cross-site", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Dest" to "empty")
         var body: String? = null
         for (key in keys.take(6)) {
-            val r = try { app.get("https://content-workspacevideo-pa.googleapis.com/v1/drive/media/$fileId/playback?key=$key&auditContext=forDisplay",
-                headers = apiHeaders, timeout = 12L) } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            val r = try { browserGet("https://content-workspacevideo-pa.googleapis.com/v1/drive/media/$fileId/playback?key=$key&auditContext=forDisplay",
+                apiHeaders, 12L) } catch (e: kotlinx.coroutines.CancellationException) { throw e }
                 catch (e: Exception) { log("gdrive: playback API error: ${e.message}"); return emptyList() }
             when (r.code) {
                 200 -> { body = r.text; driveApiKey = key; break }
@@ -3741,9 +3812,51 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
  * the stream host to the player directly. CloudStream allows cleartext traffic
  * (usesCleartextTraffic="true"), so http://127.0.0.1 is permitted.
  */
-internal class LocalHlsServer(private val log: (String) -> Unit) {
+internal class LocalHlsServer(
+    private val log: (String) -> Unit,
+    // v41: how the server talks to the stream's site (Chrome's network stack when available).
+    private val fetch: (String, Map<String, String>) -> NiceResponse? = { u, h ->
+        try { kotlinx.coroutines.runBlocking { app.get(u, headers = h, timeout = 10L) } } catch (_: Exception) { null } },
+) {
     private data class Entry(val url: String, val query: String, val headers: Map<String, String>, val created: Long,
-                             val cached: String? = null, val strip: Boolean = false, val token: TokenState? = null)
+                             val cached: String? = null, val strip: Boolean = false, val token: TokenState? = null,
+                             val beat: Heartbeat? = null)
+
+    /**
+     * v41: the page's "playing" signal. Sistenn's player calls /api/v1/player?t=… every 10 s
+     * while the video plays (the same t each time; the answer is a fresh k/kx) and stops while
+     * it is paused. Streams listed from the API now do the same: the signal runs while the app's
+     * player is fetching this stream (playlist or segments within the last 30 s), pauses when
+     * it stops, and ends after 5 idle minutes. A fresh k/kx also renews the stream token.
+     */
+    class Heartbeat(val url: String, val headers: Map<String, String>, val token: TokenState?) {
+        @Volatile var lastUse = 0L
+        @Volatile var running = false
+    }
+    private fun touch(b: Heartbeat) {
+        b.lastUse = System.currentTimeMillis()
+        synchronized(b) { if (b.running) return; b.running = true }
+        Thread({
+            var beats = 0
+            try {
+                while (true) {
+                    Thread.sleep(10_000)
+                    val idle = System.currentTimeMillis() - b.lastUse
+                    if (idle > 5 * 60_000L) break
+                    if (idle > 30_000L) continue
+                    val r = fetch(b.url, b.headers) ?: continue
+                    beats++
+                    val o = try { org.json.JSONObject(r.text) } catch (_: Exception) { null }
+                    val k = o?.optString("k").orEmpty(); val kx = o?.optLong("kx") ?: 0L
+                    val t = b.token
+                    if (t != null && r.code in 200..299 && k.isNotBlank() && kx > 0) { t.query = "k=$k&kx=$kx"; t.expiresAtMs = TokenState.expiry(t.query) }
+                    if (beats == 1) log("hls-proxy: playing signal sent (every 10 s while playing)")
+                }
+            } catch (_: InterruptedException) {
+            } catch (e: Exception) { log("hls-proxy: playing signal stopped: ${e.javaClass.simpleName}") }
+            finally { b.running = false }
+        }, "anizm-hls-beat").apply { isDaemon = true }.start()
+    }
 
     /** v35: a stream token shared by all qualities of one stream, renewed via the page's refresh URL. */
     class TokenState(initialQuery: String, val refreshUrl: String, val headers: Map<String, String>) {
@@ -3764,7 +3877,7 @@ internal class LocalHlsServer(private val log: (String) -> Unit) {
             if (t.expiresAtMs - System.currentTimeMillis() > 5 * 60_000L || now - t.lastTryMs < 30_000L) return
             t.lastTryMs = now
             try {
-                val r = kotlinx.coroutines.runBlocking { app.get(t.refreshUrl, headers = t.headers, timeout = 10L) }
+                val r = fetch(t.refreshUrl, t.headers) ?: throw java.io.IOException("no answer")
                 val o = org.json.JSONObject(r.text)
                 val k = o.optString("k"); val kx = o.optLong("kx")
                 if (r.code in 200..299 && k.isNotBlank() && kx > 0) {
@@ -3781,12 +3894,12 @@ internal class LocalHlsServer(private val log: (String) -> Unit) {
 
     /** Returns the local URL for this playlist, or null if the server could not start. */
     fun register(url: String, query: String, headers: Map<String, String>, cachedText: String? = null, stripSegments: Boolean = false,
-                 token: TokenState? = null): String? {
+                 token: TokenState? = null, beat: Heartbeat? = null): String? {
         val port = ensureStarted() ?: return null
         val now = System.currentTimeMillis()
         entries.entries.removeAll { now - it.value.created > entryTtlMs }
         val key = java.util.UUID.randomUUID().toString().replace("-", "").take(16)
-        entries[key] = Entry(url, query, headers, now, cachedText?.takeIf { it.trimStart().startsWith("#EXTM3U") }, stripSegments, token)
+        entries[key] = Entry(url, query, headers, now, cachedText?.takeIf { it.trimStart().startsWith("#EXTM3U") }, stripSegments, token, beat)
         return "http://127.0.0.1:$port/hls/$key.m3u8"
     }
 
@@ -3828,13 +3941,16 @@ internal class LocalHlsServer(private val log: (String) -> Unit) {
                     out.flush()
                 }
                 if (entry == null) { reply(404, "Not Found", ByteArray(0), "text/plain"); return }
+                entry.beat?.let { touch(it) }
                 if (isSeg) {
                     val segUrl = try { java.net.URLDecoder.decode(target.substringAfter("?u=", ""), "UTF-8") } catch (_: Exception) { "" }
                     if (!segUrl.startsWith("http")) { reply(400, "Bad Request", ByteArray(0), "text/plain"); return }
                     // v35: tokenised streams: send the player straight to the host with the current token.
-                    entry.token?.takeIf { !entry.strip }?.let { t ->
-                        ensureFresh(t)
-                        val loc = segUrl.substringBefore('?') + "?" + t.query
+                    // v41: streams with a playing signal come through here too (so it knows they are
+                    // playing) and are sent on unchanged.
+                    if (!entry.strip) {
+                        val t = entry.token
+                        val loc = if (t != null) { ensureFresh(t); segUrl.substringBefore('?') + "?" + t.query } else segUrl
                         out.write(("HTTP/1.1 302 Found\r\nLocation: $loc\r\nContent-Length: 0\r\nCache-Control: no-store\r\n" +
                             "Connection: close\r\n\r\n").toByteArray(Charsets.ISO_8859_1))
                         out.flush(); return
@@ -3940,12 +4056,12 @@ internal class LocalHlsServer(private val log: (String) -> Unit) {
         val line = raw.trimEnd('\r')
         when {
             line.isBlank() -> line
-            line.startsWith("#") && entry.token != null && !entry.strip -> uriAttrRe.replace(line) { m ->
+            line.startsWith("#") && (entry.token != null || entry.beat != null) && !entry.strip -> uriAttrRe.replace(line) { m ->
                 "URI=\"http://127.0.0.1:$port/seg/$key?u=" + java.net.URLEncoder.encode(tokenised(m.groupValues[1], entry), "UTF-8") + "\"" }
             line.startsWith("#") -> uriAttrRe.replace(line) { m -> "URI=\"${tokenised(m.groupValues[1], entry)}\"" }
             // v35: disguised segments come back through here to be cut down to the real media;
             // tokenised ones come back to be redirected with a fresh token.
-            entry.strip || entry.token != null -> "http://127.0.0.1:$port/seg/$key?u=" + java.net.URLEncoder.encode(tokenised(line, entry), "UTF-8")
+            entry.strip || entry.token != null || entry.beat != null -> "http://127.0.0.1:$port/seg/$key?u=" + java.net.URLEncoder.encode(tokenised(line, entry), "UTF-8")
             else -> tokenised(line, entry)
         }
     }
