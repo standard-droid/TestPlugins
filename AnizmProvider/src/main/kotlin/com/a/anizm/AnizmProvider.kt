@@ -17,6 +17,8 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.nicehttp.NiceResponse
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
@@ -335,6 +337,145 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         }
     }
 
+    // ── Chrome's network stack (v41) ─────────────────────────────────────────
+    // The UA and client hints say "Chrome on Android", but OkHttp's TLS handshake (cipher list,
+    // extensions, ALPN) and HTTP/2 settings are plainly not Chrome's: the mismatch Cloudflare's
+    // bot scoring (JA3/JA4, HTTP/2 fingerprint) exists to catch. CloudStream already ships
+    // Chrome's own network stack (Cronet from Google Play services; the device log shows
+    // "Cronet version: 151…", and ExoPlayer plays through it). Requests to the sites that can
+    // judge us (anizm, the players' APIs, Google Drive) now go through it. It is reached by
+    // reflection, so there is no build dependency on it; if it is missing or fails, the request
+    // goes out through OkHttp as before.
+    private val cronetEngine: Any? by lazy {
+        try {
+            val ctx = com.lagradost.cloudstream3.CloudStreamApp.context ?: return@lazy null
+            val bc = Class.forName("org.chromium.net.CronetEngine\$Builder")
+            val b = bc.getConstructor(android.content.Context::class.java).newInstance(ctx)
+            for (m in listOf("enableHttp2", "enableQuic", "enableBrotli"))
+                try { bc.getMethod(m, Boolean::class.javaPrimitiveType).invoke(b, true) } catch (_: Throwable) {}
+            try { bc.getMethod("setUserAgent", String::class.java).invoke(b, ua) } catch (_: Throwable) {}
+            val engine = bc.getMethod("build").invoke(b)
+            val ver = try { engine?.javaClass?.getMethod("getVersionString")?.invoke(engine) } catch (_: Throwable) { null }
+            log("net: Chrome network stack ready (${ver ?: "?"})")
+            engine
+        } catch (t: Throwable) { log("net: Chrome network stack unavailable (${t.javaClass.simpleName}: ${t.message?.take(80)}) — using OkHttp"); null }
+    }
+    private val cronetOpen: java.lang.reflect.Method? by lazy {
+        try { Class.forName("org.chromium.net.CronetEngine").getMethod("openConnection", java.net.URL::class.java) } catch (_: Throwable) { null }
+    }
+    // Five failures in a row (not timeouts) and the Chrome stack is left alone for this session.
+    @Volatile private var cronetFailures = 0
+
+    // Chrome's header order on the wire: one for navigations, one for fetch/XHR.
+    private val chromeNavOrder = listOf("sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "upgrade-insecure-requests", "user-agent",
+        "accept", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-user", "sec-fetch-dest", "referer", "accept-language", "cookie", "range")
+    private val chromeXhrOrder = listOf("sec-ch-ua-platform", "x-requested-with", "user-agent", "accept", "sec-ch-ua", "content-type",
+        "sec-ch-ua-mobile", "origin", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "referer", "accept-language", "cookie", "range")
+    private fun chromeOrdered(h: Map<String, String>): List<Pair<String, String>> {
+        val nav = h.entries.any { it.key.equals("Sec-Fetch-Mode", true) && it.value == "navigate" }
+        val order = if (nav) chromeNavOrder else chromeXhrOrder
+        return h.entries.map { it.key to it.value }.sortedBy { (k, _) -> order.indexOf(k.lowercase()).let { i -> if (i < 0) order.size else i } }
+    }
+
+    /**
+     * One request through Chrome's network stack. Null when the stack is unavailable or the
+     * request failed for a reason other than a timeout (the caller then uses OkHttp); a timeout
+     * throws SocketTimeoutException, as OkHttp would. Redirects are followed here, hop by hop,
+     * so the final URL is known. The body is read up to maxBytes.
+     */
+    private suspend fun chromeFetch(url: String, headers: Map<String, String>, timeoutSec: Long, allowRedirects: Boolean = true,
+                                    formBody: Map<String, String>? = null, maxBytes: Int = 6_000_000): NiceResponse? {
+        if (cronetFailures >= 5) return null
+        val engine = cronetEngine ?: return null
+        val open = cronetOpen ?: return null
+        val deadline = System.currentTimeMillis() + timeoutSec.coerceAtLeast(1L) * 1000
+        var current = url
+        var method = if (formBody != null) "POST" else "GET"
+        var body = formBody?.entries?.joinToString("&") { "${java.net.URLEncoder.encode(it.key, "UTF-8")}=${java.net.URLEncoder.encode(it.value, "UTF-8")}" }?.toByteArray()
+        for (hop in 0..5) {
+            val left = deadline - System.currentTimeMillis()
+            if (left <= 0) throw java.net.SocketTimeoutException("timeout")
+            val conn = try { open.invoke(engine, java.net.URL(current)) as java.net.HttpURLConnection }
+                catch (t: Throwable) { cronetFailures++; log("net: Chrome stack could not open ${current.substringBefore('?').takeLast(60)} (${t.javaClass.simpleName})"); return null }
+            var timedOut = false
+            val result: Pair<Int, ByteArray>? = coroutineScope {
+                val watchdog = launch { delay(left); timedOut = true; try { conn.disconnect() } catch (_: Throwable) {} }
+                try {
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        conn.requestMethod = method
+                        conn.instanceFollowRedirects = false
+                        conn.connectTimeout = left.toInt(); conn.readTimeout = left.toInt()
+                        for ((k, v) in chromeOrdered(headers))
+                            if (!k.equals("Accept-Encoding", true) && !k.equals("Content-Length", true)) conn.setRequestProperty(k, v)
+                        body?.let { b ->
+                            if (headers.keys.none { it.equals("Content-Type", true) }) conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+                            conn.doOutput = true; conn.setFixedLengthStreamingMode(b.size); conn.outputStream.use { it.write(b) }
+                        }
+                        val code = conn.responseCode
+                        val bytes = (if (code >= 400) conn.errorStream else conn.inputStream)?.use { readUpTo(it, maxBytes) } ?: ByteArray(0)
+                        code to bytes
+                    }
+                } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (e: Exception) {
+                    if (timedOut) throw java.net.SocketTimeoutException("timeout")
+                    cronetFailures++
+                    log("net: Chrome stack failed on ${current.substringBefore('?').takeLast(60)} (${e.javaClass.simpleName}: ${e.message?.take(60)}) — using OkHttp")
+                    null
+                } finally { watchdog.cancel() }
+            }
+            if (result == null) { try { conn.disconnect() } catch (_: Throwable) {}; return null }
+            val code = result.first
+            val loc = conn.getHeaderField("Location")
+            if (allowRedirects && code in 300..399 && !loc.isNullOrBlank()) {
+                try { conn.disconnect() } catch (_: Throwable) {}
+                current = try { java.net.URI(current).resolve(loc.trim()).toString() } catch (_: Exception) { return null }
+                if (code == 303 || ((code == 301 || code == 302) && method == "POST")) { method = "GET"; body = null }
+                continue
+            }
+            cronetFailures = 0
+            val hb = okhttp3.Headers.Builder()
+            conn.headerFields?.forEach { (k, vs) ->
+                if (k != null && !k.equals("content-encoding", true) && !k.equals("content-length", true))
+                    vs?.forEach { v -> if (v != null) try { hb.addUnsafeNonAscii(k, v) } catch (_: Exception) {} }
+            }
+            val ctype = conn.contentType
+            try { conn.disconnect() } catch (_: Throwable) {}
+            val resp = okhttp3.Response.Builder()
+                .request(okhttp3.Request.Builder().url(current).build())
+                .protocol(okhttp3.Protocol.HTTP_2).code(code).message("")
+                .headers(hb.build())
+                .body(result.second.toResponseBody(ctype?.toMediaTypeOrNull()))
+                .build()
+            return NiceResponse(resp, null)
+        }
+        return null // too many redirects: OkHttp reports it
+    }
+    private fun readUpTo(input: java.io.InputStream, max: Int): ByteArray {
+        val out = java.io.ByteArrayOutputStream(); val buf = ByteArray(16_384)
+        while (out.size() < max) { val n = input.read(buf, 0, minOf(buf.size, max - out.size())); if (n < 0) break; out.write(buf, 0, n) }
+        return out.toByteArray()
+    }
+    /** Chrome's network stack, or OkHttp when it is unavailable. */
+    private suspend fun browserGet(url: String, headers: Map<String, String>, timeoutSec: Long, allowRedirects: Boolean = true): NiceResponse =
+        chromeFetch(url, headers, timeoutSec, allowRedirects) ?: app.get(url, headers = headers, timeout = timeoutSec, allowRedirects = allowRedirects)
+    private fun withQuery(url: String, params: Map<String, String>): String = if (params.isEmpty()) url else
+        url + (if ('?' in url) "&" else "?") + params.entries.joinToString("&") { "${java.net.URLEncoder.encode(it.key, "UTF-8")}=${java.net.URLEncoder.encode(it.value, "UTF-8")}" }
+
+    // v41: one browser session. anizm requests carry the cookies the site set (and those the
+    // in-app WebView picked up, Cloudflare's included) and keep the ones it sets, in the WebView's
+    // own cookie store. Before, every request arrived with no cookies, so each one started a
+    // fresh server session, which is not what a browser does.
+    private fun withSiteCookies(url: String, headers: Map<String, String>): Map<String, String> {
+        if (headers.keys.any { it.equals("Cookie", true) }) return headers
+        val c = try { CookieManager.getInstance().getCookie(url) } catch (_: Throwable) { null }
+        return if (c.isNullOrBlank()) headers else headers + ("Cookie" to c)
+    }
+    private fun keepSiteCookies(r: NiceResponse) {
+        val set = try { r.headers.values("Set-Cookie") } catch (_: Exception) { emptyList() }
+        if (set.isEmpty()) return
+        try { val cm = CookieManager.getInstance(); val u = r.url; for (c in set) cm.setCookie(u, c) } catch (_: Throwable) {}
+    }
+
     // 4.0: every anizm.net request goes through here. Replaces getSession() + the
     // 403/419 "refresh session and retry" loop, which had a real bug: the refresh ran the
     // homepage through CloudflareKiller, but the retry itself did NOT use the interceptor,
@@ -351,16 +492,20 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     ): NiceResponse {
         val sticky = System.currentTimeMillis() < cfUntil
         val target = onCurrentHost(url)
-        val first = app.get(target, headers = headers, params = params, timeout = timeout,
-            allowRedirects = allowRedirects, interceptor = if (sticky) cfKiller else null)
+        val h = withSiteCookies(target, headers)
+        // v41: Chrome's network stack first; OkHttp (with CloudflareKiller while a solve is fresh) otherwise.
+        val first = (if (sticky) null else chromeFetch(withQuery(target, params), h, timeout, allowRedirects))
+            ?: app.get(target, headers = h, params = params, timeout = timeout,
+                allowRedirects = allowRedirects, interceptor = if (sticky) cfKiller else null)
+        keepSiteCookies(first)
         if (sticky || !looksCfBlocked(first)) return first.also { if (allowRedirects) noteFinalHost(target, it) }
         log("cf: challenge on ${target.substringBefore('?')} (${first.code}), retrying via CloudflareKiller")
         // v5: hard cap. CloudflareKiller's own WebView wait is 60s, which alone can eat half
         // of CloudStream's 120s loadLinks budget.
         val solved = withTimeoutOrNull(cfSolveBudgetMs) {
-            app.get(target, headers = headers, params = params, timeout = timeout,
+            app.get(target, headers = h, params = params, timeout = timeout,
                 allowRedirects = allowRedirects, interceptor = cfKiller)
-        }
+        }?.also { keepSiteCookies(it) }
         if (solved == null || looksCfBlocked(solved)) { log("cf: solve failed/timed out for ${target.substringBefore('?')}"); return solved ?: first }
         cfUntil = System.currentTimeMillis() + cfStickyMs // only sticky once a solve actually worked
         return solved
@@ -409,14 +554,22 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         "sec-ch-ua" to chromeBrandList,
         "sec-ch-ua-mobile" to "?1",
         "sec-ch-ua-platform" to "\"Android\"")
+    // v41: Chrome's own Accept for a document. The old value (…*/*;q=0.8 with nothing else) is
+    // Firefox's, which contradicts a Chrome UA.
+    private val chromeDocAccept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
     private val navHints get() = clientHints + mapOf(
         "Sec-Fetch-Dest" to "iframe", "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-Site" to "same-origin",
         "Upgrade-Insecure-Requests" to "1",
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        "Accept" to chromeDocAccept)
 
     private val baseHeaders get() = clientHints + mapOf(
         "User-Agent" to ua,
         "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7", "Referer" to "$mainUrl/")
+    // v41: page loads (home, anime and episode pages) as Chrome sends them after a click. They
+    // used to go out with no Accept and no Sec-Fetch-* at all, beside a Chrome UA and client hints.
+    private val pageHeaders get() = baseHeaders + mapOf(
+        "Upgrade-Insecure-Requests" to "1", "Accept" to chromeDocAccept,
+        "Sec-Fetch-Site" to "same-origin", "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-User" to "?1", "Sec-Fetch-Dest" to "document")
     private val xhrHeaders get() = clientHints + mapOf(
         "Sec-Fetch-Dest" to "empty", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Site" to "same-origin",
         "User-Agent" to ua,
@@ -545,15 +698,14 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         lastProbeTarget = nid to episodeUrl
         // Plain request, deliberately not siteGet(): CloudflareKiller can't help here (see
         // looksCfBlocked), and a block should switch strategy, not be retried.
-        var r = app.get(playerUrl, headers = headers, timeout = 8L, allowRedirects = false)
+        var r = browserGet(playerUrl, headers, 8L, allowRedirects = false).also { keepSiteCookies(it) }
         if (r.code == 403 && r.headers["cf-mitigated"]?.contains("challenge", true) == true) {
             // One retry with the hint values the self-test proved work, before giving up on
             // the fast path for 15 minutes.
             try { r.okhttpResponse.close() } catch (_: Exception) {}
             // Retry once without cookies: a stale __cf_bm from the WebView can itself be the
             // thing being challenged, and the self-test's cookieless variant passed.
-            r = app.get(playerUrl, headers = baseHeaders + navHints + mapOf("Referer" to onCurrentHost(episodeUrl)),
-                timeout = 8L, allowRedirects = false)
+            r = browserGet(playerUrl, baseHeaders + navHints + mapOf("Referer" to onCurrentHost(episodeUrl)), 8L, allowRedirects = false)
             if (r.code in 300..399) log("resolve: retry without cookies worked for $nid")
         }
         if (r.code == 403 || r.code == 429 || r.code == 503) {
@@ -894,7 +1046,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             if (System.currentTimeMillis() - time < mainPageCacheTtlMs) return cached
         }
         val url = if (request.data == "anime-izle") "$mainUrl/anime-izle?sayfa=$page" else "$mainUrl?sayfa=$page"
-        val doc = siteDocument(url, baseHeaders, timeout = 12L)
+        val doc = siteDocument(url, pageHeaders, timeout = 12L)
             ?: return newHomePageResponse(request.name, emptyList(), hasNext = false)
         fun toAbs(src: String): String? {
             if (src.isBlank() || src.startsWith("data:")) return null
@@ -950,7 +1102,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val doc = siteDocument(url, baseHeaders, timeout = 12L)
+        val doc = siteDocument(url, pageHeaders, timeout = 12L)
             ?: return newAnimeLoadResponse(name = url.substringAfterLast('/'), url = url, type = TvType.Anime) { addEpisodes(DubStatus.Subbed, emptyList()) }
 
         val title = doc.selectFirst("h2.anizm_pageTitle, h2.page-title, h1, .anime-title")?.text()?.trim()
@@ -1091,7 +1243,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             if (System.currentTimeMillis() - t < sourceListTtlMs) { log("loadLinks: source list cache hit (${list.size})"); return list }
         }
         val epHtml = try {
-            siteText(data, baseHeaders) ?: run { log("loadLinks: page error"); return null }
+            siteText(data, pageHeaders) ?: run { log("loadLinks: page error"); return null }
         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
         catch (e: Exception) { log("loadLinks: page error: ${e.message}"); return null }
         log("loadLinks: page len=${epHtml.length}")
