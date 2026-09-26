@@ -2185,6 +2185,19 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
 
             // v16: CloudStream had no extractor for this host (or it produced nothing).
             // Load the player page in a hidden WebView and take the playlist it requests.
+            // v37: Sistenn-family pages (sistenn.uns.bio, rpmvid, strp2p: https://host/#id) are asked
+            // directly through their own API before any WebView is loaded — one to three small
+            // requests instead of a full page with ads, taps and a 10-25 s wait.
+            if (!found) {
+                val direct = try { trySistennApi(exUrl, cleanDisplayName(label), callback) }
+                    catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                    catch (e: Exception) { log("sistenn-api: error ${e.javaClass.simpleName}: ${e.message?.take(100)}"); SistennResult.UNAVAILABLE }
+                when (direct) {
+                    SistennResult.EMITTED -> return true
+                    SistennResult.CAPACITY -> return false // the page would hit the same wall
+                    SistennResult.UNAVAILABLE -> {}
+                }
+            }
             if (!found && settings.browserSniff) {
                 val cached = sniffCache[exUrl]?.takeIf { System.currentTimeMillis() - it.second < sniffCacheTtlMs }?.first
                 if (cached != null) log("step4: reusing sniffed playlist for $label")
@@ -2543,6 +2556,166 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         if (ct.startsWith("text/") || ct.contains("json") || ct.contains("html") || ct.contains("xml")) return false
         // No usable type: binary content (control bytes in the first 64 chars) counts as media.
         return text.take(64).count { it.code < 9 || (it.code in 14..31) || it == '\uFFFD' } > 4
+    }
+
+    // ── Sistenn API, no WebView (v37) ────────────────────────────────────────
+    // Worked out from the player's own bundle (index-DqFBtoPY.js, 2026-09-26) and checked against
+    // captured responses: /api/v1/info and /api/v1/video answer hex text that is AES-128-CBC with
+    // a fixed key and IV the script assembles at runtime ("kiemtienmua911ca" / "1234567890oiuytr";
+    // both depend only on location.protocol and the '#' of the hash). /api/v1/player?t= takes the
+    // same encryption of a small JSON {website, playing, sessionId, userId, playerId, videoId,
+    // country, platform, browser, os} and answers {k, kx}. The video answer lists the stream as
+    // cfNative (a Sistenn-served playlist carrying its own ~3.5 h token — made for players that
+    // cannot add tokens, i.e. exactly this one), cf / source (the /v4/ hosts, k&kx appended from
+    // "pk"), hlsVideoTiktok / hlsVideoGoogle (image-disguised segments), ordered and adjusted by
+    // streamingConfig. When the site is full it answers no sources plus delivery.capacityToken.
+    enum class SistennResult { EMITTED, CAPACITY, UNAVAILABLE }
+    private data class SistennSource(val kind: String, val url: String, val strip: Boolean)
+    private val sistennKey = "kiemtienmua911ca".toByteArray(Charsets.UTF_8)
+    private val sistennIv = "1234567890oiuytr".toByteArray(Charsets.UTF_8)
+    private val sistennPageRe = Regex("""^https://([^/#?]+)/?#([A-Za-z0-9]{4,16})$""")
+    private val sistennApiOffUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val sistennSessionId = java.util.UUID.randomUUID().toString()
+
+    private fun sistennCipher(mode: Int) = javax.crypto.Cipher.getInstance("AES/CBC/PKCS5Padding").apply {
+        init(mode, javax.crypto.spec.SecretKeySpec(sistennKey, "AES"), javax.crypto.spec.IvParameterSpec(sistennIv))
+    }
+    private fun sistennDecrypt(hex: String): String? = try {
+        val h = hex.trim()
+        if (h.length < 32 || h.length % 2 != 0 || !h.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }) null
+        else String(sistennCipher(javax.crypto.Cipher.DECRYPT_MODE).doFinal(ByteArray(h.length / 2) { h.substring(it * 2, it * 2 + 2).toInt(16).toByte() }), Charsets.UTF_8)
+    } catch (_: Exception) { null }
+    private fun sistennEncrypt(plain: String): String =
+        sistennCipher(javax.crypto.Cipher.ENCRYPT_MODE).doFinal(plain.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+
+    /** Set (replace) query parameters on a URL. */
+    private fun withParams(url: String, params: Map<String, String>): String {
+        if (params.isEmpty()) return url
+        val base = url.substringBefore('?'); val frag = url.substringAfter('#', "")
+        val q = LinkedHashMap<String, String>()
+        url.substringAfter('?', "").substringBefore('#').split('&').filter { it.isNotEmpty() }.forEach { q[it.substringBefore('=')] = it.substringAfter('=', "") }
+        params.forEach { (k, v) -> q[k] = java.net.URLEncoder.encode(v, "UTF-8") }
+        return base + "?" + q.entries.joinToString("&") { "${it.key}=${it.value}" } + (if (frag.isNotEmpty()) "#$frag" else "")
+    }
+
+    /** The stream candidates, best first: cfNative, then the site's own order (streamingConfig). */
+    private fun sistennSources(o: JSONObject, origin: String): List<SistennSource> {
+        fun abs(u: String): String? = u.trim().takeIf { it.isNotEmpty() }?.let {
+            if (it.startsWith("//")) "https:$it" else try { java.net.URI("$origin/").resolve(it).toString() } catch (_: Exception) { null }
+        }
+        val cfg = try { JSONObject(o.optString("streamingConfig", "")) } catch (_: Exception) { null }
+        val order = cfg?.optJSONArray("order")?.let { a -> (0 until a.length()).map { a.optString(it) } }
+            ?: listOf("Tiktok", "Google", "Cloudflare", "In-House")
+        val adjust = cfg?.optJSONObject("adjust")
+        val raw = mapOf("Cloudflare" to o.optString("cf"), "Tiktok" to o.optString("hlsVideoTiktok"),
+            "Google" to o.optString("hlsVideoGoogle"), "In-House" to o.optString("source"))
+        val out = ArrayList<SistennSource>()
+        abs(o.optString("cfNative"))?.let { out += SistennSource("cfNative", it, false) }
+        for (kind in order) {
+            var url = abs(raw[kind] ?: "") ?: continue
+            val adj = adjust?.optJSONObject(kind)
+            if (adj?.optBoolean("disabled") == true) continue
+            adj?.optJSONObject("params")?.let { p -> url = withParams(url, p.keys().asSequence().associateWith { p.optString(it) }) }
+            val dom = adj?.optString("domain").orEmpty()
+            if (dom.isNotEmpty() && url.contains("/hls/")) url = url.replaceFirst("/hls/", "/hlsmod/$dom/")
+            out += SistennSource(kind, url, kind == "Tiktok" || kind == "Google" || url.contains("/hlsmod/"))
+        }
+        return out
+    }
+
+    suspend fun trySistennApi(exUrl: String, label: String, callback: (ExtractorLink) -> Unit): SistennResult {
+        val m = sistennPageRe.find(exUrl) ?: return SistennResult.UNAVAILABLE
+        val host = m.groupValues[1]; val id = m.groupValues[2]
+        val now = System.currentTimeMillis()
+        if ((sistennApiOffUntil[host] ?: 0L) > now) return SistennResult.UNAVAILABLE
+        val origin = "https://$host"
+        val apiHeaders = clientHints + mapOf("User-Agent" to ua, "Referer" to "$origin/", "Accept" to "*/*",
+            "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Sec-Fetch-Site" to "same-origin", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Dest" to "empty")
+        fun off(why: String) { sistennApiOffUntil[host] = System.currentTimeMillis() + 60 * 60_000L; log("sistenn-api: $host not usable ($why) — WebView for 1 h") }
+        // The page asks /info first; so do we (it also says early if the id is gone).
+        try { app.get("$origin/api/v1/info?id=$id", headers = apiHeaders, timeout = 8L).let { r -> try { r.okhttpResponse.close() } catch (_: Exception) {} } }
+        catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) {}
+        var capacity: Pair<String, String>? = null
+        var video: JSONObject? = null
+        var sources: List<SistennSource> = emptyList()
+        for (attempt in 0 until 3) {
+            val capQ = capacity?.let { "&capacityToken=${java.net.URLEncoder.encode(it.first, "UTF-8")}&capacityTokenExpire=${java.net.URLEncoder.encode(it.second, "UTF-8")}" }.orEmpty()
+            val r = app.get("$origin/api/v1/video?id=$id&w=1920&h=1080&r=$mainHost$capQ", headers = apiHeaders, timeout = 10L)
+            val body = r.text
+            if (r.code !in 200..299) {
+                val plainErr = sistennDecrypt(body) ?: body
+                log("sistenn-api: video http ${r.code}: ${plainErr.replace(Regex("\\s+"), " ").take(160)}")
+                if (r.code in 500..599) off("http ${r.code}")
+                return SistennResult.UNAVAILABLE
+            }
+            val plain = sistennDecrypt(body) ?: run { off("answer not decryptable: ${body.take(40)}"); return SistennResult.UNAVAILABLE }
+            val o = try { JSONObject(plain) } catch (_: Exception) { off("answer not JSON"); return SistennResult.UNAVAILABLE }
+            sources = sistennSources(o, origin)
+            if (sources.isNotEmpty()) { video = o; break }
+            val d = o.optJSONObject("delivery") ?: JSONObject()
+            val saturated = d.optString("inHouse") == "saturated"
+            val capToken = d.optString("capacityToken")
+            if (saturated && capToken.isNotEmpty() && attempt < 2) {
+                val wait = (d.optInt("retryAfter", 3).coerceIn(2, 6) * (1 shl attempt)).coerceAtMost(8)
+                log("sistenn-api: $host is at capacity — retrying in ${wait}s (${attempt + 1}/2)")
+                capacity = capToken to d.optString("capacityTokenExpire")
+                delay(wait * 1000L)
+                continue
+            }
+            log("sistenn-api: $id has no stream${if (saturated) " — streaming capacity is full" else ""} (keys ${o.keys().asSequence().take(12).joinToString(",")})")
+            return if (saturated) SistennResult.CAPACITY else SistennResult.UNAVAILABLE
+        }
+        val v = video ?: return SistennResult.UNAVAILABLE
+        val pk = v.optJSONObject("pk")
+        val pkQuery = pk?.optString("k")?.takeIf { it.isNotEmpty() }?.let { "k=$it&kx=${pk.optLong("kx")}" }.orEmpty()
+        // Our own refresh call, the way the page builds it.
+        val metric = v.optJSONObject("metric")
+        val refreshUrl = if (pkQuery.isEmpty()) null else try {
+            "$origin/api/v1/player?t=" + sistennEncrypt(JSONObject().apply {
+                put("website", mainHost); put("playing", true); put("sessionId", sistennSessionId)
+                for (k in listOf("userId", "playerId", "videoId", "country", "platform", "browser", "os")) put(k, metric?.optString(k) ?: "")
+            }.toString())
+        } catch (_: Exception) { null }
+        log("sistenn-api: ${v.optString("title").take(60)} — sources ${sources.joinToString { it.kind }}")
+        val streamHeaders = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin, "Accept" to "*/*")
+        for (src in sources) {
+            // /v4/ hosts want the token on every request (the page's own rule); cfNative carries its own.
+            val needsPk = src.url.contains("/v4/") && !Regex("""[?&]k=""").containsMatchIn(src.url) && pkQuery.isNotEmpty()
+            val masterUrl = if (needsPk) src.url + (if (src.url.contains('?')) "&" else "?") + pkQuery else src.url
+            val tokenQuery = Regex("""(?:^|&)(k=[^&]+&kx=\d+)""").find(masterUrl.substringAfter('?', ""))?.groupValues?.get(1).orEmpty()
+            val master = try { app.get(masterUrl, headers = streamHeaders, timeout = 6L).takeIf { it.code in 200..299 }?.text }
+                catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { null }
+            if (master == null || !master.trimStart().startsWith("#EXTM3U")) { log("sistenn-api: ${src.kind} master not readable, next"); continue }
+            val variants = parseVariants(master, masterUrl).map { vv ->
+                if (tokenQuery.isNotEmpty() && !vv.url.contains('?')) vv.copy(url = vv.url + "?" + tokenQuery) else vv
+            }.ifEmpty { listOf(Variant(Qualities.Unknown.value, null, masterUrl)) } // a media playlist itself
+            // Only qualities whose playlist actually loads (the /v4/ hosts stall some 1080p variants).
+            val loaded = coroutineScope {
+                variants.map { vv -> async {
+                    val t = if (vv.url == masterUrl) master else try {
+                        withTimeoutOrNull(5_000L) { app.get(vv.url, headers = streamHeaders, timeout = 5L).takeIf { it.code in 200..299 }?.text }
+                    } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { null }
+                    t?.takeIf { it.trimStart().startsWith("#EXTM3U") }?.let { vv to it }
+                } }.mapNotNull { it.await() }
+            }
+            if (loaded.isEmpty()) { log("sistenn-api: ${src.kind} variants not readable, next"); continue }
+            val tokenState = if (tokenQuery.isNotEmpty() && tokenQuery.startsWith("k=${pk?.optString("k")}&") && refreshUrl != null)
+                LocalHlsServer.TokenState(tokenQuery, refreshUrl, apiHeaders) else null
+            var emitted = 0
+            for ((vv, text) in loaded.sortedByDescending { it.first.height }) {
+                val local = localHls.register(vv.url, tokenQuery, streamHeaders, text, stripSegments = src.strip, token = tokenState) ?: continue
+                callback(newExtractorLink(source = label, name = if (vv.height > 0) "$label ${vv.height}p" else label, url = local, type = ExtractorLinkType.M3U8) {
+                    quality = vv.height; referer = "$origin/"; headers = streamHeaders })
+                emitted++
+            }
+            if (emitted > 0) {
+                log("sistenn-api: ${src.kind} → ${loaded.joinToString { "${it.first.height}p" }}${if (variants.size > loaded.size) " (${variants.size - loaded.size} variant(s) did not load)" else ""}, no WebView needed")
+                return SistennResult.EMITTED
+            }
+        }
+        log("sistenn-api: no source of $id was readable from here — falling back to the WebView")
+        return SistennResult.UNAVAILABLE
     }
 
     // ── HLS helpers (4.0) ────────────────────────────────────────────────────
