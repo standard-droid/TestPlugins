@@ -2826,7 +2826,99 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         val variants = parseVariants(body, masterUrl)
         if (variants.isEmpty()) { log("beta: no parseable variants in master.txt"); return false }
         log("beta: master lists ${variants.joinToString { "${it.height}p ${it.url.substringAfterLast('/').substringBefore('?').take(40)}${if (it.url.contains('?')) "?…" else ""}" }}")
-        return emitVariants(variants, cleanDisplayName(label), watchRef, betaHeaders, callback, "beta", "bp:$hash")
+        return emitVariants(markBetaJoins(variants, betaHeaders), cleanDisplayName(label), watchRef, betaHeaders, callback, "beta", "bp:$hash")
+    }
+
+    // v45: some Beta Player uploads are separately encoded parts joined into one playlist with no
+    // #EXT-X-DISCONTINUITY between them (2026-10-06, faa18cda… 1080p: three ~473.39 s parts; at
+    // segment 237 the video PTS drops from 474.83 s back to 1.48 s). ExoPlayer then waits for ever
+    // at 7:53. Each part ends on a short segment, so the segment after each short one is checked:
+    // when its first PTS is far below where the playlist places it, the tag goes in before it and
+    // the playlist is served from the local server. Anything unclear leaves the variant as it was.
+    private suspend fun markBetaJoins(variants: List<Variant>, headers: Map<String, String>): List<Variant> = coroutineScope {
+        variants.map { v -> async {
+            val fixed = try { markJoins(v.url, headers) }
+                catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (e: Exception) { log("beta: join check for ${v.height}p failed: ${e.message}"); null }
+            val local = fixed?.let { localHls.register(v.url, "", headers, it) }
+            if (local != null) v.copy(url = local) else v
+        } }.map { it.await() }
+    }
+
+    /** The playlist with #EXT-X-DISCONTINUITY added where the timestamps restart, or null if none do. */
+    private suspend fun markJoins(playlistUrl: String, headers: Map<String, String>): String? {
+        val text = app.get(playlistUrl, headers = headers, timeout = 10L).text
+        if (!text.trimStart().startsWith("#EXTM3U") || text.contains("#EXT-X-DISCONTINUITY")) return null
+        val lines = text.lines()
+        class Seg(val dur: Double, val start: Double, val line: Int, val url: String)
+        val segs = ArrayList<Seg>()
+        var dur: Double? = null
+        var t = 0.0
+        lines.forEachIndexed { i, raw ->
+            val l = raw.trim()
+            when {
+                l.startsWith("#EXTINF:") -> dur = extinfRe.find(l)?.groupValues?.get(1)?.toDoubleOrNull()
+                l.isEmpty() || l.startsWith("#") -> {}
+                else -> {
+                    val d = dur ?: return@forEachIndexed
+                    val u = try { java.net.URI(playlistUrl).resolve(l).toString() } catch (_: Exception) { l }
+                    segs += Seg(d, t, i, u); t += d; dur = null
+                }
+            }
+        }
+        if (segs.size < 3) return null
+        val typical = segs.map { it.dur }.sorted()[segs.size / 2]
+        val candidates = (1 until segs.size).filter { segs[it - 1].dur < typical * 0.9 }.take(8)
+        if (candidates.isEmpty()) return null
+        val base = firstPtsOf(segs[0].url, headers) ?: return null
+        val wrap = (1L shl 33) / 90_000.0
+        val joins = candidates.filter { k ->
+            val p = firstPtsOf(segs[k].url, headers) ?: return@filter false
+            val behind = ((base + segs[k].start - p) % wrap + wrap) % wrap // how far p is below where it should be
+            behind > 5.0 && behind < wrap / 2
+        }
+        if (joins.isEmpty()) return null
+        log("beta: timestamps restart at ${joins.joinToString { "segment $it (%.1f s)".format(segs[it].start) }}, marking them as discontinuities")
+        val after = joins.map { segs[it - 1].line }.toSet()
+        return buildString {
+            lines.forEachIndexed { i, l -> append(l).append('\n'); if (i in after) append("#EXT-X-DISCONTINUITY\n") }
+        }
+    }
+
+    private suspend fun firstPtsOf(url: String, headers: Map<String, String>): Double? {
+        val r = app.get(url, headers = headers + mapOf("Range" to "bytes=0-16383"), timeout = 8L)
+        if (r.code !in 200..299) { r.closeQuietly(); return null }
+        val head = try {
+            r.okhttpResponse.body?.byteStream()?.use { s ->
+                val b = ByteArray(16_384); var n = 0
+                while (n < b.size) { val k = s.read(b, n, b.size - n); if (k < 0) break; n += k }
+                b.copyOf(n)
+            }
+        } catch (_: Exception) { null } ?: return null
+        return firstTsPts(head)
+    }
+
+    /** First PES timestamp (PTS, in seconds) in the head of an MPEG-TS file; null if there is none. */
+    private fun firstTsPts(b: ByteArray): Double? {
+        var i = (0 until minOf(b.size, 4_096)).firstOrNull { b[it] == 0x47.toByte() && (it + 188 >= b.size || b[it + 188] == 0x47.toByte()) }
+            ?: return null
+        while (i + 188 <= b.size) {
+            if (b[i] != 0x47.toByte()) return null
+            val unitStart = (b[i + 1].toInt() and 0x40) != 0
+            val afc = (b[i + 3].toInt() shr 4) and 3
+            var p = i + 4
+            if (afc == 2 || afc == 3) p += 1 + (b[i + 4].toInt() and 0xff)
+            if (unitStart && (afc == 1 || afc == 3) && p + 14 <= i + 188 &&
+                b[p] == 0.toByte() && b[p + 1] == 0.toByte() && b[p + 2] == 1.toByte() &&
+                (b[p + 3].toInt() and 0xff) in 0xC0..0xEF && (b[p + 7].toInt() and 0x80) != 0) {
+                val q = p + 9
+                val pts = ((b[q].toLong() and 0x0E) shl 29) or ((b[q + 1].toLong() and 0xFF) shl 22) or
+                    ((b[q + 2].toLong() and 0xFE) shl 14) or ((b[q + 3].toLong() and 0xFF) shl 7) or ((b[q + 4].toLong() and 0xFE) shr 1)
+                return pts / 90_000.0
+            }
+            i += 188
+        }
+        return null
     }
 
     /** v32: a 2xx answer that is actually media (by type, or binary content), not an error text. */
