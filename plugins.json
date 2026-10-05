@@ -2,14 +2,14 @@
     {
         "url": "https://raw.githubusercontent.com/standard-droid/TestPlugins/builds/AnizmProvider.cs3",
         "status": 1,
-        "version": 34,
+        "version": 35,
         "name": "AnizmProvider",
         "internalName": "AnizmProvider",
         "authors": [
             " "
         ],
         "description": "Anizm (anizm.net) - T\u00fcrk\u00e7e altyaz\u0131l\u0131 anime",
-        "fileSize": 268229,
+        "fileSize": 275227,
         "repositoryUrl": "https://github.com/standard-droid/TestPlugins",
         "language": "tr",
         "tvTypes": [
@@ -19,7 +19,7 @@
         ],
         "iconUrl": "https://anizm.net/favicon.ico",
         "apiVersion": 1,
-        "fileHash": "sha256-b80af3af7ee27ca46bdaf4e656ab1f4cab91402ad214026f67eb003d3f0f998b"
+        "fileHash": "sha256-0d177354c46ea1155dfecf08741f39bfca1e80855fba3b0bf693cc7b54fe36e4"
     },
     {
         "url": "https://raw.githubusercontent.com/standard-droid/TestPlugins/builds/ReZeroIzleProvider.cs3",
