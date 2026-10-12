@@ -49,6 +49,69 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     init { instance = this }
 
     /** Called from the settings screen. Returns the report lines (also written to logcat). */
+    // v37: "Site check" in the settings. Runs every step on one known anime and reports what
+    // each one found, so a site change can be pinned to a step from the phone (where Cloudflare
+    // lets requests through) without a browser session. Read-only: the same requests as browsing.
+    suspend fun runSiteCheck(slug: String = "sousou-no-frieren", query: String = "frieren"): List<String> {
+        val out = mutableListOf("Site: $mainUrl · v37 · ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US).format(java.util.Date())}")
+        // ok = true ✓, false ✗, null ⚠ (worked around by a fallback)
+        suspend fun step(what: String, block: suspend () -> Pair<Boolean?, String>) {
+            val (ok, detail) = try { block() }
+                catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (e: Exception) { false to "${e.javaClass.simpleName}: ${e.message}" }
+            out += (when (ok) { true -> "✓ "; false -> "✗ "; null -> "⚠ " }) + "$what: $detail"
+        }
+        step("Home rows") {
+            val doc = siteDocument("$mainUrl/", pageHeaders) ?: return@step false to "page didn't load"
+            val rows = listOf("son-bolumler", "populer", "yeni-seriler").map { it to AnizmParser.homeRow(doc, it) }
+            rows.all { (_, r) -> r.isNotEmpty() && r.all { it.poster != null } } to
+                rows.joinToString { (id, r) -> "$id ${r.size} (${r.count { it.poster == null }} without poster)" }
+        }
+        step("Latest episodes (/yeniler)") {
+            val doc = siteDocument("$mainUrl/yeniler?sayfa=1", pageHeaders) ?: return@step false to "page didn't load"
+            val l = AnizmParser.listing(doc, 1)
+            (l.cards.isNotEmpty() && l.hasNext) to "${l.cards.size} anime, next page: ${l.hasNext}"
+        }
+        step("Search API (/searchAnime)") {
+            val h = searchApi(query)
+            (if (h.isNotEmpty()) true else null) to "${h.size} results" + (if (h.isEmpty()) " (it errors on some queries; /arama covers that)" else "")
+        }
+        step("Search page (/arama)") { val c = searchHtml(query); c.isNotEmpty() to "${c.size} results" }
+        step("Search suggestions") { val c = searchSuggest(query); (if (c.isNotEmpty()) true else null) to "${c.size} results" }
+        var episodeUrl: String? = null
+        step("Anime page") {
+            val url = "$mainUrl/$slug"
+            val doc = siteDocument(url, pageHeaders) ?: return@step false to "page didn't load"
+            val a = AnizmParser.anime(doc, url)
+            episodeUrl = (a.episodes.firstOrNull { it.number == 1 } ?: a.episodes.firstOrNull())?.url
+            val namesOk = a.episodes.none { it.name.contains("altyaz", ignoreCase = true) || it.name.length > 40 }
+            (a.episodes.isNotEmpty() && namesOk && a.poster != null && a.plot != null) to
+                "'${a.title}', ${a.episodes.size} episodes (first '${a.episodes.firstOrNull()?.name}'), poster ${if (a.poster != null) "yes" else "MISSING"}, " +
+                "plot ${a.plot?.length ?: 0} chars, year ${a.year}, ${a.tags.size} genres, ${a.aliases.size} other names"
+        }
+        val ep = episodeUrl ?: return out.also { it += "✗ Stopped here: no episode to test" }
+        var translators = emptyList<AnizmParser.Translator>()
+        step("Episode page → fansubs") {
+            val html = siteText(ep, pageHeaders) ?: return@step false to "page didn't load"
+            translators = AnizmParser.translators(html, onCurrentHost(ep))
+            translators.isNotEmpty() to "${translators.size}: ${translators.joinToString { it.name }}"
+        }
+        var firstVideo: AnizmParser.Video? = null
+        for (t in translators) step("Sources · ${t.name}") {
+            val text = siteText(t.url, xhrHeaders + mapOf("Referer" to onCurrentHost(ep))) ?: return@step false to "no answer"
+            val v = AnizmParser.videos(text)
+            if (firstVideo == null) firstVideo = v.firstOrNull()
+            v.isNotEmpty() to "${v.size}: ${v.joinToString { it.name }}"
+        }
+        firstVideo?.let { v ->
+            step("Player redirect · ${v.name} (/player/${v.id})") {
+                val embed = resolveViaRedirect(v.id, ep)
+                (embed != null) to (embed?.take(90) ?: "no redirect target")
+            }
+        }
+        return out
+    }
+
     suspend fun runConnectionTest(): List<String> {
         val (nid, episodeUrl) = lastProbeTarget
             ?: return listOf("Open an episode first (so there is a player id to test), then run this again.")
@@ -274,7 +337,6 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // (name-then-content vs content-then-name). Jsoup's selector doesn't care about
     // attribute order at all, so one query replaces both, and can't break the same way
     // if the site ever reorders these attributes again.
-    private val cleanRe = Regex("""\s*[-–]\s*Anizm[.\w]*$""", RegexOption.IGNORE_CASE)
     private val adsRe = Regex("""\([Rr]eklamsız\)""")
     private val qualityTagRe = Regex("""\b\d{3,4}[pP]\b""")
     private val urlRe = Regex("""https?://[^\s"'<>\\]+""")
@@ -282,17 +344,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     private val hlsResolutionRe = Regex("""RESOLUTION=\d+x(\d+)""")
     private val emptyParenRe = Regex("""\(\s*\)""")
     private val multiSpaceRe = Regex("""\s{2,}""")
-    private val posterAltRe = Regex("""\s+posteri$""", RegexOption.IGNORE_CASE)
-    private val episodeUrlCleanupRe = Regex("""-\d+[-.]?bolum[^/?#]*""")
-    private val ogAnizmCleanupRe = Regex("""\s*[-|–]\s*Anizm.*$""", RegexOption.IGNORE_CASE)
-    private val ogIzleCleanupRe = Regex("""\s+[iİ]zle\b.*$""", RegexOption.IGNORE_CASE)
-    private val ogIzleTruncRe = Regex("""\s+[iİ]z?l?e?\.{2,}.*$""", RegexOption.IGNORE_CASE)
     private val asciiOnlyRe = Regex("^[\\x20-\\x7E]+$")
-    private val yearRe = Regex("""\d{4}""")
-    private val rangeLabelRe = Regex("""\d+\s*-\s*\d+\.?\s*[Bb][oöô]l[uüû]m""")
-    private val singleEpLabelRe = Regex("""^(\d+)\.?\s*[Bb][oöô]l[uüû]m""")
-    // v36: "-?" — 53 One Piece slugs have no hyphen before "bolum" (one-piece-41bolum-izle)
-    private val singleEpUrlRe = Regex("""-(\d+)-?bolum(?:-|$)""")
     // gdriveConfirmRe/gdriveUuidRe removed (3.1) — same reasoning as the CSRF regexes:
     // Jsoup's input[name=...] selector doesn't care about attribute order, and is also
     // more tolerant of the deliberately-truncated HTML this fetch produces (Range-limited).
@@ -1006,56 +1058,57 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // the endpoint is a plain substring match, so "re zero" returns nothing for
     // "Re:Zero kara Hajimeru…" while "Re:Zero" or "zero kara" work. On an empty result we
     // retry once with the longest word and filter locally on all words, punctuation-blind.
-    private data class SearchHit(val slug: String, val title: String, val poster: String?, val year: Int?, val haystack: String)
-    private val nonAlnumRe = Regex("""[^\p{L}\p{N}]+""")
-    private fun squash(s: String) = s.lowercase().replace(nonAlnumRe, "")
-
-    private suspend fun searchApi(q: String): List<SearchHit> {
+    // v37: all HTML/JSON reading lives in AnizmParser, which tools/check-parser.sh checks
+    // against saved copies of the site. This file only fetches and maps to CloudStream types.
+    private suspend fun searchApi(q: String): List<AnizmParser.SearchHit> {
         val params = mapOf("query" to q, "type" to "detailed", "limit" to "20",
             "priorityField" to "info_title", "orderBy" to "info_year", "orderDirection" to "ASC")
         val text = try { siteText("$mainUrl/searchAnime", xhrHeaders, params = params, timeout = 10L) }
             catch (e: kotlinx.coroutines.CancellationException) { throw e }
             catch (_: Exception) { null } ?: return emptyList()
-        return try {
-            val arr = JSONObject(text).optJSONArray("data") ?: JSONArray(text)
-            (0 until arr.length()).mapNotNull { i ->
-                val obj = arr.optJSONObject(i) ?: return@mapNotNull null
-                val slug = obj.optString("info_slug", "").ifBlank { return@mapNotNull null }
-                val title = obj.optString("info_title", "").ifBlank { return@mapNotNull null }
-                val thumb = obj.optString("info_poster", "")
-                val poster = if (thumb.isBlank()) null else if (thumb.startsWith("http")) thumb else "$mainUrl/storage/pcovers/$thumb"
-                val year = obj.optString("info_year", "").toIntOrNull()
-                val hay = squash(listOf("info_title", "info_titleoriginal", "info_titleenglish", "info_othernames")
-                    .joinToString(" ") { obj.optString(it, "") })
-                SearchHit(slug, title, poster, year, hay)
-            }
-        } catch (_: Exception) { emptyList() }
+        return AnizmParser.searchApi(text, mainUrl)
     }
 
-    private suspend fun searchHtml(q: String): List<SearchResponse> {
+    // v36: the catalog page's own search (/arama?q=) — plain HTML, with posters.
+    private suspend fun searchHtml(q: String): List<AnizmParser.Card> {
         val url = "$mainUrl/arama"
         val text = try { siteText(url, pageHeaders, params = mapOf("q" to q), timeout = 10L) }
             catch (e: kotlinx.coroutines.CancellationException) { throw e }
             catch (_: Exception) { null } ?: return emptyList()
-        return org.jsoup.Jsoup.parse(text, url).select("article.v3-catalog-card").mapNotNull { parseCard(it) }
+        return AnizmParser.listing(org.jsoup.Jsoup.parse(text, url), 1).cards
     }
+
+    // v37: the header box's suggestions — 3 results, no posters, so only the last resort.
+    private suspend fun searchSuggest(q: String): List<AnizmParser.Card> {
+        val text = try { siteText("$mainUrl/arama-onerileri", xhrHeaders, params = mapOf("q" to q), timeout = 8L) }
+            catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (_: Exception) { null } ?: return emptyList()
+        return AnizmParser.suggestions(text)
+    }
+
+    private fun cardResponse(c: AnizmParser.Card) =
+        newAnimeSearchResponse(c.title, c.url, TvType.Anime) { posterUrl = c.poster; year = c.year }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val q = query.trim().ifBlank { return emptyList() }
         var hits = searchApi(q)
         if (hits.isEmpty()) {
             // v36: /searchAnime answers some queries (e.g. "frieren") with a 500 every time.
-            // The catalog page's own search (/arama?q=) is plain HTML and has posters too.
             val html = searchHtml(q)
-            if (html.isNotEmpty()) { log("search: '$q' api empty, /arama gave ${html.size}"); return html }
-            val words = q.split(nonAlnumRe).filter { it.length >= 2 }
+            if (html.isNotEmpty()) { log("search: '$q' api empty, /arama gave ${html.size}"); return html.map { cardResponse(it) } }
+            val words = AnizmParser.words(q)
             val longest = words.maxByOrNull { it.length }
             if (words.size > 1 && longest != null && longest.length >= 3) {
-                val squashedWords = words.map { squash(it) }
+                val squashedWords = words.map { AnizmParser.squash(it) }
                 val broad = searchApi(longest)
                 hits = broad.filter { h -> squashedWords.all { h.haystack.contains(it) } }.ifEmpty { broad }
                 log("search: '$q' empty, retried with '$longest' → ${hits.size}")
             }
+        }
+        if (hits.isEmpty()) {
+            val sug = searchSuggest(q)
+            log("search: '$q' still empty, /arama-onerileri gave ${sug.size}")
+            return sug.map { cardResponse(it) }
         }
         return hits.map { h ->
             newAnimeSearchResponse(h.title, "$mainUrl/${h.slug}", TvType.Anime) { posterUrl = h.poster; year = h.year }
@@ -1070,22 +1123,6 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         "yeni-seriler" to "Yeni Seriler",
         "populer" to "Popüler")
 
-    // One card parser for every listing: home rows (v3-episode-card / v3-series-card),
-    // /yeniler (v3-episode-card) and the catalog/search page (v3-catalog-card).
-    private fun parseCard(card: org.jsoup.nodes.Element): SearchResponse? {
-        val a = card.selectFirst("a.v3-catalog-poster[href], a[href]") ?: return null
-        val href = a.attr("abs:href").ifBlank { return null }
-        val title = card.selectFirst(".v3-card-copy h3, .v3-catalog-card-copy h2, h3, h2")?.text()
-            ?.replace(cleanRe, "")?.trim()?.ifBlank { null }
-            ?: card.selectFirst("img[alt]")?.attr("alt")?.replace(posterAltRe, "")?.trim()?.ifBlank { null }
-            ?: return null
-        val poster = card.selectFirst("img")?.let { findImg(it) }
-        // Episode cards link to the episode; the anime page is the slug without "-N-bolum-izle".
-        val animeUrl = if (card.hasClass("v3-episode-card")) href.replace(episodeUrlCleanupRe, "").trimEnd('-', '/') else href
-        val year = card.selectFirst(".v3-catalog-card-copy p")?.text()?.trim()?.toIntOrNull()
-        return newAnimeSearchResponse(title, animeUrl, TvType.Anime) { posterUrl = poster; this.year = year }
-    }
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val paged = request.data == "yeniler"
         if (!paged && page > 1) return newHomePageResponse(request.name, emptyList(), hasNext = false)
@@ -1096,11 +1133,13 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         val url = if (paged) "$mainUrl/yeniler?sayfa=$page" else "$mainUrl/"
         val doc = siteDocument(url, pageHeaders, timeout = 12L)
             ?: return newHomePageResponse(request.name, emptyList(), hasNext = false)
-        val cards = if (paged) doc.select("article.v3-episode-card")
-            else doc.select("#${request.data} article")
-        val items = cards.mapNotNull { parseCard(it) }.distinctBy { it.url }
+        // v37: home images keep their URL in data-v3-deferred-src (v36 read only src, so the
+        // home rows had no posters); /yeniler pages end at the last rel=next link.
+        val listing = if (paged) AnizmParser.listing(doc, page)
+            else AnizmParser.Listing(AnizmParser.homeRow(doc, request.data), hasNext = false)
+        val items = listing.cards.map { cardResponse(it) }
         if (page == 1 && items.isEmpty()) logW("site-change warning: main page selectors empty")
-        val result = newHomePageResponse(request.name, items, hasNext = paged && items.isNotEmpty())
+        val result = newHomePageResponse(request.name, items, hasNext = listing.hasNext)
         if (items.isNotEmpty()) {
             mainPageCache[cacheKey] = result to System.currentTimeMillis()
             synchronized(mainPageCacheLock) {
@@ -1115,137 +1154,21 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     }
 
     // ── Load ──────────────────────────────────────────────────────────────────
-    private fun absUrl(src: String): String? {
-        if (src.isBlank() || src.startsWith("data:")) return null
-        return when {
-            src.startsWith("http") -> src; src.startsWith("//") -> "https:$src"
-            src.startsWith("/") -> "$mainUrl$src"; else -> "$mainUrl/$src"
-        }
-    }
-
-    private fun findImg(el: org.jsoup.nodes.Element): String? {
-        return absUrl(el.attr("src")) ?: absUrl(el.attr("data-src"))
-            ?: absUrl(el.attr("data-original")) ?: absUrl(el.attr("data-lazy-src"))
-    }
-
     override suspend fun load(url: String): LoadResponse {
         val doc = siteDocument(url, pageHeaders, timeout = 12L)
             ?: return newAnimeLoadResponse(name = url.substringAfterLast('/'), url = url, type = TvType.Anime) { addEpisodes(DubStatus.Subbed, emptyList()) }
-
-        // v36 (site revamp 2026-10): the old info rows/selectors are all gone. The page also
-        // carries a schema.org TVSeries block, used as a fallback for title/plot/poster/genres.
-        val ld = doc.select("script[type=application/ld+json]").mapNotNull { s ->
-            try { JSONObject(s.data()) } catch (_: Exception) { null }
-        }.firstOrNull { it.optString("@type") in setOf("TVSeries", "Movie", "CreativeWorkSeries") }
-        // h1 reads "Sousou no Frieren izle"; the episode section's kicker is the bare title.
-        val title = doc.selectFirst("#bolumler .v3-section-kicker")?.text()?.trim()?.ifBlank { null }
-            ?: ld?.optString("name", "")?.trim()?.ifBlank { null }
-            ?: doc.selectFirst("header.v3-anime-detail-header h1, h1")?.text()?.replace(ogIzleCleanupRe, "")?.trim()?.ifBlank { null }
-            ?: url.substringAfterLast("/").replace("-", " ")
-
-        // Extract alternative names for AniList/MAL sync matching
-        val aliases = mutableListOf<String>()
-        // Method 1: fact rows — <div><span>İngilizce adı</span><strong>…</strong></div>
-        doc.select(".v3-anime-facts > div").forEach { row ->
-            // "İ".lowercase() is "i̇" (dotted), so match "ngilizce", not "ingilizce"
-            val label = row.selectFirst("span")?.text()?.lowercase()?.trim()?.trimEnd(':') ?: return@forEach
-            if (label.contains("japonca") || label.contains("japanese") ||
-                label.contains("ngilizce") || label.contains("english") ||
-                label.contains("diğer ad") || label.contains("other name") ||
-                label.contains("romaji") || label.contains("orijinal")) {
-                val value = row.selectFirst("strong")?.text()?.trim() ?: ""
-                if (value.isNotBlank() && value != title) {
-                    // Split on comma — "Name1, Name2" → ["Name1", "Name2"]
-                    value.split(",", "،", "/").map { it.trim() }.filter { it.isNotBlank() && it != title }
-                        .forEach { aliases.add(it) }
-                }
-            }
-        }
-        // Method 2: og:title might have a different name
-        doc.selectFirst("meta[property=og:title]")?.attr("content")?.trim()
-            ?.replace(ogAnizmCleanupRe, "")
-            ?.replace(ogIzleCleanupRe, "")
-            ?.replace(ogIzleTruncRe, "")?.trim()
-            ?.let { if (it.isNotBlank() && it != title && it !in aliases) aliases.add(it) }
-        // Method 3 removed — h1/h2 scan grabs footer/nav junk ("Biz Kimiz?", "Hızlı Erişim" etc.)
-        // Clean Turkish "izle/İzle" and truncated forms (anizm truncates long titles to "izl...", "iz...", etc.)
-        val cleanedAliases = aliases.map { it.replace(ogIzleCleanupRe, "").replace(ogIzleTruncRe, "").trim() }
-            .filter { it.isNotBlank() && it != title && it.length > 3 }
-        // Deduplicate and limit
-        val nameAliases = cleanedAliases.distinct().take(10).ifEmpty { null }
-        log("load: aliases=${nameAliases?.size ?: 0}: ${nameAliases?.joinToString(" | ") ?: "none"}")
-
-        // Poster: the cover image, then JSON-LD / og:image (both relative now)
-        val poster = sequenceOf(
-            doc.selectFirst(".v3-anime-detail-cover img"),
-            doc.selectFirst("img[src*=pcovers]"),
-        ).filterNotNull().map { findImg(it) }.firstOrNull { it != null }
-            ?: ld?.optString("image", "")?.takeIf { !it.startsWith("[") && !it.startsWith("{") }?.let { absUrl(it) }
-            ?: doc.selectFirst("meta[property=og:image]")?.attr("content")?.let { absUrl(it) }
-
-        // Plot: the meta description is cut at ~160 chars, so it's the last resort
-        val plot = doc.selectFirst("p#v3-anime-summary-content")?.text()?.trim()?.ifBlank { null }
-            ?: ld?.optString("description", "")?.trim()?.ifBlank { null }
-            ?: doc.selectFirst("meta[name=description], meta[property=og:description]")?.attr("content")?.trim()?.ifBlank { null }
-
-        // ".v3-anime-detail-meta" spans: "2023", "28 yayınlanmış bölüm", …
-        val year = doc.select(".v3-anime-detail-meta span").map { it.text().trim() }
-            .firstOrNull { it.matches(yearRe) && it.toInt() in 1950..2040 }?.toIntOrNull()
-        val tags = doc.select(".v3-anime-detail-tags a").map { it.text().trim() }
-            .ifEmpty { ld?.optJSONArray("genre")?.let { g -> (0 until g.length()).map { g.optString(it, "").trim() } } ?: emptyList() }
-            .filter { it.isNotBlank() && it.length < 30 }.distinct().take(10).ifEmpty { null }
-
-        // v36: every episode is in the HTML (the 12-per-group paging is client-side). Don't
-        // select by a[href*=-bolum]: it misses slugs like one-piece-41bolum-izle. And don't
-        // trust data-episode-number: it's an internal sequence (drifts from One Piece 956 on).
-        val allLinks = doc.select("[data-anime-episode-grid] > a[href]")
-            .ifEmpty { doc.select("#bolumler a[href*=bolum]") }
-            .distinctBy { it.attr("abs:href") }
-        // Preview/teaser entries (e.g. "1-2. Bölüm (Ön Gösterim)") sit before "1. Bölüm" in
-        // the list. Naive position-based numbering (i+1) shifts every real episode after it
-        // by one — confirmed on a real page. Naive number-parsing doesn't fix this either:
-        // "1-2. Bölüm" parses to "2" from either the label or the URL, colliding with the
-        // real episode 2. So: detect range-style/preview entries first and give them
-        // episode=0 (visible, watchable, never collides with or shifts real numbers);
-        // parse real episodes' numbers directly from label or URL instead of trusting
-        // position at all, so a missing/reordered entry elsewhere can't shift anything.
-        data class EpEntry(val href: String, val label: String, val isSpecial: Boolean)
-        // rangeLabelRe/singleEpLabelRe/singleEpUrlRe now hoisted to class level (1.8)
-        val entries = allLinks.mapNotNull { el ->
-            val href = el.attr("abs:href").ifBlank { return@mapNotNull null }
-            // The link text is "1 1. Bölüm Sousou no Frieren · Türkçe altyazılı izle" — use the title only
-            val label = el.attr("data-episode-title").trim()
-                .ifBlank { el.selectFirst("strong")?.text()?.trim() ?: "" }
-                .ifBlank { el.text().trim() }.ifBlank { return@mapNotNull null }
-            val ll = label.lowercase()
-            if (href.contains("fragman") || ll.contains("fragman")) return@mapNotNull null
-            if (href.contains("-pv-") || ll == "pv" || ll.endsWith(" pv")) return@mapNotNull null
-            val isSpecial = rangeLabelRe.containsMatchIn(label) ||
-                ll.contains("önizleme") || ll.contains("ön gösterim") ||
-                href.contains("onizleme") || href.contains("on-gosterim")
-            EpEntry(href, label, isSpecial)
-        }
-        var regularCount = 0
-        val episodes = entries.map { e ->
-            newEpisode(e.href) { name = e.label }.apply {
-                episode = if (e.isSpecial) {
-                    0
-                } else {
-                    regularCount++
-                    singleEpLabelRe.find(e.label)?.groupValues?.get(1)?.toIntOrNull()
-                        ?: singleEpUrlRe.find(e.href)?.groupValues?.get(1)?.toIntOrNull()
-                        ?: regularCount // fall back to a count of regular episodes only,
-                                        // never raw list position — specials don't skew this
-                }
-            }
-        }
+        val anime = AnizmParser.anime(doc, url)
+        if (anime.episodes.isEmpty()) logW("site-change warning: no episodes found on ${url.substringAfterLast('/')}")
+        // number 0 = preview or joined episode ("215-216. Bölüm"): watchable, never shifts the real numbers
+        val episodes = anime.episodes.map { e -> newEpisode(e.url) { name = e.name }.apply { episode = e.number } }
         // Split aliases into eng/jap + synonyms for AniList/MAL sync matching
-        val eng = nameAliases?.firstOrNull { asciiOnlyRe.matches(it) }
-        val jap = nameAliases?.firstOrNull { !asciiOnlyRe.matches(it) }
-        val syns = nameAliases?.filter { it != eng && it != jap }?.ifEmpty { null }
-        log("load: '$title' poster=${poster != null} plot=${(plot?.length ?: 0) > 0} eps=${episodes.size} eng=$eng jap=$jap syns=${syns?.size ?: 0}")
-        return newAnimeLoadResponse(title, url, TvType.Anime) {
-            posterUrl = poster; this.plot = plot; this.year = year; this.tags = tags
+        val aliases = anime.aliases.ifEmpty { null }
+        val eng = aliases?.firstOrNull { asciiOnlyRe.matches(it) }
+        val jap = aliases?.firstOrNull { !asciiOnlyRe.matches(it) }
+        val syns = aliases?.filter { it != eng && it != jap }?.ifEmpty { null }
+        log("load: '${anime.title}' poster=${anime.poster != null} plot=${(anime.plot?.length ?: 0) > 0} eps=${episodes.size} eng=$eng jap=$jap syns=${syns?.size ?: 0}")
+        return newAnimeLoadResponse(anime.title, url, TvType.Anime) {
+            posterUrl = anime.poster; this.plot = anime.plot; this.year = anime.year; this.tags = anime.tags.ifEmpty { null }
             this.engName = eng
             this.japName = jap
             this.synonyms = syns
@@ -1275,25 +1198,11 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         catch (e: Exception) { log("loadLinks: page error: ${e.message}"); return null }
         log("loadLinks: page len=${epHtml.length}")
 
-        // v36 (site revamp 2026-10): fansubs are <button data-sources="/bolum/<epId>/cevirmen/<trId>"
-        // title="Fansub name">. That URL answers JSON {"success":true,"videos":[{"id","name"}]},
-        // and each id is the /player/<id> number. No XHR headers are required (verified).
+        // v37: AnizmParser.translators reads the fansub buttons (data-sources, then
+        // data-translator-id + data-episode-id, then any /bolum/<ep>/cevirmen/<tr> URL in the HTML).
         // LinkedHashMap: O(1) dedup by URL while preserving on-page order.
         val translators = LinkedHashMap<String, String>()
-        try {
-            val epDoc = org.jsoup.Jsoup.parse(epHtml, onCurrentHost(data))
-            // A button with only data-translator-id gets the URL the page's JS would build.
-            val epId = epDoc.selectFirst("[data-episode-id]")?.attr("data-episode-id")?.trim()?.takeIf { it.all(Char::isDigit) }
-            epDoc.select("button[data-sources], button[data-translator-id]").forEach { e ->
-                val trId = e.attr("data-translator-id").trim()
-                val u = e.absUrl("data-sources").ifBlank { e.attr("data-sources") }.ifBlank {
-                    if (epId != null && trId.isNotEmpty() && trId.all(Char::isDigit)) "$mainUrl/bolum/$epId/cevirmen/$trId" else ""
-                }
-                if (u.isNotBlank() && u !in translators) translators[u] = e.attr("title").trim()
-                    .ifBlank { e.clone().also { it.select(".v3-translation-flag").remove() }.text().trim() }
-                    .ifBlank { "Fansub" }
-            }
-        } catch (_: Exception) {}
+        AnizmParser.translators(epHtml, onCurrentHost(data)).forEach { translators[it.url] = it.name }
         log("loadLinks: ${translators.size} translators: ${translators.values}")
         if (translators.isEmpty()) {
             if (epHtml.length > 5000) logW("site-change warning: no translators found on a normal-sized episode page")
@@ -1314,18 +1223,13 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                                 ?: run { log("loadLinks: tr error ($fansubName)"); return@withPermit }
                         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
                         catch (e: Exception) { log("loadLinks: tr error ($fansubName): ${e.message}"); return@withPermit }
-                        val videos = try { JSONObject(trText).optJSONArray("videos") } catch (_: Exception) { null }
-                        if (videos == null || videos.length() == 0) return@withPermit
+                        // {"success":true,"videos":[{"id","name"}]}; each id is the /player/<id> number
+                        val list = AnizmParser.videos(trText).map { VidInfo(it.id, it.name, fansubName) }
+                        if (list.isEmpty()) return@withPermit
                         anyTranslatorHadData.set(true)
                         // 4.0: no name whitelist here. It silently dropped every player it didn't
                         // recognise by label ("LuluStream", "Sistenn", "BYSE", "FlyF", …). What the
                         // host actually is gets decided from the URL /player/<id> redirects to.
-                        val list = (0 until videos.length()).mapNotNull { i ->
-                            val v = videos.optJSONObject(i) ?: return@mapNotNull null
-                            val id = v.optString("id", "").takeIf { it.isNotEmpty() && it.all(Char::isDigit) }
-                                ?: return@mapNotNull null
-                            VidInfo(id, v.optString("name", "").trim().ifBlank { "Player" }, fansubName)
-                        }
                         log("loadLinks: $fansubName: ${list.map { it.name }}")
                         perTranslator[idx] = list
                     }
