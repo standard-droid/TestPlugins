@@ -1,6 +1,8 @@
 package com.a.anizm
 
 import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Typeface
@@ -187,6 +189,33 @@ class AnizmSettings(private val prefs: SharedPreferences) {
                 }
             }
             root.addView(testBtn)
+
+            header("Site check")
+            note("Runs every step (home, search, anime page, episodes, fansubs, sources, player) on Sousou no Frieren and shows what each one found. If the site changes again, copy this report and send it along.")
+            val siteBtn = Button(context).apply {
+                text = "Run site check"
+                setOnClickListener {
+                    isEnabled = false; text = "Checking…"
+                    CoroutineScope(Dispatchers.IO).launch {
+                        val lines = try { AnizmProvider.instance?.runSiteCheck() ?: listOf("Extension not loaded yet.") }
+                        catch (e: Exception) { listOf("Check failed: ${e.message}") }
+                        val report = lines.joinToString("\n")
+                        withContext(Dispatchers.Main) {
+                            isEnabled = true; text = "Run site check"
+                            AlertDialog.Builder(context)
+                                .setTitle("Site check")
+                                .setMessage(report)
+                                .setPositiveButton("OK", null)
+                                .setNeutralButton("Copy") { _, _ ->
+                                    (context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager)
+                                        ?.setPrimaryClip(ClipData.newPlainText("Anizm site check", report))
+                                }
+                                .show()
+                        }
+                    }
+                }
+            }
+            root.addView(siteBtn)
 
             header("Extras")
             val sniffBox = check("Use the in-app browser for players CloudStream can't read", settings.browserSniff)
