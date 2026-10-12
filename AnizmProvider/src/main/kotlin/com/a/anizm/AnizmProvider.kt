@@ -1281,8 +1281,14 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // LinkedHashMap: O(1) dedup by URL while preserving on-page order.
         val translators = LinkedHashMap<String, String>()
         try {
-            org.jsoup.Jsoup.parse(epHtml, onCurrentHost(data)).select("button[data-sources]").forEach { e ->
-                val u = e.absUrl("data-sources").ifBlank { e.attr("data-sources") }
+            val epDoc = org.jsoup.Jsoup.parse(epHtml, onCurrentHost(data))
+            // A button with only data-translator-id gets the URL the page's JS would build.
+            val epId = epDoc.selectFirst("[data-episode-id]")?.attr("data-episode-id")?.trim()?.takeIf { it.all(Char::isDigit) }
+            epDoc.select("button[data-sources], button[data-translator-id]").forEach { e ->
+                val trId = e.attr("data-translator-id").trim()
+                val u = e.absUrl("data-sources").ifBlank { e.attr("data-sources") }.ifBlank {
+                    if (epId != null && trId.isNotEmpty() && trId.all(Char::isDigit)) "$mainUrl/bolum/$epId/cevirmen/$trId" else ""
+                }
                 if (u.isNotBlank() && u !in translators) translators[u] = e.attr("title").trim()
                     .ifBlank { e.clone().also { it.select(".v3-translation-flag").remove() }.text().trim() }
                     .ifBlank { "Fansub" }
