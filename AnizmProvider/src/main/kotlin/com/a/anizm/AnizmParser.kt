@@ -42,6 +42,12 @@ object AnizmParser {
     private val rangeEpisodeSuffixRe = Regex("""-\d+-\d+[-.]?bolum[^/?#]*""")
     private val episodeHrefRe = Regex("""\d-?bolum""")
     private val translatorUrlRe = Regex("""/bolum/(\d+)/cevirmen/(\d+)""")
+    private val episodeIdUrlRe = Regex("""/bolum/(\d+)/""")
+    // Case-sensitive on purpose: IGNORE_CASE made this scan of ~1 MB 6x slower (11 ms vs 1.7);
+    // the site writes lowercase tags, and an uppercase one still reaches the DOM path.
+    private val buttonTagRe = Regex("""<button\b[^>]*>""")
+    private val dataSourcesAttrRe = Regex("""\sdata-sources\s*=\s*(["'])(.*?)\1""", RegexOption.IGNORE_CASE)
+    private val titleAttrRe = Regex("""\stitle\s*=\s*(["'])(.*?)\1""", RegexOption.IGNORE_CASE)
     private val defaultCoverRe = Regex("""defaultcover""", RegexOption.IGNORE_CASE)
 
     fun squash(s: String) = s.lowercase().replace(nonAlnumRe, "")
@@ -70,6 +76,13 @@ object AnizmParser {
         val imgs = if (el.tagName() == "img") listOf(el) else el.select("img")
         for (img in imgs) for (a in imgAttrs) absUrl(img.baseUri(), img.attr(a))?.let { return it }
         return null
+    }
+
+    /** href as written when it's already absolute (every link on the site is); resolving
+     *  "abs:href" costs a URI parse per link, which is most of the time on One Piece's 1175. */
+    private fun Element.href(): String {
+        val h = attr("href").trim()
+        return if (h.startsWith("https://") || h.startsWith("http://")) h else attr("abs:href")
     }
 
     private fun Element.cleanText() = text().replace(cleanRe, "").trim()
@@ -217,12 +230,12 @@ object AnizmParser {
         val links = doc.select("[data-anime-episode-grid] > a[href]")
             .ifEmpty { doc.select("#bolumler a[href]").filter { episodeHrefRe.containsMatchIn(it.attr("href")) } }
             // Last resort: any link that is this anime's URL plus an episode suffix.
-            .ifEmpty { doc.select("a[href]").filter { it.attr("abs:href").startsWith("$animeUrl-") && episodeHrefRe.containsMatchIn(it.attr("href")) } }
-            .distinctBy { it.attr("abs:href") }
+            .ifEmpty { doc.select("a[href]").filter { it.href().startsWith("$animeUrl-") && episodeHrefRe.containsMatchIn(it.attr("href")) } }
+            .distinctBy { it.href() }
 
         data class Raw(val href: String, val label: String, val special: Boolean)
         val raws = links.mapNotNull { el ->
-            val href = el.attr("abs:href").ifBlank { return@mapNotNull null }
+            val href = el.href().ifBlank { return@mapNotNull null }
             // The link text is "1 1. Bölüm Sousou no Frieren · Türkçe altyazılı izle" — title only.
             val label = el.attr("data-episode-title").trim()
                 .ifBlank { el.selectFirst("strong")?.text()?.trim().orEmpty() }
@@ -252,17 +265,47 @@ object AnizmParser {
 
     /**
      * Fansub buttons: <button data-sources="/bolum/<epId>/cevirmen/<trId>" title="Fansub">.
-     * Fallbacks: a button with only data-translator-id (URL built the way the page's JS does),
-     * then any /bolum/<epId>/cevirmen/<trId> URL in the raw HTML.
+     * Read straight from the HTML text first: the episode page is 0.8–1.2 MB (a 636 KB inline
+     * script in <head>, plus One Piece's 3500-link sidebar), and building a DOM of all of it to
+     * read 1–4 buttons took ~18 ms against ~2 ms for the text scan.
+     * Fallbacks, each only when the one before finds nothing: the same buttons through jsoup;
+     * a button with only data-translator-id (URL built the way the page's JS does); then any
+     * /bolum/<epId>/cevirmen/<trId> URL in the raw HTML.
      */
-    fun translators(html: String, pageUrl: String): List<Translator> {
+    fun translators(html: String, pageUrl: String): List<Translator> =
+        translatorsFromText(html, pageUrl).ifEmpty { translatorsFromDom(html, pageUrl) }
+
+    /** Every <button> with data-sources and a title; empty (so the DOM path runs) if any lacks either. */
+    private fun translatorsFromText(html: String, pageUrl: String): List<Translator> {
+        val out = LinkedHashMap<String, String>()
+        for (m in buttonTagRe.findAll(html)) {
+            val tag = m.value
+            // A fansub button with only data-translator-id needs the DOM path's URL building.
+            val src = dataSourcesAttrRe.find(tag)?.groupValues?.get(2)
+                ?: if (tag.contains("data-translator-id", ignoreCase = true)) return emptyList() else continue
+            val u = absUrl(pageUrl, org.jsoup.parser.Parser.unescapeEntities(src, true)) ?: continue
+            val title = titleAttrRe.find(tag)?.groupValues?.get(2)?.let { org.jsoup.parser.Parser.unescapeEntities(it, true).trim() }
+            if (title.isNullOrEmpty()) return emptyList()
+            if (u !in out) out[u] = title
+        }
+        return out.map { (u, n) -> Translator(u, n) }
+    }
+
+    // The player block's own URLs (#v3-watch data-progress, #v3-watched data-url) first; the
+    // Watch Together widget's data-episode-id is the backup, since that feature can go on its own.
+    private fun episodeId(doc: Document): String? =
+        doc.select("[data-progress*=/bolum/], [data-url*=/bolum/]").firstNotNullOfOrNull { e ->
+            episodeIdUrlRe.find(e.attr("data-progress").ifBlank { e.attr("data-url") })?.groupValues?.get(1)
+        } ?: doc.selectFirst("[data-episode-id]")?.attr("data-episode-id")?.trim()?.takeIf { it.isNotEmpty() && it.all(Char::isDigit) }
+
+    private fun translatorsFromDom(html: String, pageUrl: String): List<Translator> {
         val doc = Jsoup.parse(html, pageUrl)
         val out = LinkedHashMap<String, String>()
-        val epId = doc.selectFirst("[data-episode-id]")?.attr("data-episode-id")?.trim()?.takeIf { it.isNotEmpty() && it.all(Char::isDigit) }
+        val epId by lazy { episodeId(doc) }
         doc.select("button[data-sources], button[data-translator-id], [data-v3-translator]").forEach { e ->
             val trId = e.attr("data-translator-id").trim()
             val u = absUrl(pageUrl, e.attr("data-sources"))
-                ?: if (epId != null && trId.isNotEmpty() && trId.all(Char::isDigit)) absUrl(pageUrl, "/bolum/$epId/cevirmen/$trId") else null
+                ?: if (trId.isNotEmpty() && trId.all(Char::isDigit)) epId?.let { absUrl(pageUrl, "/bolum/$it/cevirmen/$trId") } else null
             if (u != null && u !in out) out[u] = e.attr("title").trim()
                 .ifBlank { e.clone().also { it.select(".v3-translation-flag").remove() }.text().trim() }
                 .ifBlank { "Fansub" }

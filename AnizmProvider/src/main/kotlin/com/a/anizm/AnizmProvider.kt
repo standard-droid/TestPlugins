@@ -53,7 +53,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // each one found, so a site change can be pinned to a step from the phone (where Cloudflare
     // lets requests through) without a browser session. Read-only: the same requests as browsing.
     suspend fun runSiteCheck(slug: String = "sousou-no-frieren", query: String = "frieren"): List<String> {
-        val out = mutableListOf("Site: $mainUrl · v37 · ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US).format(java.util.Date())}")
+        val out = mutableListOf("Site: $mainUrl · v38 · ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US).format(java.util.Date())}")
         // ok = true ✓, false ✗, null ⚠ (worked around by a fallback)
         suspend fun step(what: String, block: suspend () -> Pair<Boolean?, String>) {
             val (ok, detail) = try { block() }
@@ -1198,8 +1198,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         catch (e: Exception) { log("loadLinks: page error: ${e.message}"); return null }
         log("loadLinks: page len=${epHtml.length}")
 
-        // v37: AnizmParser.translators reads the fansub buttons (data-sources, then
-        // data-translator-id + data-episode-id, then any /bolum/<ep>/cevirmen/<tr> URL in the HTML).
+        // v38: AnizmParser.translators reads the fansub buttons straight from the HTML text, then
+        // through jsoup (data-sources, then data-translator-id + the episode id), then any
+        // /bolum/<ep>/cevirmen/<tr> URL in the HTML.
         // LinkedHashMap: O(1) dedup by URL while preserving on-page order.
         val translators = LinkedHashMap<String, String>()
         AnizmParser.translators(epHtml, onCurrentHost(data)).forEach { translators[it.url] = it.name }

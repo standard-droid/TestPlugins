@@ -54,6 +54,10 @@ fun main() {
     check("page 1: posters", y1.cards.all { it.poster != null })
     val y2 = AnizmParser.listing(doc("yeniler_sayfa_2.html", "$site/yeniler?sayfa=2"), 2)
     check("page 2: ≥20 anime, has next", y2.cards.size >= 20 && y2.hasNext, y2.cards.size)
+    val y1Doc = doc("yeniler_sayfa_1.html", "$site/yeniler?sayfa=1")
+    val yLoose = AnizmParser.listing(y1Doc.damaged { select("article").forEach { it.tagName("div").removeAttr("class") } }, 1).cards
+    check("fallback: cards with <article>/classes gone, same count, no site-logo card",
+        yLoose.size == y1.cards.size && yLoose.none { it.url.trimEnd('/') == site }, yLoose.size)
 
     section("Search")
     val arama = AnizmParser.listing(doc("arama_q_frieren.html", "$site/arama?q=frieren"), 1).cards
@@ -89,6 +93,9 @@ fun main() {
     val noSection = frDoc.damaged { select("#bolumler").removeAttr("id"); select("[data-anime-episode-grid]").removeAttr("data-anime-episode-grid") }
     check("fallback: episodes with neither grid nor #bolumler", AnizmParser.anime(noSection, "$site/sousou-no-frieren").episodes.size == 28,
         AnizmParser.anime(noSection, "$site/sousou-no-frieren").episodes.size)
+    val relative = frDoc.damaged { select("[data-anime-episode-grid] > a[href]").forEach { it.attr("href", it.attr("href").removePrefix(site)) } }
+    check("relative episode hrefs still come out absolute",
+        AnizmParser.anime(relative, "$site/sousou-no-frieren").episodes.map { it.url } == fr.episodes.map { it.url })
     val bare = frDoc.damaged { select(".v3-anime-detail-cover, #v3-anime-summary-content, .v3-anime-detail-tags, #bolumler .v3-section-kicker").remove() }
     val frBare = AnizmParser.anime(bare, "$site/sousou-no-frieren")
     check("fallback: title/plot/poster/genres from JSON-LD", frBare.title == "Sousou no Frieren" && (frBare.plot?.length ?: 0) > 300 &&
@@ -118,8 +125,23 @@ fun main() {
     check("Frieren ep 1: 4 fansubs", trs.map { it.name } == listOf("Hoşumuza Giden Şeyler", "Holy", "GachaFlex Fansub", "NekoSubs"), trs.map { it.name })
     check("fansub URLs", trs.all { Regex("""^https://anizm\.net/bolum/73483/cevirmen/\d+$""").matches(it.url) }, trs.map { it.url })
     val noSources = Jsoup.parse(epHtml, epUrl).also { it.select("[data-sources]").removeAttr("data-sources") }.outerHtml()
-    check("fallback: data-sources gone → built from data-translator-id + data-episode-id",
+    check("fallback: data-sources gone → built from data-translator-id + the player block's /bolum/<id>/",
         AnizmParser.translators(noSources, epUrl).map { it.url } == trs.map { it.url })
+    val noSourcesNoWt = Jsoup.parse(noSources, epUrl).also { it.select(".v3-watch-together, [data-episode-id]").remove() }.outerHtml()
+    check("fallback: …and with the Watch Together widget gone too",
+        AnizmParser.translators(noSourcesNoWt, epUrl).map { it.url } == trs.map { it.url })
+    val noSourcesNoPlayerIds = Jsoup.parse(noSources, epUrl).also { it.select("[data-progress]").removeAttr("data-progress"); it.select("[data-url]").removeAttr("data-url") }.outerHtml()
+    check("fallback: …or with the player block's URLs gone (data-episode-id backup)",
+        AnizmParser.translators(noSourcesNoPlayerIds, epUrl).map { it.url } == trs.map { it.url })
+    val noTitles = Jsoup.parse(epHtml, epUrl).also { it.select("[data-v3-translator]").removeAttr("title") }.outerHtml()
+    check("fallback: titles gone → names from the button text (DOM path)",
+        AnizmParser.translators(noTitles, epUrl).map { it.name } == trs.map { it.name }, AnizmParser.translators(noTitles, epUrl).map { it.name })
+    check("text scan unescapes entities in names and URLs",
+        AnizmParser.translators("""<button data-sources="/bolum/1/cevirmen/2?a=1&amp;b=2" title="A &amp; B">x</button>""", epUrl)
+            .let { it.size == 1 && it[0].name == "A & B" && it[0].url == "$site/bolum/1/cevirmen/2?a=1&b=2" })
+    val mixed = epHtml.replaceFirst("<button ", """<button data-translator-id="555" title="Only Id">x</button><button """)
+    check("a button with only data-translator-id is still found (DOM path)",
+        AnizmParser.translators(mixed, epUrl).let { it.size == trs.size + 1 && it.any { t -> t.url == "$site/bolum/73483/cevirmen/555" } })
     val noButtons = Jsoup.parse(epHtml, epUrl).also { it.select("[data-v3-translator]").remove() }.outerHtml() +
         trs.joinToString("") { "<script>var u='${it.url.removePrefix(site)}';</script>" }
     check("fallback: buttons gone → URLs found in the raw HTML", AnizmParser.translators(noButtons, epUrl).map { it.url } == trs.map { it.url },
