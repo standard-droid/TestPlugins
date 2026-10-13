@@ -164,6 +164,11 @@ fun main() {
     check("videos: bare array", AnizmParser.videos("""[{"id":"7","name":"Y"}]""").map { it.id } == listOf("7"))
     check("videos: error JSON → empty", AnizmParser.videos("""{"success":false}""").isEmpty())
     check("videos: HTML error page → empty", AnizmParser.videos("<html>404</html>").isEmpty())
+    val pu = AnizmParser.playerUrl(text("bolum_73483_video_1591727.json"), site)
+    check("/bolum/73483/video/1591727: player url", pu == "$site/player/1591727", pu)
+    check("player url: relative, against playerOrigin", AnizmParser.playerUrl("""{"success":true,"url":"/oynat/5","playerOrigin":"https://p.example"}""", site) == "https://p.example/oynat/5")
+    check("player url: relative, no playerOrigin → site", AnizmParser.playerUrl("""{"success":true,"url":"/oynat/5","playerOrigin":null}""", site) == "$site/oynat/5")
+    check("player url: error JSON / HTML → null", AnizmParser.playerUrl("""{"success":false,"url":"/x"}""", site) == null && AnizmParser.playerUrl("<html>404</html>", site) == null)
 
     println("\n$passed passed, $failed failed")
     if (failed > 0) exitProcess(1)

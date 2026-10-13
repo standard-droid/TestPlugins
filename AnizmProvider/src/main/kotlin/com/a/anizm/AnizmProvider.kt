@@ -53,7 +53,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // each one found, so a site change can be pinned to a step from the phone (where Cloudflare
     // lets requests through) without a browser session. Read-only: the same requests as browsing.
     suspend fun runSiteCheck(slug: String = "sousou-no-frieren", query: String = "frieren"): List<String> {
-        val out = mutableListOf("Site: $mainUrl · v38 · ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US).format(java.util.Date())}")
+        // v39: no version number here: it was typed in by hand and went stale on every bump
+        // (build.gradle.kts has it; the Extensions screen shows it).
+        val out = mutableListOf("Site: $mainUrl · ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US).format(java.util.Date())}")
         // ok = true ✓, false ✗, null ⚠ (worked around by a fallback)
         suspend fun step(what: String, block: suspend () -> Pair<Boolean?, String>) {
             val (ok, detail) = try { block() }
@@ -253,7 +255,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     private val aincradCache = java.util.concurrent.ConcurrentHashMap<String, AincradSource>()
     private val expiresParamRe = Regex("""[?&]expires=(\d{9,13})""")
     private val sizeCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Map<Int, Long>, Long>>()
-    private val sizeCacheTtlMs = 60 * 60 * 1000L
+    // v39: 1 h -> 24 h. Every key names one video (ap:<hash>, bp:<hash>, sistenn:<host>:<id>:<kind>),
+    // whose size never changes; an hour only meant re-sampling it on the next evening's download.
+    private val sizeCacheTtlMs = 24 * 60 * 60 * 1000L
     private fun cachedSizes(key: String): Map<Int, Long>? =
         sizeCache[key]?.takeIf { System.currentTimeMillis() - it.second < sizeCacheTtlMs }?.first
     private fun storeSizes(key: String, sizes: Map<Int, Long>) {
@@ -278,7 +282,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // Was local to loadLinks; now needed at class level so processSource() can take it
     // as a parameter — loadLinks dispatches each source to it as soon as that source's
     // numId resolves, instead of waiting for every source in the episode to resolve first.
-    private data class VidInfo(val numId: String, val name: String, val fansub: String)
+    // v39: epId = the episode id from the fansub list URL (/bolum/<epId>/cevirmen/…), for playerUrlFor.
+    private data class VidInfo(val numId: String, val name: String, val fansub: String, val epId: String? = null)
+    private val bolumIdRe = Regex("""/bolum/(\d+)/""")
     // ConcurrentHashMap: loadLinks can run concurrently (prefetch + user click)
     private val embedCache = java.util.concurrent.ConcurrentHashMap<String, CachedEmbed>()
     private val cacheTtlMs = 30 * 60 * 1000L // 30 minutes
@@ -319,7 +325,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     private val gdRe = Regex("""drive\.google\.com/(?:file/d/|uc\?[^"]*id=|open\?[^"]*id=)([A-Za-z0-9_-]{20,})""")
     // Beta Player: /player/{numId} redirects to pl.puffytr.tr/watch/{hash} — a genuinely
     // new backend, unrelated to Aincrad/anizmplayer.com despite similar button styling.
-    private val puffytrRe = Regex("""puffytr\.tr/watch/([a-f0-9]+)""", RegexOption.IGNORE_CASE)
+    // v39: the host is kept too (group 1), so a move to another puffytr.tr subdomain is followed.
+    private val puffytrRe = Regex("""(https?://[a-z0-9.-]*puffytr\.tr)/watch/([a-f0-9]+)""", RegexOption.IGNORE_CASE)
     // Master parsing: resolution + bandwidth + the variant URI on the line after — shared
     // between Aincrad's HLS master and Beta Player's master.txt, same format either way.
     private val streamInfRe = Regex("""#EXT-X-STREAM-INF:([^\n]*)\n\s*([^#\s]\S*)""")
@@ -661,6 +668,22 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // the one global playerBase — whichever such host was seen last. An episode with Aincrad
     // plus another FirePlayer host then asked the wrong server for half its getVideo calls.
     private val apDomains = java.util.concurrent.ConcurrentHashMap<String, String>()
+    // v39: the Beta Player host each "bp:" hash was found on (processBeta used to assume pl.puffytr.tr).
+    private val betaOrigins = java.util.concurrent.ConcurrentHashMap<String, String>()
+    // v39: what both resolvers note about an ap:/bp: match, in one place (the WebView one had its own copy).
+    private fun noteApMatch(m: MatchResult): String {
+        val domain = m.groupValues[1]
+        synchronized(playerBaseLock) {
+            if (!playerBase.contains(domain.substringAfter("://"))) { playerBase = domain; log("resolve: player domain updated to $domain") }
+        }
+        noteApDomain(m.groupValues[2], domain)
+        return m.groupValues[2]
+    }
+    private fun noteBetaMatch(m: MatchResult): String {
+        betaOrigins[m.groupValues[2]] = m.groupValues[1].lowercase()
+        if (betaOrigins.size > 400) betaOrigins.clear() // lookups fall back to pl.puffytr.tr
+        return m.groupValues[2]
+    }
     private fun noteApDomain(hash: String, domain: String) {
         apDomains[hash] = domain
         if (apDomains.size > 400) apDomains.clear() // lookups fall back to playerBase
@@ -669,15 +692,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     private fun classifyEmbedUrl(url: String): String? {
         val host = try { java.net.URI(url).host ?: "" } catch (_: Exception) { "" }
         if (host.isBlank() || host.endsWith(mainHost)) return null // self-redirect = not an embed
-        puffytrRe.find(url)?.let { return "bp:${it.groupValues[1]}" }
-        apRe.find(url)?.let { m ->
-            val domain = m.groupValues[1]
-            synchronized(playerBaseLock) {
-                if (!playerBase.contains(domain.substringAfter("://"))) { playerBase = domain; log("resolve: player domain updated to $domain") }
-            }
-            noteApDomain(m.groupValues[2], domain)
-            return "ap:${m.groupValues[2]}"
-        }
+        puffytrRe.find(url)?.let { return "bp:${noteBetaMatch(it)}" }
+        apRe.find(url)?.let { return "ap:${noteApMatch(it)}" }
         gdRe.find(url)?.let { return "gd:${it.groupValues[1]}" }
         // Anything else goes to loadExtractor(). No keyword whitelist on purpose: if
         // CloudStream has no extractor for the host, loadExtractor() returns false without
@@ -703,7 +719,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         CookieManager.getInstance().getCookie(url)?.takeIf { it.isNotBlank() }
     } catch (_: Throwable) { null }
 
-    // One-shot self-test, run the first time a direct lookup is refused. It replays the same
+    // Self-test, run from the settings' "Run connection test" (v39: no longer automatic). It replays the same
     // request a few different ways and logs what each one gets back, so a single logcat shows
     // whether the block is about the path, the headers, the missing cookies or the client
     // itself — instead of us guessing one variable at a time across builds.
@@ -754,13 +770,25 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         report("player, via CloudflareKiller → $viaKiller")
     }
 
-    private suspend fun resolveViaRedirect(nid: String, episodeUrl: String): String? {
+    // v39: where the site's player frame for an id lives. The site's own /bolum/<ep>/video/<id>
+    // answer names it ("url": "https://anizm.net/player/<id>" in every capture, 2026-10-13); it is
+    // only asked when /player/<id> stops answering, and a new path is then used for every id.
+    @Volatile private var playerUrlTemplate: String? = null // "{id}" marks the id
+    private fun playerUrlFor(nid: String): String =
+        playerUrlTemplate?.let { onCurrentHost(it.replace("{id}", nid)) } ?: "$mainUrl/player/$nid"
+
+    private suspend fun sitePlayerUrl(epId: String, nid: String, episodeUrl: String): String? = try {
+        siteText("$mainUrl/bolum/$epId/video/$nid", xhrHeaders + mapOf("Referer" to onCurrentHost(episodeUrl)), timeout = 8L)
+            ?.let { AnizmParser.playerUrl(it, mainUrl) }
+    } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { null }
+
+    private suspend fun resolveViaRedirect(nid: String, episodeUrl: String, epId: String? = null,
+                                           playerUrl: String = playerUrlFor(nid)): String? {
         // v5: no Sec-Fetch-* headers. Only the Referer is needed (verified), and Sec-Fetch-*
         // without Chrome's matching sec-ch-ua client hints is an inconsistent fingerprint —
         // a plausible reason Cloudflare singled these requests out.
         val cookieHeader = webViewCookies()?.let { mapOf("Cookie" to it) } ?: emptyMap()
         val headers = baseHeaders + navHints + mapOf("Referer" to onCurrentHost(episodeUrl)) + cookieHeader
-        val playerUrl = "$mainUrl/player/$nid"
         lastProbeTarget = nid to episodeUrl
         // Plain request, deliberately not siteGet(): CloudflareKiller can't help here (see
         // looksCfBlocked), and a block should switch strategy, not be retried.
@@ -778,9 +806,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             logW("resolve: /player/$nid refused (http ${r.code}, server=${r.headers["server"]}, cf-mitigated=${r.headers["cf-mitigated"]}, cf-ray=${r.headers["cf-ray"]}) — switching to WebView for ${playerHttpBlockCooldownMs / 60000} min")
             r.closeQuietly()
             playerHttpBlockedUntil = System.currentTimeMillis() + playerHttpBlockCooldownMs
-            try { diagnoseDirectBlock(nid, episodeUrl) }
-            catch (e: kotlinx.coroutines.CancellationException) { throw e }
-            catch (e: Exception) { log("diag: failed: ${e.message}") }
+            // v39: the self-test no longer runs here. It sent 9 more requests to the URL that had
+            // just been refused, and held up the WebView fallback for 7-30 s while it did.
+            // "Run connection test" in the settings still runs it on demand.
             throw PlayerLookupBlocked(r.code)
         }
         if (r.code in 300..399) {
@@ -791,8 +819,20 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             return classifyEmbedUrl(abs)
         }
         if (r.code !in 200..299) {
-            if (r.code == 404) logW("site-change warning: /player/$nid returned 404 (Referer gate changed?)")
-            else log("resolve: /player/$nid http ${r.code}")
+            r.closeQuietly()
+            if (r.code == 404 || r.code == 410) {
+                // v39: ask the site where this id's player is now, the way the episode page does.
+                val moved = epId?.let { sitePlayerUrl(it, nid, episodeUrl) }?.takeIf { it != playerUrl }
+                // Only on the site's own host: this request carries anizm's cookies and same-origin headers.
+                val movedHost = moved?.let { try { java.net.URI(it).host } catch (_: Exception) { null } }
+                if (moved != null && movedHost != null && siteHostRe.matches(movedHost)) {
+                    if (moved.contains(nid)) playerUrlTemplate = moved.substringBeforeLast(nid) + "{id}" + moved.substringAfterLast(nid)
+                    logW("site-change warning: ${playerUrl.substringAfter("//")} answered ${r.code}; the site now names ${moved.substringAfter("//")} — using that")
+                    return resolveViaRedirect(nid, episodeUrl, null, moved)
+                }
+                logW("site-change warning: ${playerUrl.substringAfter("//")} returned ${r.code} (Referer gate changed?)" +
+                    (moved?.let { "; the site names $it, not on its own host — not followed" } ?: ""))
+            } else log("resolve: /player/$nid http ${r.code}")
             return null
         }
         // 200 instead of a redirect: the site went back to serving a page. Look for the
@@ -824,6 +864,10 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     private suspend fun httpResolveEmbeds(
         numIds: List<String>,
         episodeUrl: String,
+        // v39: the episode id for each numId (for the site's own player lookup, see playerUrlFor), and
+        // a stop signal: once the lazy target is met, the lookups still queued behind the gate are dropped.
+        epIdOf: (String) -> String? = { null },
+        stop: () -> Boolean = { false },
         onResolved: (numId: String, embed: String) -> Unit,
     ) {
         coroutineScope {
@@ -831,10 +875,10 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 launch {
                     resolveGate.withPermit {
                         // One refusal stops the rest of the batch — don't keep knocking.
-                        if (System.currentTimeMillis() < playerHttpBlockedUntil) return@withPermit
+                        if (System.currentTimeMillis() < playerHttpBlockedUntil || stop()) return@withPermit
                         paceResolve()
-                        if (System.currentTimeMillis() < playerHttpBlockedUntil) return@withPermit
-                        val embed = try { resolveViaRedirect(nid, episodeUrl) }
+                        if (System.currentTimeMillis() < playerHttpBlockedUntil || stop()) return@withPermit
+                        val embed = try { resolveViaRedirect(nid, episodeUrl, epIdOf(nid)) }
                             catch (e: kotlinx.coroutines.CancellationException) { throw e }
                             catch (_: PlayerLookupBlocked) { null }
                             catch (e: Exception) { log("resolve: $nid failed: ${e.message}"); null }
@@ -992,22 +1036,17 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         // Cross-domain: check for embeds we want to intercept
                         if (host.contains("player")) {
                             apRe.find(url)?.let { m ->
-                                val domain = m.groupValues[1]
-                                synchronized(playerBaseLock) {
-                                    if (!playerBase.contains(domain.substringAfter("://"))) {
-                                        playerBase = domain; log("resolve: player domain updated to $domain")
-                                    }
-                                }
-                                noteApDomain(m.groupValues[2], domain)
-                                if (seenEmbeds.add(m.groupValues[2]))
-                                    handler.post { handleDetectedEmbed("ap:${m.groupValues[2]}") }
+                                val hash = noteApMatch(m)
+                                if (seenEmbeds.add(hash))
+                                    handler.post { handleDetectedEmbed("ap:$hash") }
                                 return emptyResponse()
                             }
                         }
                         if (host.contains("puffytr")) {
                             puffytrRe.find(url)?.let { m ->
-                                if (seenEmbeds.add(m.groupValues[1]))
-                                    handler.post { handleDetectedEmbed("bp:${m.groupValues[1]}") }
+                                val hash = noteBetaMatch(m)
+                                if (seenEmbeds.add(hash))
+                                    handler.post { handleDetectedEmbed("bp:$hash") }
                                 return emptyResponse()
                             }
                         }
@@ -1123,6 +1162,19 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         "yeni-seriler" to "Yeni Seriler",
         "populer" to "Popüler")
 
+    // v39: "yeni-seriler" and "populer" both come from the home page, and CloudStream asks for the
+    // rows at the same time; each used to download and parse it. Now one download serves both
+    // (the second row waits for the first) and is kept as long as the row cache.
+    private val homeRowsLock = Mutex()
+    @Volatile private var homeRows: Pair<Map<String, List<AnizmParser.Card>>, Long>? = null
+    private suspend fun homeRowCards(rowId: String): List<AnizmParser.Card>? = homeRowsLock.withLock {
+        homeRows?.takeIf { System.currentTimeMillis() - it.second < mainPageCacheTtlMs }?.first
+            ?: siteDocument("$mainUrl/", pageHeaders, timeout = 12L)?.let { doc ->
+                setOf("yeni-seriler", "populer", rowId).associateWith { AnizmParser.homeRow(doc, it) }
+                    .also { rows -> if (rows.values.any { it.isNotEmpty() }) homeRows = rows to System.currentTimeMillis() }
+            }
+    }?.get(rowId)
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val paged = request.data == "yeniler"
         if (!paged && page > 1) return newHomePageResponse(request.name, emptyList(), hasNext = false)
@@ -1130,13 +1182,14 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         mainPageCache[cacheKey]?.let { (cached, time) ->
             if (System.currentTimeMillis() - time < mainPageCacheTtlMs) return cached
         }
-        val url = if (paged) "$mainUrl/yeniler?sayfa=$page" else "$mainUrl/"
-        val doc = siteDocument(url, pageHeaders, timeout = 12L)
-            ?: return newHomePageResponse(request.name, emptyList(), hasNext = false)
         // v37: home images keep their URL in data-v3-deferred-src (v36 read only src, so the
         // home rows had no posters); /yeniler pages end at the last rel=next link.
-        val listing = if (paged) AnizmParser.listing(doc, page)
-            else AnizmParser.Listing(AnizmParser.homeRow(doc, request.data), hasNext = false)
+        val listing = if (paged) {
+            val doc = siteDocument("$mainUrl/yeniler?sayfa=$page", pageHeaders, timeout = 12L)
+                ?: return newHomePageResponse(request.name, emptyList(), hasNext = false)
+            AnizmParser.listing(doc, page)
+        } else AnizmParser.Listing(homeRowCards(request.data)
+            ?: return newHomePageResponse(request.name, emptyList(), hasNext = false), hasNext = false)
         val items = listing.cards.map { cardResponse(it) }
         if (page == 1 && items.isEmpty()) logW("site-change warning: main page selectors empty")
         val result = newHomePageResponse(request.name, items, hasNext = listing.hasNext)
@@ -1225,7 +1278,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
                         catch (e: Exception) { log("loadLinks: tr error ($fansubName): ${e.message}"); return@withPermit }
                         // {"success":true,"videos":[{"id","name"}]}; each id is the /player/<id> number
-                        val list = AnizmParser.videos(trText).map { VidInfo(it.id, it.name, fansubName) }
+                        val epId = bolumIdRe.find(trUrl)?.groupValues?.get(1)
+                        val list = AnizmParser.videos(trText).map { VidInfo(it.id, it.name, fansubName, epId) }
                         if (list.isEmpty()) return@withPermit
                         anyTranslatorHadData.set(true)
                         // 4.0: no name whitelist here. It silently dropped every player it didn't
@@ -1303,7 +1357,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // made "reload links" look like it did nothing. That one re-scrapes everything:
         // episode page, translator lists, every player lookup, and Aincrad's signed URL.
         val callNow = System.currentTimeMillis()
-        sniffSpentThisLoad = 0L
+        val sniffSpent = java.util.concurrent.atomic.AtomicLong(0L)
         val sinceLast = lastLoadAt[data]?.let { callNow - it } ?: Long.MAX_VALUE
         lastLoadAt[data] = callNow
         if (lastLoadAt.size > 50) lastLoadAt.entries.removeAll { callNow - it.value > reloadWindowMs }
@@ -1386,7 +1440,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                     }
                     val defer: ((VidInfo, String) -> Unit)? =
                         if (allowDefer) { v, e -> deferredSniffs.add(v to e) } else null
-                    if (processSource(vi, embed, data, trackingCallback, subtitleCallback, defer)) {
+                    if (processSource(vi, embed, data, trackingCallback, subtitleCallback, defer, sniffSpent)) {
                         found.set(true)
                         val b = best.get().let { if (it <= Int.MIN_VALUE + 1) Qualities.Unknown.value else it }
                         if (meetsMin(b)) okSources.incrementAndGet()
@@ -1414,7 +1468,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         }
 
         // onIdDone: an id is finished (its sources ran, or it could not be resolved).
-        suspend fun runWave(wave: List<String>, label: String, onIdDone: (String) -> Unit = {}) {
+        // v39: stop = the goal is met; lookups still queued behind the resolve gate are then dropped.
+        suspend fun runWave(wave: List<String>, label: String, stop: () -> Boolean = { false }, onIdDone: (String) -> Unit = {}) {
             tried += wave
             val uncachedIds = mutableListOf<String>()
             val cachedNow = mutableListOf<Pair<String, String>>()
@@ -1444,7 +1499,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                     // Primary: redirect read, each source dispatched the moment it resolves.
                     // Skipped entirely while direct lookups are being refused.
                     if (System.currentTimeMillis() >= playerHttpBlockedUntil) {
-                        try { httpResolveEmbeds(uncachedIds, data) { id, embed -> accept(id, embed) } }
+                        try {
+                            httpResolveEmbeds(uncachedIds, data, { id -> byNumId[id]?.firstNotNullOfOrNull { it.epId } }, stop) { id, embed -> accept(id, embed) }
+                        }
                         catch (e: kotlinx.coroutines.CancellationException) { throw e }
                         catch (e: Exception) { log("loadLinks: http resolve error: ${e.message}") }
                     } else log("loadLinks: direct lookups blocked recently, using WebView")
@@ -1453,7 +1510,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                     val missing = uncachedIds.filter { id ->
                         !embedMap.containsKey(id) && byNumId[id]?.any { settings.isRecognised(it.name) } == true
                     }
-                    if (missing.isNotEmpty()) {
+                    if (missing.isNotEmpty() && stop()) log("loadLinks: $label: goal met, ${missing.size} unresolved not tried")
+                    else if (missing.isNotEmpty()) {
                         log("loadLinks: ${missing.size} unresolved, trying WebView fallback")
                         try { resolveEmbeds(missing, data) { id, embed -> accept(id, embed) } }
                         catch (e: kotlinx.coroutines.CancellationException) { throw e }
@@ -1473,7 +1531,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         coroutineScope {
             for ((i, wave) in w1.withIndex()) {
                 val pending = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>()).apply { addAll(wave) }
-                val job = launch { runWave(wave, "wave ${i + 1}/${w1.size}") { id -> pending.remove(id) } }
+                val job = launch { runWave(wave, "wave ${i + 1}/${w1.size}", { lazy && okSources.get() >= target }) { id -> pending.remove(id) } }
                 while (job.isActive) {
                     if (lazy && okSources.get() >= target) break
                     if (lazy && i < w1.lastIndex && okSources.get() + pending.size < target) {
@@ -1514,7 +1572,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             log("loadLinks: no enabled source worked, trying ${disabledIds.size} disabled as last resort")
             val w2 = waves(disabledIds)
             for ((i, wave) in w2.withIndex()) {
-                runWave(wave, "last-resort wave ${i + 1}/${w2.size}")
+                runWave(wave, "last-resort wave ${i + 1}/${w2.size}", { found.get() })
                 if (found.get()) break // last resort: stop at the first thing that plays
             }
             flushDeferred({ found.get() }, "last resort")
@@ -1757,7 +1815,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     private val sniffHostCooldownMs = 15 * 60 * 1000L
     // Whole-episode cap. Three Sistenn entries on one episode must not turn into three full
     // budgets of waiting before the link list appears.
-    @Volatile private var sniffSpentThisLoad = 0L
+    // v39: counted per load (loadLinksWork's sniffSpent), not in one field every load reset and added to.
     private val sniffBudgetPerLoadMs = 45_000L
 
     private fun sniffHostOnCooldown(url: String): Boolean {
@@ -2300,6 +2358,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // v22: when set, a source that would need a browser sniff is handed back through
         // this instead of sniffed now (loadLinks retries it later, only if still needed).
         deferSniff: ((VidInfo, String) -> Unit)? = null,
+        // v39: this load's time spent in browser sniffs (the per-episode cap).
+        sniffSpent: java.util.concurrent.atomic.AtomicLong = java.util.concurrent.atomic.AtomicLong(0L),
     ): Boolean {
         val label = "${vi.fansub} - ${vi.name.replace(adsRe, "").trim()}"
         log("step4: $label embed=$embed")
@@ -2308,7 +2368,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         if (settings.groupOf(vi.name).key == "aincrad" && !embed.startsWith("ap:"))
             logW("site-change warning: Aincrad source ${vi.fansub}/${vi.name} resolved to $embed, not an anizmplayer /video/ link")
 
-        if (embed.startsWith("ex:")) return processExtractorSource(vi, embed, data, label, callback, subtitleCallback, deferSniff)
+        if (embed.startsWith("ex:")) return processExtractorSource(vi, embed, data, label, callback, subtitleCallback, deferSniff, sniffSpent)
         if (embed.startsWith("ap:")) return processAincrad(vi, embed, data, label, callback, subtitleCallback, deferSniff)
         if (embed.startsWith("gd:")) return processGDrive(vi, embed, data, label, callback, subtitleCallback, deferSniff)
         if (embed.startsWith("bp:")) return processBeta(vi, embed, data, label, callback, subtitleCallback, deferSniff)
@@ -2320,7 +2380,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     private suspend fun processExtractorSource(
         vi: VidInfo, embed: String, data: String, label: String,
         callback: (ExtractorLink) -> Unit, subtitleCallback: (SubtitleFile) -> Unit,
-        deferSniff: ((VidInfo, String) -> Unit)?,
+        deferSniff: ((VidInfo, String) -> Unit)?, sniffSpent: java.util.concurrent.atomic.AtomicLong,
     ): Boolean {
         val exUrl = embed.removePrefix("ex:")
         log("step4: $label -> loadExtractor $exUrl")
@@ -2367,7 +2427,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 deferSniff(vi, embed)
                 return false
             }
-            val overBudget = sniffSpentThisLoad >= sniffBudgetPerLoadMs
+            val overBudget = sniffSpent.get() >= sniffBudgetPerLoadMs
             val skip = cached == null && (sniffHostOnCooldown(exUrl) || overBudget)
             if (skip) log("step4: skipping sniff for $label (${if (overBudget) "episode sniff budget spent" else "host on cooldown"})")
             val sniffed = cached ?: if (skip) null else try {
@@ -2379,7 +2439,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                         ?: sniffHlsViaWebView(exUrl, "$mainUrl/")
                 }
                     .also {
-                        sniffSpentThisLoad += System.currentTimeMillis() - t0
+                        sniffSpent.addAndGet(System.currentTimeMillis() - t0)
                         noteSniffResult(exUrl, it != null)
                     }
             }
@@ -2724,14 +2784,15 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // unauthenticated standard HLS master.
         val hash = embed.removePrefix("bp:")
         log("beta: hash=$hash for $label")
-        val watchRef = "https://pl.puffytr.tr/watch/$hash"
+        val betaOrigin = betaOrigins[hash] ?: "https://pl.puffytr.tr"
+        val watchRef = "$betaOrigin/watch/$hash"
         val betaHeaders = mapOf("User-Agent" to ua, "Referer" to watchRef)
-        val masterUrl = "https://pl.puffytr.tr/stream/$hash/master.txt"
+        val masterUrl = "$betaOrigin/stream/$hash/master.txt"
         val body = try {
             app.get(masterUrl, headers = betaHeaders, timeout = 10L).text
         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
         catch (e: Exception) { log("beta: master.txt fetch failed: ${e.message}"); return false }
-        if (!body.trimStart().startsWith("#EXTM3U")) { log("beta: master.txt not a valid playlist"); return false }
+        if (!body.trimStart().startsWith("#EXTM3U")) { logW("site-change warning: beta: ${masterUrl.substringAfter("//").substringBefore('/')} master.txt is not a playlist (${oneLine(body, 60)})"); return false }
         val variants = parseVariants(body, masterUrl)
         if (variants.isEmpty()) { log("beta: no parseable variants in master.txt"); return false }
         log("beta: master lists ${variants.joinToString { "${it.height}p ${it.url.substringAfterLast('/').substringBefore('?').take(40)}${if (it.url.contains('?')) "?…" else ""}" }}")
@@ -2756,7 +2817,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
 
     /** The playlist with #EXT-X-DISCONTINUITY added where the timestamps restart, or null if none do. */
     private suspend fun markJoins(playlistUrl: String, headers: Map<String, String>): String? {
-        val text = app.get(playlistUrl, headers = headers, timeout = 10L).text
+        val text = playlistText(playlistUrl, headers, 10L)
         if (!text.trimStart().startsWith("#EXTM3U") || text.contains("#EXT-X-DISCONTINUITY")) return null
         val lines = text.lines()
         class Seg(val dur: Double, val start: Double, val line: Int, val url: String)
@@ -2950,14 +3011,19 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 logW("sistenn-api: $host has a new player script ($name, was $known) — if its links stop, its API key may have changed")
             if (known != name) settings.setPlayerScript(host, name)
         }
-        for ((path, dest) in listOf(script to "script", css to "style")) {
-            if (path == null || !sistennAssetsSeen.add("$origin$path")) continue
-            val u = try { java.net.URI("$origin/").resolve(path).toString() } catch (_: Exception) { continue }
-            try {
-                browserGet(u, clientHints + mapOf("User-Agent" to ua, "Accept" to (if (dest == "style") "text/css,*/*;q=0.1" else "*/*"),
-                    "Origin" to origin, "Sec-Fetch-Site" to "same-origin", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Dest" to dest,
-                    "Referer" to "$origin/", "Accept-Language" to acceptLang), 15L).closeQuietly()
-            } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) {}
+        // v39: script and stylesheet at the same time, as a browser fetches them (they were one after the other).
+        coroutineScope {
+            for ((path, dest) in listOf(script to "script", css to "style")) {
+                if (path == null || !sistennAssetsSeen.add("$origin$path")) continue
+                val u = try { java.net.URI("$origin/").resolve(path).toString() } catch (_: Exception) { continue }
+                launch {
+                    try {
+                        browserGet(u, clientHints + mapOf("User-Agent" to ua, "Accept" to (if (dest == "style") "text/css,*/*;q=0.1" else "*/*"),
+                            "Origin" to origin, "Sec-Fetch-Site" to "same-origin", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Dest" to dest,
+                            "Referer" to "$origin/", "Accept-Language" to acceptLang), 15L).closeQuietly()
+                    } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) {}
+                }
+            }
         }
     }
 
@@ -3027,20 +3093,29 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         } catch (_: Exception) { null }
         log("sistenn-api: ${v.optString("title").take(60)} — sources ${sources.joinToString { it.kind }}")
         val streamHeaders = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin, "Accept" to "*/*")
-        // v39: every source is checked at once. One after another, the backup search took 16 s
+        // Sources are checked in parallel: one after another, the backup search took 16 s
         // after Tiktok was already found (device log 2026-09-26, build 31), and held up the
         // episode's next wave of sources. The first working source is still awaited in full;
         // a second one only if it is ready within sistennBackupWaitMs of the start.
+        // v39: two at a time, not all at once. Each check is ~5 requests and at most two sources are
+        // listed; the next one starts when a running one turns out unreadable.
         val t0 = System.currentTimeMillis()
         var sourcesEmitted = 0
         coroutineScope {
-            val checks = sources.map { src -> src to async {
-                try { checkSistennSource(src, pkQuery, streamHeaders) }
+            val checks = ArrayList<Pair<SistennSource, kotlinx.coroutines.Deferred<SistennChecked?>>>()
+            var nextCheck = 0
+            fun startNextCheck() { synchronized(checks) { checks.getOrNull(nextCheck++) }?.second?.start() }
+            for (src in sources) checks += src to async(start = kotlinx.coroutines.CoroutineStart.LAZY) {
+                (try { checkSistennSource(src, pkQuery, streamHeaders) }
                 catch (e: kotlinx.coroutines.CancellationException) { throw e }
-                catch (e: Exception) { log("sistenn-api: ${src.kind} check failed: ${e.javaClass.simpleName}"); null }
-            } }
+                catch (e: Exception) { log("sistenn-api: ${src.kind} check failed: ${e.javaClass.simpleName}"); null })
+                    .also { if (it == null) startNextCheck() }
+            }
+            repeat(2) { startNextCheck() }
             for ((src, job) in checks) {
                 if (sourcesEmitted >= 2) break
+                // A backup that never had to start is not started now.
+                if (sourcesEmitted > 0 && !job.isActive && !job.isCompleted) continue
                 val c = if (sourcesEmitted == 0) job.await()
                     else withTimeoutOrNull((t0 + sistennBackupWaitMs - System.currentTimeMillis()).coerceAtLeast(1L)) { job.await() }
                 if (c == null) {
@@ -3180,6 +3255,13 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             for (v in variants) {
                 launch {
                     gate.withPermit {
+                        // v39: a playlist this load already downloaded (the join check, the size estimate) is the answer.
+                        if (recentPlaylist(v.url) != null) {
+                            callback(newExtractorLink(source = cleanLabel, name = "$cleanLabel ${v.height}p" + formatSize(sizes[v.height], isEstimate = true),
+                                url = v.url, type = ExtractorLinkType.M3U8) { quality = v.height; this.referer = referer; this.headers = headers })
+                            any.set(true)
+                            return@withPermit
+                        }
                         val probe = try {
                             app.get(v.url, headers = headers + mapOf("Range" to "bytes=0-4095"), timeout = 8L)
                         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
@@ -3260,10 +3342,29 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // returns text/html with no length.) Cost: ~15 tiny requests per Aincrad source, run
     // 4 at a time under a 4s budget. Can be turned off in the extension settings.
     private data class RenditionStats(val bytesPerSec: Double, val durationSec: Double)
+    private val sizeCheckedHosts = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
     private data class Seg(val dur: Double, val url: String, val byteLen: Long?)
 
+    // v39: a playlist read by more than one step (Beta's join check, the size estimate, the probe in
+    // emitVariants, a 24-sample re-check) is downloaded once and reused for 2 minutes. The URLs are
+    // per video (and often signed), and these VOD playlists don't change; only real playlists are kept.
+    private val playlistTexts = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
+    private val playlistTextTtlMs = 2 * 60 * 1000L
+    private fun recentPlaylist(url: String): String? =
+        playlistTexts[url]?.takeIf { System.currentTimeMillis() - it.second < playlistTextTtlMs }?.first
+    private suspend fun playlistText(url: String, headers: Map<String, String>, timeoutSec: Long): String {
+        recentPlaylist(url)?.let { return it }
+        val text = app.get(url, headers = headers, timeout = timeoutSec).text
+        if (text.trimStart().startsWith("#EXTM3U")) {
+            val now = System.currentTimeMillis()
+            playlistTexts.entries.removeAll { now - it.value.second >= playlistTextTtlMs }
+            if (playlistTexts.size < 60) playlistTexts[url] = text to now
+        }
+        return text
+    }
+
     private suspend fun sampleRendition(playlistUrl: String, headers: Map<String, String>, samples: Int): RenditionStats? {
-        val text = try { app.get(playlistUrl, headers = headers, timeout = 8L).text }
+        val text = try { playlistText(playlistUrl, headers, 8L) }
             catch (e: kotlinx.coroutines.CancellationException) { throw e }
             catch (_: Exception) { return null }
         return sampleSegments(text, playlistUrl, headers, samples)
@@ -3336,7 +3437,10 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // v8: verify one reported size is real. Ask for the LAST byte the server claims the
         // segment has: a truthful size answers 206 with one byte, an inflated one answers
         // 416 (Range Not Satisfiable). Costs one request and no meaningful data.
+        // v39: once per host per session. The check is about how the server reports sizes, not
+        // about this playlist, and it cost one request per quality of every source.
         val check = sizes.entries.minByOrNull { it.value }
+            ?.takeIf { e -> (try { java.net.URI(segs[e.key].url).host } catch (_: Exception) { null }).let { it == null || it !in sizeCheckedHosts } }
         if (check != null) {
             val claimed = check.value
             val ok = try {
@@ -3346,7 +3450,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 rr.closeQuietly()
                 if (code == 416 || (reported != null && reported != claimed))
                     log("size: reported size looks wrong (claimed $claimed, tail request → $code, total=$reported)")
-                code != 416 && (reported == null || reported == claimed)
+                (code != 416 && (reported == null || reported == claimed)).also { good ->
+                    if (good) try { java.net.URI(segs[check.key].url).host?.let { sizeCheckedHosts.add(it) } } catch (_: Exception) {}
+                }
             } catch (e: kotlinx.coroutines.CancellationException) { throw e }
             catch (_: Exception) { true } // network hiccup: don't throw the estimate away over it
             if (!ok) return null
@@ -3373,16 +3479,19 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     }
 
     // Split-audio master (Aincrad): top video rendition + the audio rendition.
-    private suspend fun estimateSplitAudioBytes(master: String, masterUrl: String, variants: List<Variant>, headers: Map<String, String>): Long? {
-        val top = variants.firstOrNull() ?: return null
-        val video = sampleVideoChecked(top, headers) ?: return null
+    private suspend fun estimateSplitAudioBytes(master: String, masterUrl: String, variants: List<Variant>, headers: Map<String, String>): Long? = coroutineScope {
+        val top = variants.firstOrNull() ?: return@coroutineScope null
         val audioUrl = audioMediaUriRe.find(master)?.groupValues?.get(1)
             ?.let { try { java.net.URI(masterUrl).resolve(it).toString() } catch (_: Exception) { null } }
         // Audio is near-constant bitrate AAC, so 3 samples is plenty.
-        val audio = audioUrl?.let { sampleRendition(it, headers, 3) }
+        // v39: sampled alongside the video rendition instead of after it (same requests, ~3-4 round-trips sooner).
+        val audioJob = audioUrl?.let { u -> async { sampleRendition(u, headers, 3) } }
+        val video = sampleVideoChecked(top, headers)
+        if (video == null) { audioJob?.cancel(); return@coroutineScope null }
+        val audio = audioJob?.await()
         val bytes = (video.bytesPerSec + (audio?.bytesPerSec ?: 0.0)) * video.durationSec
         log("size: split-audio ${top.height}p ≈ ${(bytes / 1_048_576).toLong()}MB (video ${(video.bytesPerSec * 8 / 1000).toLong()} kbps + audio ${audio?.let { "${(it.bytesPerSec * 8 / 1000).toLong()} kbps" } ?: "missing"}, ${(video.durationSec / 60).toInt()} min)")
-        return bytes.toLong()
+        bytes.toLong()
     }
 
     /**
@@ -3408,7 +3517,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
 
     /** Total runtime of a media playlist, from its EXTINF lines. One request. */
     private suspend fun playlistDurationSec(url: String, headers: Map<String, String>): Double? {
-        val text = try { app.get(url, headers = headers, timeout = 8L).text }
+        val text = try { playlistText(url, headers, 8L) }
             catch (e: kotlinx.coroutines.CancellationException) { throw e }
             catch (_: Exception) { return null }
         if (!text.trimStart().startsWith("#EXTM3U")) return null
@@ -3788,8 +3897,7 @@ internal class LocalHlsServer(
         try { kotlinx.coroutines.runBlocking { app.get(u, headers = h, timeout = 10L) } } catch (_: Exception) { null } },
 ) {
     private data class Entry(val url: String, val query: String, val headers: Map<String, String>, val created: Long,
-                             val cached: String? = null, val strip: Boolean = false, val token: TokenState? = null,
-                             val beat: Heartbeat? = null)
+                             val strip: Boolean = false, val token: TokenState? = null, val beat: Heartbeat? = null)
 
     /**
      * v41: the page's "playing" signal. Sistenn's player calls /api/v1/player?t=… every 10 s
@@ -3870,7 +3978,10 @@ internal class LocalHlsServer(
         entries.entries.removeAll { now - it.value.created > entryTtlMs }
         rewritten.keys.retainAll(entries.keys)
         val key = java.util.UUID.randomUUID().toString().replace("-", "").take(16)
-        entries[key] = Entry(url, query, headers, now, cachedText?.takeIf { it.trimStart().startsWith("#EXTM3U") }, stripSegments, token, beat)
+        val entry = Entry(url, query, headers, now, strip = stripSegments, token = token, beat = beat)
+        entries[key] = entry
+        // v39: a copy in hand is rewritten here, once, and only the result is kept (both were kept for 6 h).
+        cachedText?.takeIf { it.trimStart().startsWith("#EXTM3U") }?.let { rewritten[key] = rewrite(it, entry, key, port).toByteArray(Charsets.UTF_8) }
         return "http://127.0.0.1:$port/hls/$key.m3u8"
     }
 
@@ -3878,7 +3989,7 @@ internal class LocalHlsServer(
     // is churn a TV box's CPU notices; idle threads are reused, and dropped after 60 s.
     private val pool = java.util.concurrent.Executors.newCachedThreadPool { r -> Thread(r, "anizm-hls-conn").apply { isDaemon = true } }
     // v43: a VOD playlist the page fetched never changes, so it is rewritten once per entry.
-    private val rewritten = java.util.concurrent.ConcurrentHashMap<String, Pair<Int, ByteArray>>() // key -> (port, body)
+    private val rewritten = java.util.concurrent.ConcurrentHashMap<String, ByteArray>() // key -> body
 
     @Synchronized private fun ensureStarted(): Int? {
         socket?.takeIf { !it.isClosed }?.let { return it.localPort }
@@ -3983,12 +4094,8 @@ internal class LocalHlsServer(
                 }
                 // v33: VOD playlists (ENDLIST) don't change, so the copy the sniff page fetched
                 // through the WebView is served as-is; only without one is the host asked.
-                entry.cached?.let {
-                    val port = sock.localPort
-                    val body = rewritten[key]?.takeIf { c -> c.first == port }?.second ?: rewrite(it, entry, key, port).toByteArray(Charsets.UTF_8).also { b ->
-                        rewritten[key] = port to b
-                        log("hls-proxy: served ${entry.url.substringBefore('?').substringAfterLast('/')} from the page's copy")
-                    }
+                rewritten[key]?.let { body ->
+                    log("hls-proxy: served ${entry.url.substringBefore('?').substringAfterLast('/')} from the page's copy")
                     reply(200, "OK", body, "application/vnd.apple.mpegurl"); return
                 }
                 var failure = ""
