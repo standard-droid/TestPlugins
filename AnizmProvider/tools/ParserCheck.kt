@@ -1,6 +1,9 @@
-// Checks AnizmParser against saved copies of anizm.net (tools/fixtures, gzipped, captured
-// 2026-10-12 with session tokens blanked out). Not part of the Gradle build — run
-// tools/check-parser.sh. Exits non-zero if any check fails.
+// Checks AnizmParser against saved copies of anizm.net. Not part of the Gradle build — run
+// tools/check-parser.sh <folder>. Exits non-zero if any check fails.
+//
+// The saved pages are deliberately not in the repo. They come from running a capture script in
+// the browser console on anizm.net (one JSON file with every page), split into gzipped
+// <name>.html.gz / <name>.json.gz files named the way the checks below read them.
 //
 // Besides the pages as saved, it re-runs the key checks on deliberately damaged copies
 // (renamed classes, removed attributes) to prove each fallback actually catches that change.
