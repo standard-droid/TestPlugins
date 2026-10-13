@@ -316,6 +316,19 @@ object AnizmParser {
         return out.map { (u, n) -> Translator(u, n) }
     }
 
+    /**
+     * /bolum/<epId>/video/<id> JSON: {"success":true,"url":"https://anizm.net/player/<id>","playerOrigin":null,…},
+     * the address the episode page opens in its player frame. A relative url is resolved against
+     * playerOrigin when that is set, otherwise against [base]. Null when there is no usable url.
+     */
+    fun playerUrl(text: String, base: String): String? {
+        val o = try { JSONObject(text.trim()) } catch (_: Exception) { return null }
+        if (!o.optBoolean("success", true)) return null
+        val u = o.str("url") ?: return null
+        val origin = o.str("playerOrigin")?.takeIf { it.startsWith("http") }
+        return absUrl(origin ?: base, u)?.takeIf { it.startsWith("http") }
+    }
+
     /** /bolum/<epId>/cevirmen/<trId> JSON: {"success":true,"videos":[{"id","name"}]}. */
     fun videos(text: String): List<Video> {
         val arr: JSONArray = try {

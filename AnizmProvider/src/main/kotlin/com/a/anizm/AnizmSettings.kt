@@ -222,8 +222,8 @@ class AnizmSettings(private val prefs: SharedPreferences) {
             note("Needed for Sistenn and similar (their stream link is built by the page's own JavaScript). Costs a few seconds per source, and only runs after the normal method finds nothing.")
             val deferBox = check("Try in-app-browser sources last (faster start)", settings.deferBrowserSources)
             note("On: with lazy loading, Sistenn and similar wait until the other sources have been tried, and are skipped if those already reach the target. Off: the order above is followed exactly.")
-            val sizeBox = check("Show estimated file size for Aincrad / Beta Player", settings.estimateSizes)
-            note("Costs ~15 tiny extra requests per source and up to 4s before that source appears. Google Drive sizes are exact and need no extra requests.")
+            val sizeBox = check("Show estimated file size for Aincrad, Beta Player and Sistenn", settings.estimateSizes)
+            note("Costs about 15-40 tiny extra requests per source and up to 8 s before that source appears; each size is then kept for a day. Google Drive sizes are exact and need no extra requests.")
 
             val scroll = ScrollView(context).apply { addView(root) }
 
