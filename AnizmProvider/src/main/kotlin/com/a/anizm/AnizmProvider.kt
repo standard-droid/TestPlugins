@@ -65,7 +65,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         }
         step("Home rows") {
             val doc = siteDocument("$mainUrl/", pageHeaders) ?: return@step false to "page didn't load"
-            val rows = listOf("son-bolumler", "populer", "yeni-seriler").map { it to AnizmParser.homeRow(doc, it) }
+            val rows = listOf("son-bolumler", "populer", "yeni-seriler").map { it to AnizmParser.homeRow(doc, it) } +
+                ("banners" to AnizmParser.heroSlides(doc))
             rows.all { (_, r) -> r.isNotEmpty() && r.all { it.poster != null } } to
                 rows.joinToString { (id, r) -> "$id ${r.size} (${r.count { it.poster == null }} without poster)" }
         }
@@ -1157,7 +1158,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // ── Home page ─────────────────────────────────────────────────────────────
     // v36 (site revamp 2026-10): /anime-izle is gone (redirects home). Latest episodes are
     // /yeniler?sayfa=N; the home page has the "Popüler" and "Yeni Seriler" rows, unpaged.
-    override val mainPage = mainPageOf(
+    // v40: the home page's banner slider ("Öne çıkan animeler") first, as wide cards with the slider's
+    // own full-size images (1672x941 up to 3840x2160).
+    override val mainPage = listOf(MainPageData(name = "Öne Çıkanlar", data = "one-cikanlar", horizontalImages = true)) + mainPageOf(
         "yeniler" to "Son Eklenen Bölümler",
         "yeni-seriler" to "Yeni Seriler",
         "populer" to "Popüler")
@@ -1166,12 +1169,19 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // rows at the same time; each used to download and parse it. Now one download serves both
     // (the second row waits for the first) and is kept as long as the row cache.
     private val homeRowsLock = Mutex()
+    private val heroBanners = java.util.concurrent.ConcurrentHashMap<String, String>() // anime url -> banner
     @Volatile private var homeRows: Pair<Map<String, List<AnizmParser.Card>>, Long>? = null
     private suspend fun homeRowCards(rowId: String): List<AnizmParser.Card>? = homeRowsLock.withLock {
         homeRows?.takeIf { System.currentTimeMillis() - it.second < mainPageCacheTtlMs }?.first
             ?: siteDocument("$mainUrl/", pageHeaders, timeout = 12L)?.let { doc ->
-                setOf("yeni-seriler", "populer", rowId).associateWith { AnizmParser.homeRow(doc, it) }
-                    .also { rows -> if (rows.values.any { it.isNotEmpty() }) homeRows = rows to System.currentTimeMillis() }
+                setOf("one-cikanlar", "yeni-seriler", "populer", rowId)
+                    .associateWith { if (it == "one-cikanlar") AnizmParser.heroSlides(doc) else AnizmParser.homeRow(doc, it) }
+                    .also { rows ->
+                        if (rows.values.any { it.isNotEmpty() }) homeRows = rows to System.currentTimeMillis()
+                        // v40: the anime pages have no wide image; a featured anime's banner becomes its background there.
+                        rows["one-cikanlar"]?.forEach { c -> c.poster?.let { heroBanners[c.url] = it } }
+                        if (heroBanners.size > 100) heroBanners.clear()
+                    }
             }
     }?.get(rowId)
 
@@ -1192,7 +1202,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             ?: return newHomePageResponse(request.name, emptyList(), hasNext = false), hasNext = false)
         val items = listing.cards.map { cardResponse(it) }
         if (page == 1 && items.isEmpty()) logW("site-change warning: main page selectors empty")
-        val result = newHomePageResponse(request.name, items, hasNext = listing.hasNext)
+        // v40: the request carries the row's card layout (wide for the banner row).
+        val result = newHomePageResponse(request, items, hasNext = listing.hasNext)
         if (items.isNotEmpty()) {
             mainPageCache[cacheKey] = result to System.currentTimeMillis()
             synchronized(mainPageCacheLock) {
@@ -1222,6 +1233,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         log("load: '${anime.title}' poster=${anime.poster != null} plot=${(anime.plot?.length ?: 0) > 0} eps=${episodes.size} eng=$eng jap=$jap syns=${syns?.size ?: 0}")
         return newAnimeLoadResponse(anime.title, url, TvType.Anime) {
             posterUrl = anime.poster; this.plot = anime.plot; this.year = anime.year; this.tags = anime.tags.ifEmpty { null }
+            this.backgroundPosterUrl = heroBanners[url] ?: heroBanners[onCurrentHost(url)]
             this.engName = eng
             this.japName = jap
             this.synonyms = syns
