@@ -40,6 +40,7 @@ fun main() {
         val row = AnizmParser.homeRow(home, id)
         check("$id: ≥$min cards", row.size >= min, row.size)
         check("$id: every card has a poster (home uses data-v3-deferred-src)", row.isNotEmpty() && row.all { it.poster != null }, row.count { it.poster == null }.let { "$it missing" })
+        check("$id: posters are the large covers (<id>l.webp)", row.all { it.poster?.matches(Regex(""".*/storage/pcovers/\d+l\.webp""")) == true }, row.take(2).map { it.poster })
         check("$id: titles clean", row.all { it.title.isNotBlank() && !it.title.endsWith("posteri") }, row.take(3).map { it.title })
     }
     val latest = AnizmParser.homeRow(home, "son-bolumler")
@@ -47,11 +48,21 @@ fun main() {
     val renamed = home.damaged { select("article").forEach { it.tagName("div").removeAttr("class") } }
     check("fallback: row found with <article>/classes gone", AnizmParser.homeRow(renamed, "populer").size >= 10, AnizmParser.homeRow(renamed, "populer").size)
 
+    section("Home page banner slider")
+    val hero = AnizmParser.heroSlides(home)
+    check("5 slides", hero.size == 5, hero.map { it.title })
+    check("slides link to the anime page", hero.firstOrNull()?.url == "$site/ao-no-hako-season-2" && hero.none { it.url.contains("bolum") }, hero.map { it.url })
+    check("wide images (landscape_*.webp)", hero.all { it.poster?.matches(Regex("""https://anizm\.net/storage/pcovers/landscape_[0-9a-f]+\.webp""")) == true }, hero.map { it.poster })
+    check("full title from the detail button, not the cut-off h1", hero.any { it.title.startsWith("Magical★Explorer") && !it.title.endsWith("...") && it.title.endsWith("ikiru", ignoreCase = true) || it.title.length > 70 }, hero.map { it.title })
+    val heroBare = home.damaged { select(".v3-hero-slide").removeAttr("class"); select(".v3-info-action").removeAttr("class") }
+    check("fallback: slides found with their classes gone", AnizmParser.heroSlides(heroBare).map { it.url } == hero.map { it.url }, AnizmParser.heroSlides(heroBare).map { it.url })
+
     section("/yeniler")
     val y1 = AnizmParser.listing(doc("yeniler_sayfa_1.html", "$site/yeniler?sayfa=1"), 1)
     check("page 1: ≥20 anime", y1.cards.size >= 20, y1.cards.size)
     check("page 1: has next", y1.hasNext)
     check("page 1: posters", y1.cards.all { it.poster != null })
+    check("page 1: large covers", y1.cards.all { it.poster?.endsWith("l.webp") == true }, y1.cards.firstOrNull()?.poster)
     val y2 = AnizmParser.listing(doc("yeniler_sayfa_2.html", "$site/yeniler?sayfa=2"), 2)
     check("page 2: ≥20 anime, has next", y2.cards.size >= 20 && y2.hasNext, y2.cards.size)
     val y1Doc = doc("yeniler_sayfa_1.html", "$site/yeniler?sayfa=1")
@@ -68,6 +79,11 @@ fun main() {
     check("/arama?q=one piece: finds One Piece", op.any { it.url == "$site/one-piece" }, op.size)
     val api = AnizmParser.searchApi(text("searchAnime_frieren.json"), site)
     check("/searchAnime frieren: 3 hits with slug/poster", api.size == 3 && api.all { it.slug.isNotBlank() && it.poster?.contains("/storage/pcovers/") == true }, api.map { it.slug })
+    check("/searchAnime: large covers", api.all { it.poster?.endsWith("l.webp") == true }, api.firstOrNull()?.poster)
+    check("largeCover: already large / not a cover / query kept",
+        AnizmParser.largeCover("$site/storage/pcovers/3l.webp") == "$site/storage/pcovers/3l.webp" &&
+            AnizmParser.largeCover("$site/upload/assets/x.webp") == "$site/upload/assets/x.webp" &&
+            AnizmParser.largeCover("$site/storage/pcovers/3.webp?v=2") == "$site/storage/pcovers/3l.webp?v=2")
     check("/searchAnime haystack has the English title", api.any { it.haystack.contains("beyondjourneysend") })
     check("/searchAnime naruto: hits", AnizmParser.searchApi(text("searchAnime_naruto.json"), site).size >= 5)
     check("/searchAnime: a 500 body parses to nothing, not a crash", AnizmParser.searchApi("""{"message":"Server Error"}""", site).isEmpty())

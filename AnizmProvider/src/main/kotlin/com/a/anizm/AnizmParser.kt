@@ -71,6 +71,14 @@ object AnizmParser {
     // use src directly.
     private val imgAttrs = listOf("src", "data-v3-deferred-src", "data-src", "data-original", "data-lazy-src")
 
+    // Listings (home rows, /yeniler, /arama, /searchAnime) link the small cover, /storage/pcovers/<id>.webp
+    // (225x318); the anime page uses <id>l.webp (425x600). Checked 2026-10-15 on 16 covers, new and old:
+    // every one has the l file, and where the upload was small it is the same image, never a worse one.
+    private val smallCoverRe = Regex("""(/storage/pcovers/\d+)\.(webp|jpe?g|png)(?=$|\?)""", RegexOption.IGNORE_CASE)
+
+    /** The large version of a site cover URL; anything else is returned unchanged. */
+    fun largeCover(url: String?): String? = url?.replace(smallCoverRe, "$1l.$2")
+
     fun imageUrl(el: Element?): String? {
         if (el == null) return null
         val imgs = if (el.tagName() == "img") listOf(el) else el.select("img")
@@ -118,7 +126,7 @@ object AnizmParser {
         val url = if (isEpisode) animeUrlFromEpisodeUrl(href, el.selectFirst(".v3-card-copy span, .v3-card-tag")?.text()) else href
         val year = el.selectFirst(".v3-catalog-card-copy p, .v3-catalog-preview-meta span")?.text()?.trim()
             ?.takeIf { yearRe.matches(it) }?.toIntOrNull()
-        return Card(title, url, imageUrl(img), year)
+        return Card(title, url, largeCover(imageUrl(img)), year)
     }
 
     private fun cards(els: Collection<Element>) = els.mapNotNull { card(it) }.distinctBy { it.url }
@@ -128,6 +136,36 @@ object AnizmParser {
     // Fallback for a renamed card class: any link with a poster image inside the main content.
     private fun looseCards(root: Element) =
         root.select("a[href]:has(img)").filter { it.parents().none { p -> p.tagName() in setOf("header", "nav", "footer") } }
+
+    /**
+     * The home page's banner slider (section.v3-hero, "Öne çıkan animeler"): one card per slide, with
+     * the slide's wide image (/storage/pcovers/landscape_<hash>.webp, 1672x941 up to 3840x2160) as
+     * poster. The h1 is cut off for long titles ("…Game Ch..."), so the full name comes from the
+     * detail button's aria-label ("<title> anime detay sayfası") first.
+     */
+    fun heroSlides(doc: Document): List<Card> {
+        val slides = doc.select("article.v3-hero-slide, [data-v3-slide]")
+            .ifEmpty { doc.select("[data-v3-slider] article, section.v3-hero article") }
+        return slides.mapNotNull { s ->
+            // Fallbacks: the link labelled as the detail page, then any link that is not an episode or
+            // trailer (those end in "-izle"; anime pages don't), a search or a genre.
+            val info = s.selectFirst("a.v3-info-action[href]")
+                ?: s.select("a[href]").firstOrNull { heroLabelRe.containsMatchIn(it.attr("aria-label")) }
+                ?: s.select("a[href]").firstOrNull { a ->
+                    val h = a.attr("href").substringBefore('?').trimEnd('/')
+                    !h.endsWith("-izle") && !episodeHrefRe.containsMatchIn(h) && !a.attr("href").contains("/arama") && !h.contains("kategori")
+                }
+            val url = info?.attr("abs:href")?.ifBlank { null }
+                ?: s.selectFirst("a.v3-watch-action[href]")?.attr("abs:href")?.ifBlank { null }?.let { animeUrlFromEpisodeUrl(it) }
+                ?: return@mapNotNull null
+            val title = info?.attr("aria-label")?.replace(heroLabelRe, "")?.trim()?.ifBlank { null }
+                ?: s.selectFirst("h1, h2, h3")?.text()?.trim()?.ifBlank { null }
+                ?: return@mapNotNull null
+            val year = s.select(".v3-hero-meta span").map { it.text().trim() }.firstOrNull { yearRe.matches(it) }?.toIntOrNull()
+            Card(title, url, imageUrl(s.selectFirst("img.v3-hero-image") ?: s.selectFirst("img")), year)
+        }.distinctBy { it.url }
+    }
+    private val heroLabelRe = Regex("""\s+anime\s+detay\s+sayfas[ıi]\s*$""", RegexOption.IGNORE_CASE)
 
     /** A home-page row: "son-bolumler", "populer" or "yeni-seriler". */
     fun homeRow(doc: Document, rowId: String): List<Card> {
@@ -156,7 +194,7 @@ object AnizmParser {
             val o = arr.optJSONObject(i) ?: return@mapNotNull null
             val slug = o.str("info_slug") ?: return@mapNotNull null
             val title = o.str("info_title") ?: return@mapNotNull null
-            val poster = o.str("info_poster")?.let { if (it.startsWith("http") || it.startsWith("/")) absUrl(base, it) else absUrl(base, "/storage/pcovers/$it") }
+            val poster = largeCover(o.str("info_poster")?.let { if (it.startsWith("http") || it.startsWith("/")) absUrl(base, it) else absUrl(base, "/storage/pcovers/$it") })
             val hay = squash(listOf("info_title", "info_titleoriginal", "info_titleenglish", "info_othernames").joinToString(" ") { o.str(it) ?: "" })
             SearchHit(slug, title, poster, o.str("info_year")?.toIntOrNull(), hay)
         }
