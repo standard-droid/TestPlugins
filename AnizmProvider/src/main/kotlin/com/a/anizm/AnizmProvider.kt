@@ -1218,6 +1218,38 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     }
 
     // ── Load ──────────────────────────────────────────────────────────────────
+    // v41: a wide background for every anime, not only the featured ones. Anizm's anime pages have no
+    // wide image, and CloudStream's home header shows background ?: poster, so it stretched the portrait
+    // cover. Kitsu's cover first (1920x640 and up), then AniList's banner (1900x400): of 69 shows on the
+    // home rows (2026-10), Kitsu had 14, the two together 40. One search each, matched on title and year
+    // (AnizmParser.kitsuCover/anilistBanner), remembered for the session. CloudStream itself already
+    // talks to both (Kitsu for episode thumbnails, AniList for its own metadata).
+    private val wideBackgrounds = java.util.concurrent.ConcurrentHashMap<String, String>() // anime url -> image, "" = none
+    private suspend fun wideBackground(url: String, anime: AnizmParser.Anime): String? {
+        wideBackgrounds[url]?.let { return it.ifEmpty { null } }
+        val titles = listOf(anime.title) + anime.aliases
+        var answered = false
+        suspend fun ask(what: String, call: suspend () -> NiceResponse): String? = try {
+            withTimeoutOrNull(4_000L) { call().takeIf { it.code == 200 }?.text }?.also { answered = true }
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Exception) { log("$what: ${e.javaClass.simpleName}"); null }
+        val image = ask("kitsu") {
+            app.get("https://kitsu.io/api/edge/anime", headers = mapOf("Accept" to "application/vnd.api+json", "User-Agent" to ua),
+                params = mapOf("filter[text]" to anime.title, "page[limit]" to "5"), timeout = 4L)
+        }?.let { AnizmParser.kitsuCover(it, titles, anime.year) }
+            ?: run {
+                answered = false // only AniList's answer decides from here
+                ask("anilist") {
+                    app.post("https://graphql.anilist.co", headers = mapOf("Accept" to "application/json", "User-Agent" to ua), data = null,
+                        json = JSONObject().put("query", AnizmParser.ANILIST_BANNER_QUERY).put("variables", JSONObject().put("s", anime.title)), timeout = 4L)
+                }?.let { AnizmParser.anilistBanner(it, titles, anime.year) }
+            }
+        log("background: ${image?.substringAfter("//")?.substringBefore('/') ?: "none"} for '${anime.title}'")
+        if (!answered) return image // the last site asked did not answer: not remembered, the next load tries again
+        if (wideBackgrounds.size > 300) wideBackgrounds.clear()
+        wideBackgrounds[url] = image ?: ""
+        return image
+    }
+
     override suspend fun load(url: String): LoadResponse {
         val doc = siteDocument(url, pageHeaders, timeout = 12L)
             ?: return newAnimeLoadResponse(name = url.substringAfterLast('/'), url = url, type = TvType.Anime) { addEpisodes(DubStatus.Subbed, emptyList()) }
@@ -1231,9 +1263,11 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         val jap = aliases?.firstOrNull { !asciiOnlyRe.matches(it) }
         val syns = aliases?.filter { it != eng && it != jap }?.ifEmpty { null }
         log("load: '${anime.title}' poster=${anime.poster != null} plot=${(anime.plot?.length ?: 0) > 0} eps=${episodes.size} eng=$eng jap=$jap syns=${syns?.size ?: 0}")
+        // v41: the site's banner for featured anime, otherwise Kitsu's or AniList's (wideBackground).
+        val background = heroBanners[url] ?: heroBanners[onCurrentHost(url)] ?: wideBackground(url, anime)
         return newAnimeLoadResponse(anime.title, url, TvType.Anime) {
             posterUrl = anime.poster; this.plot = anime.plot; this.year = anime.year; this.tags = anime.tags.ifEmpty { null }
-            this.backgroundPosterUrl = heroBanners[url] ?: heroBanners[onCurrentHost(url)]
+            this.backgroundPosterUrl = background
             this.engName = eng
             this.japName = jap
             this.synonyms = syns
