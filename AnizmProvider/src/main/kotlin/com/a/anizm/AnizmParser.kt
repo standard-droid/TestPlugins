@@ -299,62 +299,6 @@ object AnizmParser {
         }
     }
 
-    // ── Kitsu (wide background images) ──────────────────────────────────────
-
-    // "Ao no Hako Season 2" (anizm) and "Ao no Hako 2nd Season" (Kitsu) are the same show.
-    private val ordinalSeasonRe = Regex("""\b(\d+)(?:st|nd|rd|th)\s+season\b""")
-
-    /** A title reduced for comparison: lowercase, "2nd Season" → "season 2", punctuation and spaces gone. */
-    fun titleKey(s: String): String = s.lowercase().replace(ordinalSeasonRe, "season $1").replace(nonAlnumRe, "")
-
-    /**
-     * Kitsu /api/edge/anime?filter[text]=… JSON: the cover image (coverImage.original, 1920x640 and up)
-     * of the first entry one of whose titles matches one of [titles], and whose start year is within a
-     * year of [year] when both are known. Null when nothing matches: a wrong show's picture is worse
-     * than none.
-     */
-    fun kitsuCover(text: String, titles: List<String>, year: Int?): String? {
-        val keys = titles.map { titleKey(it) }.filter { it.length >= 3 }.toSet()
-        if (keys.isEmpty()) return null
-        val arr = try { JSONObject(text.trim()).optJSONArray("data") } catch (_: Exception) { null } ?: return null
-        for (i in 0 until arr.length()) {
-            val a = arr.optJSONObject(i)?.optJSONObject("attributes") ?: continue
-            val names = mutableListOf<String>()
-            a.str("canonicalTitle")?.let { names += it }
-            a.optJSONObject("titles")?.let { t -> t.keys().forEach { k -> t.str(k)?.let { names += it } } }
-            a.optJSONArray("abbreviatedTitles")?.let { ab -> for (j in 0 until ab.length()) ab.optString(j, "").ifBlank { null }?.let { names += it } }
-            if (names.none { titleKey(it) in keys }) continue
-            val y = a.str("startDate")?.take(4)?.toIntOrNull()
-            if (year != null && y != null && kotlin.math.abs(y - year) > 1) continue
-            return a.optJSONObject("coverImage")?.str("original")?.takeIf { it.startsWith("https://") }
-        }
-        return null
-    }
-
-    /** The AniList query anilistBanner() reads: up to 5 anime for a title, with their names, year and banner. */
-    const val ANILIST_BANNER_QUERY = "query(\$s:String){Page(perPage:5){media(search:\$s,type:ANIME){title{romaji english native} synonyms seasonYear bannerImage}}}"
-
-    /**
-     * AniList answer to [ANILIST_BANNER_QUERY]: the banner (1900x400) of the first anime one of whose
-     * names matches one of [titles], within a year of [year] when both are known. Null when nothing matches.
-     */
-    fun anilistBanner(text: String, titles: List<String>, year: Int?): String? {
-        val keys = titles.map { titleKey(it) }.filter { it.length >= 3 }.toSet()
-        if (keys.isEmpty()) return null
-        val arr = try { JSONObject(text.trim()).optJSONObject("data")?.optJSONObject("Page")?.optJSONArray("media") } catch (_: Exception) { null } ?: return null
-        for (i in 0 until arr.length()) {
-            val m = arr.optJSONObject(i) ?: continue
-            val names = mutableListOf<String>()
-            m.optJSONObject("title")?.let { t -> listOf("romaji", "english", "native").forEach { k -> t.str(k)?.let { names += it } } }
-            m.optJSONArray("synonyms")?.let { s -> for (j in 0 until s.length()) s.optString(j, "").ifBlank { null }?.let { names += it } }
-            if (names.none { titleKey(it) in keys }) continue
-            val y = m.optInt("seasonYear", 0).takeIf { it > 0 }
-            if (year != null && y != null && kotlin.math.abs(y - year) > 1) continue
-            return m.str("bannerImage")?.takeIf { it.startsWith("https://") }
-        }
-        return null
-    }
-
     // ── Episode page → fansubs → sources ────────────────────────────────────
 
     /**

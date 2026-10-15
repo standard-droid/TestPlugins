@@ -127,26 +127,6 @@ fun main() {
     check("no two regular episodes share a number", dupes.isEmpty(), dupes.keys.take(10))
     check("1180 present (data-episode-number drift ignored)", opa.episodes.any { it.number == 1180 && it.url.endsWith("one-piece-1180-bolum-izle") })
 
-    section("Wide backgrounds (Kitsu, AniList)")
-    check("\"Season 2\" and \"2nd Season\" are the same title", AnizmParser.titleKey("Ao no Hako Season 2") == AnizmParser.titleKey("Ao no Hako 2nd Season"))
-    check("…but season 2 is not season 3", AnizmParser.titleKey("Kusuriya no Hitorigoto 3rd Season") != AnizmParser.titleKey("Kusuriya no Hitorigoto Season 2"))
-    // Shaped like real /api/edge/anime answers (2026-10-15): the sequel comes first for "Sousou no Frieren".
-    val kitsu = """{"data":[
-        {"attributes":{"canonicalTitle":"Sousou no Frieren 2nd Season","titles":{"en":"Frieren: Beyond Journey's End Season 2"},"startDate":"2026-01-16","coverImage":{"original":"https://media.kitsu.app/anime/2/cover_image/b.png"}}},
-        {"attributes":{"canonicalTitle":"Sousou no Frieren","titles":{"en":"Frieren: Beyond Journey's End","ja_jp":"葬送のフリーレン"},"abbreviatedTitles":[],"startDate":"2023-09-29","coverImage":{"original":"https://media.kitsu.app/anime/1/cover_image/a.png"}}},
-        {"attributes":{"canonicalTitle":"Kyoufu Collector","titles":{},"startDate":"2026-10-03","coverImage":null}}]}"""
-    check("kitsu: the right season by title", AnizmParser.kitsuCover(kitsu, listOf("Sousou no Frieren"), 2023) == "https://media.kitsu.app/anime/1/cover_image/a.png")
-    check("kitsu: matched on an alias (English title)", AnizmParser.kitsuCover(kitsu, listOf("Sousou no Frieren 2", "Frieren: Beyond Journey's End Season 2"), 2026) == "https://media.kitsu.app/anime/2/cover_image/b.png")
-    check("kitsu: a year two off is another show", AnizmParser.kitsuCover(kitsu, listOf("Sousou no Frieren"), 2025) == null)
-    check("kitsu: matched but no cover → none (no other show's picture)", AnizmParser.kitsuCover(kitsu, listOf("Kyoufu Collector"), 2026) == null)
-    check("kitsu: no title match → none", AnizmParser.kitsuCover(kitsu, listOf("Kanata Kara"), 2026) == null)
-    val anilist = """{"data":{"Page":{"media":[
-        {"title":{"romaji":"Kyoufu Collector","english":null,"native":"恐怖コレクター"},"synonyms":[],"seasonYear":2026,"bannerImage":"https://s4.anilist.co/file/anilistcdn/media/anime/banner/203473-KCGlCZL2ApjB.jpg"},
-        {"title":{"romaji":"Kanata Kara","english":"From Beyond"},"synonyms":["Kanata"],"seasonYear":2026,"bannerImage":null}]}}}"""
-    check("anilist: banner by title", AnizmParser.anilistBanner(anilist, listOf("Kyoufu Collector"), 2026) == "https://s4.anilist.co/file/anilistcdn/media/anime/banner/203473-KCGlCZL2ApjB.jpg")
-    check("anilist: matched but no banner → none", AnizmParser.anilistBanner(anilist, listOf("Kanata Kara"), 2026) == null)
-    check("anilist: error answer → none", AnizmParser.anilistBanner("""{"data":null,"errors":[{"status":404}]}""", listOf("Kyoufu Collector"), 2026) == null)
-
     section("URL helpers")
     check("episode → anime URL", AnizmParser.animeUrlFromEpisodeUrl("$site/bungou-stray-dogs-wan-2-11-bolum-izle") == "$site/bungou-stray-dogs-wan-2")
     check("double episode → anime URL (with its label)", AnizmParser.animeUrlFromEpisodeUrl("$site/one-piece-215-216-bolum-izle", "215-216. Bölüm") == "$site/one-piece")
