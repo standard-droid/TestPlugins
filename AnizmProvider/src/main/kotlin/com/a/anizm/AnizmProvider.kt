@@ -252,7 +252,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // had no size, a different name too. CloudStream treats that as a new link. Caching the
     // signed URL (until shortly before it expires) and the size estimate per stream makes a
     // repeat load emit byte-identical links, which the app de-duplicates.
-    private data class AincradSource(val videoSource: String, val securedLink: String, val validUntil: Long, val cookie: String = "")
+    // viaChrome: getVideo was answered through Chrome's network stack, so the playlist must be too (2026-11).
+    private data class AincradSource(val videoSource: String, val securedLink: String, val validUntil: Long, val cookie: String = "", val viaChrome: Boolean = false)
     private val aincradCache = java.util.concurrent.ConcurrentHashMap<String, AincradSource>()
     private val expiresParamRe = Regex("""[?&]expires=(\d{9,13})""")
     private val sizeCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Map<Int, Long>, Long>>()
@@ -2640,8 +2641,15 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // cookies the player page and getVideo set, got the playlist. The app's HTTP client
         // keeps no cookie jar, so they are carried by hand, to getVideo and onto the link.
         val cookieJar = LinkedHashMap<String, String>()
+        // 2026-11: which client got getVideo's answer. Device log (2026-11-01): getVideo through
+        // Chrome's stack, the master.txt probe through OkHttp with the session cookie, and master.txt
+        // answered "security error" — while the same URL with the same headers (cookie included)
+        // returns the playlist when one client makes every request. Headers made no difference in
+        // any test, so the session most likely belongs to the connection that created it (the two
+        // stacks can leave the phone on different addresses, e.g. IPv6 vs IPv4). Keep to one client.
+        var viaChrome = false
         if (cachedSource != null) {
-            videoSource = cachedSource.videoSource; securedLink = cachedSource.securedLink
+            videoSource = cachedSource.videoSource; securedLink = cachedSource.securedLink; viaChrome = cachedSource.viaChrome
             cachedSource.cookie.split("; ").filter { '=' in it }.forEach { cookieJar[it.substringBefore('=')] = it.substringAfter('=') }
             log("aincrad: reusing signed URL for $apBase $hash (${(cachedSource.validUntil - now) / 1000}s left)")
         } else {
@@ -2653,7 +2661,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 val gvUrl = "$apBase/player/index.php?data=$hash&do=getVideo"
                 val gvHeaders = aHeaders + (if (cookieJar.isEmpty()) emptyMap() else mapOf("Cookie" to cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" }))
                 val gvData = mapOf("hash" to hash, "r" to "$mainUrl/")
-                (chromeFetch(gvUrl, gvHeaders, 10L, formBody = gvData) ?: app.post(gvUrl, headers = gvHeaders, data = gvData, timeout = 10))
+                val viaCronet = chromeFetch(gvUrl, gvHeaders, 10L, formBody = gvData)
+                viaChrome = viaCronet != null
+                (viaCronet ?: app.post(gvUrl, headers = gvHeaders, data = gvData, timeout = 10))
                     .also { cookieJar.putAll(it.cookies) }
             } catch (e: kotlinx.coroutines.CancellationException) { throw e }
               catch (e: Exception) { log("aincrad error: ${e.javaClass.simpleName}: ${e.message}"); return false }
@@ -2680,7 +2690,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             val until = minOf(exp?.minus(120_000) ?: (now + 10 * 60_000), now + 30 * 60_000)
             if (until > now && (videoSource.isNotBlank() || securedLink.isNotBlank())) {
                 aincradCache[hash] = AincradSource(videoSource, securedLink, until,
-                    cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" })
+                    cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" }, viaChrome)
                 if (aincradCache.size > 200) aincradCache.entries.removeAll { it.value.validUntil <= now }
             }
         }
@@ -2691,18 +2701,22 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             (if (cookieJar.isEmpty()) emptyMap() else mapOf("Cookie" to cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" }))
 
         var resolved = false
-        // v32: securedLink first. Until 2026-09 both fields held the same URL; now videoSource
-        // is a bare master.txt behind a session check ("security error"), and securedLink is
-        // the md5/expires-signed master.m3u8, which carries its own authorisation.
-        for (cand in listOf(securedLink, videoSource).filter { it.isNotBlank() }.distinct()) {
+        // v32 tried securedLink first (the md5/expires-signed master.m3u8). Since 2026-11 it is a
+        // flat nginx 403 for every client and header set tried, and the player page itself only
+        // ever plays videoSource (master.txt), so that goes first and securedLink is a fallback.
+        for (cand in listOf(videoSource, securedLink).filter { it.isNotBlank() }.distinct()) {
             if (resolved) break
+            val probeHeaders = hlsHeaders + mapOf("Range" to "bytes=0-4095")
+            var probedVia = "okhttp"
             val head = try {
-                app.get(cand, headers = hlsHeaders + mapOf("Range" to "bytes=0-4095"), timeout = 8)
+                // 2026-11: through the client that called getVideo (see viaChrome above).
+                (if (viaChrome) chromeFetch(cand, probeHeaders, 8L)?.also { probedVia = "chrome" } else null)
+                    ?: app.get(cand, headers = probeHeaders, timeout = 8)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) { log("aincrad: probe failed: ${e.message}"); continue }
             val t = head.text.trimStart()
-            log("aincrad: probe http ${head.code}, ${head.headers["Content-Type"]}, ${t.length}B, starts '${t.take(24).replace('\n', ' ')}'")
+            log("aincrad: probe ($probedVia, getVideo via ${if (viaChrome) "chrome" else "okhttp"}) http ${head.code}, ${head.headers["Content-Type"]}, ${t.length}B, starts '${t.take(24).replace('\n', ' ')}'")
             when {
                 t.startsWith("#EXTM3U") -> {
                     val cleanLabel = cleanDisplayName(label)
