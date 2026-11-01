@@ -2286,6 +2286,14 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                             else log("sniff: stream master answered http $code — giving up on this one")
                             handler.post { finish(null) }
                         }
+                        // 2026-11: the page's own video request was refused (400 "player is not recognized"
+                        // on every Sistenn host, device logs 2026-11-01). The page never asks again, so each
+                        // one sat out the whole budget (~20 s per source, ~1 min per episode). Stop now.
+                        if (!done && code in 400..499 && code != 429 && h.equals(pageHost, true) &&
+                            request.url?.path?.startsWith("/api/v1/video") == true) {
+                            log("sniff: the page's video request was refused (http $code) — giving up on this one")
+                            handler.post { finish(null) }
+                        }
                     }
 
                     override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
@@ -2696,16 +2704,22 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // 2026-11: Accept must be exactly "*/*" (what Chrome and hls.js send). Without it, or with any
         // other value, master.txt and the /m3/ media playlists answer 200 "security error"; neither
         // OkHttp nor Cronet adds an Accept on its own. Also reaches ExoPlayer through the link's headers.
-        val hlsHeaders = mapOf("User-Agent" to ua, "Accept" to "*/*", "Origin" to apBase, "Referer" to playerRef) +
+        // v45: the rest of what the page's hls.js sends for its playlists (same-origin XHR): client hints,
+        // language, Sec-Fetch-*, and no Origin (Chrome sends none on a same-origin GET). Checked on master.txt,
+        // the /m3/ playlists and the anz-gth segment hosts, which ExoPlayer reaches with this same set.
+        val hlsHeaders = clientHints + mapOf("User-Agent" to ua, "Accept" to "*/*", "Accept-Language" to acceptLang,
+            "Referer" to playerRef, "Sec-Fetch-Site" to "same-origin", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Dest" to "empty") +
             (if (cookieJar.isEmpty()) emptyMap() else mapOf("Cookie" to cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" }))
 
         var resolved = false
-        // v32 tried securedLink first (the md5/expires-signed master.m3u8). Since 2026-11 it is a
-        // flat nginx 403 for every client and header set tried, and the player page itself only
-        // ever plays videoSource (master.txt), so that goes first and securedLink is a fallback.
-        for (cand in listOf(videoSource, securedLink).filter { it.isNotBlank() }.distinct()) {
+        // v45: videoSource (master.txt) only. securedLink, the md5/expires-signed master.m3u8 that v32
+        // switched to, has been a flat nginx 403 since 2026-11 and the player page never requests it,
+        // so asking for it only added a request no browser makes. Its expires= still sets the cache time above.
+        for (cand in listOf(videoSource).filter { it.isNotBlank() }) {
             if (resolved) break
-            val probeHeaders = hlsHeaders + mapOf("Range" to "bytes=0-4095")
+            // v45: a playlist is fetched whole, as the page does; Range only for something that may be a video file.
+            val isPlaylist = cand.substringBefore('?').let { it.endsWith(".txt") || it.endsWith(".m3u8") }
+            val probeHeaders = if (isPlaylist) hlsHeaders else hlsHeaders + mapOf("Range" to "bytes=0-4095")
             var probedVia = "okhttp"
             val head = try {
                 // 2026-11: through the client that called getVideo (see viaChrome above).
