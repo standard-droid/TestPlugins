@@ -2641,12 +2641,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // cookies the player page and getVideo set, got the playlist. The app's HTTP client
         // keeps no cookie jar, so they are carried by hand, to getVideo and onto the link.
         val cookieJar = LinkedHashMap<String, String>()
-        // 2026-11: which client got getVideo's answer. Device log (2026-11-01): getVideo through
-        // Chrome's stack, the master.txt probe through OkHttp with the session cookie, and master.txt
-        // answered "security error" — while the same URL with the same headers (cookie included)
-        // returns the playlist when one client makes every request. Headers made no difference in
-        // any test, so the session most likely belongs to the connection that created it (the two
-        // stacks can leave the phone on different addresses, e.g. IPv6 vs IPv4). Keep to one client.
+        // 2026-11: which client got getVideo's answer; the playlist probe uses the same one, as a
+        // browser would. (Not what caused the "security error" — that was the missing Accept, see hlsHeaders.)
         var viaChrome = false
         if (cachedSource != null) {
             videoSource = cachedSource.videoSource; securedLink = cachedSource.securedLink; viaChrome = cachedSource.viaChrome
@@ -2697,7 +2693,10 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // Single entry per source, chosen by CONTENT, not by JSON field name — see git
         // history for the 3003 error this avoids. NOTE ON DOWNLOADS: split-audio masters
         // stream fine but CloudStream's downloader can't mux them (app limitation).
-        val hlsHeaders = mapOf("User-Agent" to ua, "Origin" to apBase, "Referer" to playerRef) +
+        // 2026-11: Accept must be exactly "*/*" (what Chrome and hls.js send). Without it, or with any
+        // other value, master.txt and the /m3/ media playlists answer 200 "security error"; neither
+        // OkHttp nor Cronet adds an Accept on its own. Also reaches ExoPlayer through the link's headers.
+        val hlsHeaders = mapOf("User-Agent" to ua, "Accept" to "*/*", "Origin" to apBase, "Referer" to playerRef) +
             (if (cookieJar.isEmpty()) emptyMap() else mapOf("Cookie" to cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" }))
 
         var resolved = false
