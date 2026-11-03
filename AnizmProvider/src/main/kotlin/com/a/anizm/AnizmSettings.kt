@@ -224,6 +224,8 @@ class AnizmSettings(private val prefs: SharedPreferences) {
             note("On: with lazy loading, Sistenn and similar wait until the other sources have been tried, and are skipped if those already reach the target. Off: the order above is followed exactly.")
             val sizeBox = check("Show estimated file size for Aincrad, Beta Player and Sistenn", settings.estimateSizes)
             note("Costs about 15-40 tiny extra requests per source and up to 8 s before that source appears; each size is then kept for a day. Google Drive sizes are exact and need no extra requests.")
+            val lockBox = check("Aincrad: always play the best quality (no automatic switching)", settings.lockTopQuality)
+            note("On: Aincrad plays only its top quality (usually 1080p), so the player never drops to a lower one; on a slow connection it buffers instead. Off: the player switches by connection speed, using Aincrad's quality labels, which are often wrong for 1080p.")
 
             val scroll = ScrollView(context).apply { addView(root) }
 
@@ -241,6 +243,7 @@ class AnizmSettings(private val prefs: SharedPreferences) {
                     e.putInt("lazy_target", targetField.text.toString().trim().toIntOrNull()?.coerceIn(1, 99) ?: settings.lazyTargetSources)
                     e.putInt("lazy_min_quality", minQField.text.toString().trim().toIntOrNull()?.coerceIn(0, 4320) ?: settings.lazyMinQuality)
                     e.putBoolean("estimate_sizes", sizeBox.isChecked)
+                    e.putBoolean("lock_top_quality", lockBox.isChecked)
                     e.putBoolean("browser_sniff", sniffBox.isChecked)
                     e.putBoolean("defer_browser_sources", deferBox.isChecked)
                     e.apply()
@@ -268,6 +271,8 @@ class AnizmSettings(private val prefs: SharedPreferences) {
     val lazyResolve get() = prefs.getBoolean("lazy_resolve", true)
     val lazyTargetSources get() = prefs.getInt("lazy_target", 2).coerceAtLeast(1)
     val estimateSizes get() = prefs.getBoolean("estimate_sizes", true)
+    /** v46: Aincrad's split-audio masters are served with only their top variant. */
+    val lockTopQuality get() = prefs.getBoolean("lock_top_quality", true)
     val browserSniff get() = prefs.getBoolean("browser_sniff", true)
     /** Put browser-only sources (Sistenn…) after the rest while lazy loading. */
     val deferBrowserSources get() = prefs.getBoolean("defer_browser_sources", true)
