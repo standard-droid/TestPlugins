@@ -96,12 +96,13 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         var translators = emptyList<AnizmParser.Translator>()
         step("Episode page → fansubs") {
             val html = siteText(ep, pageHeaders) ?: return@step false to "page didn't load"
+            noteCsrfToken(html)
             translators = AnizmParser.translators(html, onCurrentHost(ep))
             translators.isNotEmpty() to "${translators.size}: ${translators.joinToString { it.name }}"
         }
         var firstVideo: AnizmParser.Video? = null
         for (t in translators) step("Sources · ${t.name}") {
-            val text = siteText(t.url, xhrHeaders + mapOf("Referer" to onCurrentHost(ep))) ?: return@step false to "no answer"
+            val text = siteText(t.url, episodeXhrHeaders(ep)) ?: return@step false to "no answer"
             val v = AnizmParser.videos(text)
             if (firstVideo == null) firstVideo = v.firstOrNull()
             v.isNotEmpty() to "${v.size}: ${v.joinToString { it.name }}"
@@ -255,6 +256,8 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // viaChrome: getVideo was answered through Chrome's network stack, so the playlist must be too (2026-11).
     private data class AincradSource(val videoSource: String, val securedLink: String, val validUntil: Long, val cookie: String = "", val viaChrome: Boolean = false)
     private val aincradCache = java.util.concurrent.ConcurrentHashMap<String, AincradSource>()
+    // v46: master URL + text hash -> (local top-quality-only master URL, when registered).
+    private val aincradLocked = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
     private val expiresParamRe = Regex("""[?&]expires=(\d{9,13})""")
     private val sizeCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Map<Int, Long>, Long>>()
     // v39: 1 h -> 24 h. Every key names one video (ap:<hash>, bp:<hash>, sistenn:<host>:<id>:<kind>),
@@ -645,6 +648,20 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     private val pageHeaders get() = baseHeaders + mapOf(
         "Upgrade-Insecure-Requests" to "1", "Accept" to chromeDocAccept,
         "Sec-Fetch-Site" to "same-origin", "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-User" to "?1", "Sec-Fetch-Dest" to "document")
+    // v46: the episode page's own JSON lookups (/bolum/<ep>/cevirmen/<tr>, /bolum/<ep>/video/<id>), as its
+    // script sends them (browser capture, 2026-11-03): Accept application/json, X-CSRF-TOKEN from the page's
+    // <meta name="csrf-token">, the episode URL as Referer, and no Origin (same-origin GET). anizm does not
+    // check the token today; sending it means the day it does, translator lists keep loading.
+    @Volatile private var csrfToken: String? = null
+    private val csrfMetaRe = Regex("""<meta\b[^>]*\bname\s*=\s*["']csrf-token["'][^>]*>""", RegexOption.IGNORE_CASE)
+    private val contentAttrRe = Regex("""\bcontent\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+    private fun noteCsrfToken(html: String) {
+        val tag = csrfMetaRe.find(html)?.value ?: return
+        contentAttrRe.find(tag)?.groupValues?.get(1)?.takeIf { it.length in 16..200 }?.let { csrfToken = it }
+    }
+    private fun episodeXhrHeaders(episodeUrl: String): Map<String, String> =
+        (xhrHeaders - "Origin") + mapOf("Accept" to "application/json", "Referer" to onCurrentHost(episodeUrl)) +
+            (csrfToken?.let { mapOf("X-CSRF-TOKEN" to it) } ?: emptyMap())
     private val xhrHeaders get() = clientHints + mapOf(
         "Sec-Fetch-Dest" to "empty", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Site" to "same-origin",
         "User-Agent" to ua,
@@ -780,7 +797,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         playerUrlTemplate?.let { onCurrentHost(it.replace("{id}", nid)) } ?: "$mainUrl/player/$nid"
 
     private suspend fun sitePlayerUrl(epId: String, nid: String, episodeUrl: String): String? = try {
-        siteText("$mainUrl/bolum/$epId/video/$nid", xhrHeaders + mapOf("Referer" to onCurrentHost(episodeUrl)), timeout = 8L)
+        siteText("$mainUrl/bolum/$epId/video/$nid", episodeXhrHeaders(episodeUrl), timeout = 8L)
             ?.let { AnizmParser.playerUrl(it, mainUrl) }
     } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { null }
 
@@ -1266,6 +1283,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
         catch (e: Exception) { log("loadLinks: page error: ${e.message}"); return null }
         log("loadLinks: page len=${epHtml.length}")
+        noteCsrfToken(epHtml)
 
         // v38: AnizmParser.translators reads the fansub buttons straight from the HTML text, then
         // through jsoup (data-sources, then data-translator-id + the episode id), then any
@@ -1289,7 +1307,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 launch {
                     trGate.withPermit {
                         val trText = try {
-                            siteText(trUrl, xhrHeaders + mapOf("Referer" to onCurrentHost(data)))
+                            siteText(trUrl, episodeXhrHeaders(data))
                                 ?: run { log("loadLinks: tr error ($fansubName)"); return@withPermit }
                         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
                         catch (e: Exception) { log("loadLinks: tr error ($fansubName): ${e.message}"); return@withPermit }
@@ -2625,16 +2643,17 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     ): Boolean {
         val hash = embed.removePrefix("ap:")
         // 4.0: the real player page is /video/{hash} — that's where /player/{numId}
-        // redirects, and it's what a browser has as Referer for everything after.
-        // The old warm-up hit $playerBase/player/{hash}, which is a 404 on
+        // redirects. The old warm-up hit $playerBase/player/{hash}, which is a 404 on
         // anizmplayer.com (verified), so every Aincrad play started with a request
-        // no browser ever makes, and then used that 404 URL as the Referer.
+        // no browser ever makes. (v46: the page is no-referrer, so it is not a Referer either.)
         val apBase = apDomains[hash] ?: playerBase
         val playerRef = "$apBase/video/$hash"
         // v41: what the player page's own $.ajax sends (client hints, Sec-Fetch-*, language).
+        // v46: and no Referer. The page sets <meta name="referrer" content="no-referrer">, so the
+        // browser sends none on getVideo, the playlists or the segments (browser capture, 2026-11-03).
         val aHeaders = clientHints + mapOf("User-Agent" to ua,
             "X-Requested-With" to "XMLHttpRequest", "Accept" to "*/*",
-            "Referer" to playerRef, "Origin" to apBase, "Accept-Language" to acceptLang,
+            "Origin" to apBase, "Accept-Language" to acceptLang,
             "Sec-Fetch-Site" to "same-origin", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Dest" to "empty")
         // The player page itself, loaded the way anizm's iframe loads it.
         val aPageHeaders = clientHints + mapOf("Upgrade-Insecure-Requests" to "1", "User-Agent" to ua, "Accept" to chromeDocAccept,
@@ -2708,7 +2727,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // language, Sec-Fetch-*, and no Origin (Chrome sends none on a same-origin GET). Checked on master.txt,
         // the /m3/ playlists and the anz-gth segment hosts, which ExoPlayer reaches with this same set.
         val hlsHeaders = clientHints + mapOf("User-Agent" to ua, "Accept" to "*/*", "Accept-Language" to acceptLang,
-            "Referer" to playerRef, "Sec-Fetch-Site" to "same-origin", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Dest" to "empty") +
+            "Sec-Fetch-Site" to "same-origin", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Dest" to "empty") +
             (if (cookieJar.isEmpty()) emptyMap() else mapOf("Cookie" to cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" }))
 
         var resolved = false
@@ -2747,11 +2766,26 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                                 ?: withTimeoutOrNull(sizeEstimateBudgetMs) { estimateSplitAudioBytes(t, cand, variants, hlsHeaders) }
                                     ?.also { storeSizes(sizeKey, mapOf(0 to it)) }
                         } else null
-                        callback(newExtractorLink(source = cleanLabel, name = cleanLabel + formatSize(est, isEstimate = true), url = cand, type = ExtractorLinkType.M3U8) {
-                            quality = h ?: Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
+                        // v46: "Always play the best quality": a master listing only the top variant (plus the audio
+                        // group), served by the local proxy, so the app's player has nothing lower to switch to.
+                        // Aincrad's labelled 1080p rate is fixed and often wrong (see sampleVideoChecked), which is
+                        // exactly what an automatic switch decides by. Off, or if the proxy can't start: the full master.
+                        val top = variants.firstOrNull()
+                        // The local URL is reused while the master is unchanged, so a repeat load emits the same link
+                        // and CloudStream de-duplicates it. Keyed by the master's text: its /m3/v1.<token> paths
+                        // expire (same after 18 min, different and dead 2 days later), and a new text means new ones.
+                        val lockKey = "$cand|${t.hashCode()}"
+                        val playUrl = if (settings.lockTopQuality && top != null && variants.size > 1)
+                            (aincradLocked[lockKey]?.takeIf { now - it.second < 5 * 60 * 60_000L }?.first
+                                ?: topOnlyMaster(t, cand, top)?.let { localHls.register(cand, "", hlsHeaders, it) }
+                                    ?.also { aincradLocked[lockKey] = it to now; if (aincradLocked.size > 200) aincradLocked.entries.removeAll { e -> now - e.value.second > 5 * 60 * 60_000L } })
+                                ?.also { log("aincrad: locked to ${top.height}p (${variants.size - 1} lower variant(s) left out)") } ?: cand
+                        else cand
+                        callback(newExtractorLink(source = cleanLabel, name = cleanLabel + formatSize(est, isEstimate = true), url = playUrl, type = ExtractorLinkType.M3U8) {
+                            quality = h ?: Qualities.Unknown.value; referer = ""; headers = hlsHeaders }) // v46: no-referrer, as above
                         resolved = true
                     } else {
-                        resolved = emitVariants(variants, cleanLabel, playerRef, hlsHeaders, callback, "aincrad", "ap:$hash")
+                        resolved = emitVariants(variants, cleanLabel, "", hlsHeaders, callback, "aincrad", "ap:$hash")
                     }
                 }
                 // v32: only a real media answer becomes a VIDEO link. A 14-byte text/html
@@ -2763,12 +2797,39 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                     val cleanLabel = cleanDisplayName(label)
                     val sizeBytes = parseContentRangeTotal(head.headers)
                     callback(newExtractorLink(source = cleanLabel, name = cleanLabel + formatSize(sizeBytes), url = cand, type = ExtractorLinkType.VIDEO) {
-                        quality = Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
+                        quality = Qualities.Unknown.value; referer = ""; headers = hlsHeaders })
                     resolved = true
                 }
             }
         }
         return resolved
+    }
+
+    /**
+     * v46: the master with every #EXT-X-STREAM-INF entry but [keep]'s removed. Media lines (the
+     * audio group) and the header stay. Null if [keep]'s entry is not found, so the caller plays
+     * the full master rather than a broken one.
+     */
+    private fun topOnlyMaster(master: String, masterUrl: String, keep: Variant): String? {
+        val lines = master.lines()
+        val out = ArrayList<String>(lines.size)
+        var kept = false
+        var i = 0
+        while (i < lines.size) {
+            val line = lines[i]
+            if (line.startsWith("#EXT-X-STREAM-INF")) {
+                var j = i + 1
+                while (j < lines.size && lines[j].isBlank()) j++
+                val uri = lines.getOrNull(j)?.trim().orEmpty()
+                val abs = try { java.net.URI(masterUrl).resolve(uri).toString() } catch (_: Exception) { uri }
+                if (uri.isNotEmpty() && !uri.startsWith("#") && abs == keep.url) { out += line; out += uri; kept = true }
+                i = j + 1
+                continue
+            }
+            out += line
+            i++
+        }
+        return if (kept) out.joinToString("\n") else null
     }
 
     // v38: split out of processSource, which had outgrown ART's compiler limit (17494 instructions,
@@ -3508,7 +3569,10 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // BANDWIDTH doesn't happen with this encoder, so it means the 12 samples were unlucky
     // (or a server quirk). Re-sample with 24; if it's still implausible, show no size rather
     // than a wrong one.
-    private suspend fun sampleVideoChecked(top: Variant, headers: Map<String, String>): RenditionStats? {
+    // v46: trustMeasured (Aincrad) keeps the 24-sample result instead of dropping it. Aincrad's 1080p is a
+    // separate encode whose real rate swings around the fixed 4096 kbps label, from ~1.1 Mbps to ~6.3 Mbps
+    // (measured 2026-11-03), so above 1.3x declared is real there, not bad luck, and those episodes showed no size.
+    private suspend fun sampleVideoChecked(top: Variant, headers: Map<String, String>, trustMeasured: Boolean = false): RenditionStats? {
         val declaredBps = top.bandwidth?.takeIf { it > 0 }?.let { it / 8.0 }
         fun plausible(r: RenditionStats) = declaredBps == null || r.bytesPerSec <= declaredBps * 1.3
         val first = sampleRendition(top.url, headers, 12) ?: return null
@@ -3516,6 +3580,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         log("size: ${top.height}p measured ${(first.bytesPerSec * 8 / 1000).toLong()} kbps > declared ${top.bandwidth!! / 1000} kbps, re-sampling with 24")
         val second = sampleRendition(top.url, headers, 24) ?: return null
         if (plausible(second)) return second
+        if (trustMeasured) { log("size: ${top.height}p measured ${(second.bytesPerSec * 8 / 1000).toLong()} kbps twice — keeping it"); return second }
         log("size: ${top.height}p still ${(second.bytesPerSec * 8 / 1000).toLong()} kbps, not showing a size")
         return null
     }
@@ -3528,7 +3593,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // Audio is near-constant bitrate AAC, so 3 samples is plenty.
         // v39: sampled alongside the video rendition instead of after it (same requests, ~3-4 round-trips sooner).
         val audioJob = audioUrl?.let { u -> async { sampleRendition(u, headers, 3) } }
-        val video = sampleVideoChecked(top, headers)
+        val video = sampleVideoChecked(top, headers, trustMeasured = true)
         if (video == null) { audioJob?.cancel(); return@coroutineScope null }
         val audio = audioJob?.await()
         val bytes = (video.bytesPerSec + (audio?.bytesPerSec ?: 0.0)) * video.durationSec
