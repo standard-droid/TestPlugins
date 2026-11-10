@@ -29,7 +29,7 @@ import kotlinx.coroutines.withContext
  * The provider reads these on every loadLinks call, so changes apply to the next episode
  * opened — no app restart.
  */
-class AnizmSettings(private val prefs: SharedPreferences) {
+class AnizmSettings(internal val prefs: SharedPreferences) {
 
     /** A player family, matched against the site's player button label (case-insensitive). */
     data class SourceGroup(val key: String, val label: String, val keywords: List<String>)
@@ -216,6 +216,32 @@ class AnizmSettings(private val prefs: SharedPreferences) {
                 }
             }
             root.addView(siteBtn)
+            // v48: what the extension noticed about the site on its own (a player that moved, a page
+            // read through a fallback), and the recent log, without a computer and adb.
+            val warnings = settings.recentWarnings()
+            if (warnings.isNotEmpty()) {
+                header("Recent site warnings")
+                note(warnings.takeLast(8).joinToString("\n"))
+            }
+            fun copy(label: String, text: String) =
+                (context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager)?.setPrimaryClip(ClipData.newPlainText(label, text))
+            root.addView(Button(context).apply {
+                text = "Copy recent log"
+                setOnClickListener {
+                    val log = AnizmProvider.instance?.recentLogText().orEmpty()
+                    copy("Anizm log", (if (warnings.isEmpty()) "" else "Site warnings:\n" + warnings.joinToString("\n") + "\n\n") + log)
+                    text = if (log.isEmpty()) "Nothing logged yet" else "Copied (${log.count { it == '\n' } + 1} lines)"
+                }
+            })
+            root.addView(Button(context).apply {
+                text = "Clear saved data"
+                setOnClickListener {
+                    AnizmProvider.instance?.clearSavedData()
+                    settings.clearWarnings()
+                    text = "Cleared"
+                }
+            })
+            note("Saved data: file sizes, where each player id points and which player pages never worked. It only saves requests; clearing it is always safe.")
 
             header("Extras")
             val sniffBox = check("Use the in-app browser for players CloudStream can't read", settings.browserSniff)
@@ -223,7 +249,11 @@ class AnizmSettings(private val prefs: SharedPreferences) {
             val deferBox = check("Try in-app-browser sources last (faster start)", settings.deferBrowserSources)
             note("On: with lazy loading, Sistenn and similar wait until the other sources have been tried, and are skipped if those already reach the target. Off: the order above is followed exactly.")
             val sizeBox = check("Show estimated file size for Aincrad, Beta Player and Sistenn", settings.estimateSizes)
-            note("Costs about 15-40 tiny extra requests per source and up to 8 s before that source appears; each size is then kept for a day. Google Drive sizes are exact and need no extra requests.")
+            note("Measured from a few small reads spread over the video, the first time a video is opened; the result is then kept. Google Drive sizes are exact and need no extra requests.")
+            val accurateBox = check("More accurate sizes (about twice the reads)", settings.accurateSizes)
+            note("On: about 35 small reads per video (once), usually within 3 % of the real size. Off: about half as many, usually within 5 %.")
+            val creditsBox = check("Show who made each source (translator, encoder, uploader)", settings.showCredits)
+            note("Added to the source's name, e.g. \"Net-Rip - Beta Player · Enc/Up: Rinrintan\". Costs one small request per source, the same one the site makes when a player button is pressed.")
             val lockBox = check("Aincrad: always play the best quality (no automatic switching)", settings.lockTopQuality)
             note("On: Aincrad plays only its top quality (usually 1080p), so the player never drops to a lower one; on a slow connection it buffers instead. Off: the player switches by connection speed, using Aincrad's quality labels, which are often wrong for 1080p.")
 
@@ -244,6 +274,8 @@ class AnizmSettings(private val prefs: SharedPreferences) {
                     e.putInt("lazy_min_quality", minQField.text.toString().trim().toIntOrNull()?.coerceIn(0, 4320) ?: settings.lazyMinQuality)
                     e.putBoolean("estimate_sizes", sizeBox.isChecked)
                     e.putBoolean("lock_top_quality", lockBox.isChecked)
+                    e.putBoolean("accurate_sizes", accurateBox.isChecked)
+                    e.putBoolean("show_credits", creditsBox.isChecked)
                     e.putBoolean("browser_sniff", sniffBox.isChecked)
                     e.putBoolean("defer_browser_sources", deferBox.isChecked)
                     e.apply()
@@ -280,9 +312,22 @@ class AnizmSettings(private val prefs: SharedPreferences) {
     var siteHost: String?
         get() = prefs.getString("site_host", null)
         set(v) { prefs.edit().putString("site_host", v).apply() }
-    /** v42: the last player script name seen per Sistenn-family host (a change is logged). */
-    fun playerScript(host: String): String? = prefs.getString("player_script_$host", null)
-    fun setPlayerScript(host: String, name: String) { prefs.edit().putString("player_script_$host", name).apply() }
+    /** v48: 16 size samples per video instead of 8 (and 4 instead of 2 for each lower quality). */
+    val accurateSizes get() = prefs.getBoolean("accurate_sizes", true)
+    /** v48: translator, encoder and uploader in each source's name. */
+    val showCredits get() = prefs.getBoolean("show_credits", true)
+
+    /** v48: the last 20 "the site changed" warnings, newest last, each with its date. */
+    fun recentWarnings(): List<String> = prefs.getString("site_warnings", null)?.split('\n')?.filter { it.isNotBlank() } ?: emptyList()
+    @Synchronized fun addWarning(msg: String) {
+        val line = msg.replace('\n', ' ').take(240)
+        val old = recentWarnings()
+        // The same warning again (every episode, while the site stays changed) only moves its date.
+        val kept = old.filter { it.substringAfter("  ") != line }
+        val stamp = java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.US).format(java.util.Date())
+        prefs.edit().putString("site_warnings", (kept + "$stamp  $line").takeLast(20).joinToString("\n")).apply()
+    }
+    fun clearWarnings() { prefs.edit().remove("site_warnings").apply() }
     /** 0 = any quality counts toward the lazy target. */
     val lazyMinQuality get() = prefs.getInt("lazy_min_quality", 1080)
 

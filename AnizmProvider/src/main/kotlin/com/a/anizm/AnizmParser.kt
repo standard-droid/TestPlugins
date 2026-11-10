@@ -50,6 +50,13 @@ object AnizmParser {
     private val titleAttrRe = Regex("""\stitle\s*=\s*(["'])(.*?)\1""", RegexOption.IGNORE_CASE)
     private val defaultCoverRe = Regex("""defaultcover""", RegexOption.IGNORE_CASE)
 
+    /**
+     * Told when a page could only be read through a fallback: the site's markup changed, and the
+     * next change may break it. The provider logs these as site-change warnings.
+     */
+    @Volatile var onFallback: ((String) -> Unit)? = null
+    private fun fallback(what: String) { try { onFallback?.invoke(what) } catch (_: Exception) {} }
+
     fun squash(s: String) = s.lowercase().replace(nonAlnumRe, "")
     fun words(q: String) = q.split(nonAlnumRe).filter { it.length >= 2 }
 
@@ -119,7 +126,7 @@ object AnizmParser {
         val title = el.selectFirst(".v3-card-copy h3, .v3-catalog-card-copy h2, .v3-catalog-preview h3, h3, h2")
             ?.cleanText()?.ifBlank { null }
             ?: img?.attr("alt")?.replace(posterAltRe, "")?.trim()?.ifBlank { null }
-            ?: a.attr("aria-label").replace(Regex("""\s+anime detayları$"""), "").trim().ifBlank { null }
+            ?: a.attr("aria-label").replace(detailLabelRe, "").trim().ifBlank { null }
             ?: return null
         // Episode cards link to the episode; the anime page is that URL without "-N-bolum-izle".
         val isEpisode = el.hasClass("v3-episode-card") || episodeHrefRe.containsMatchIn(href.substringAfterLast('/'))
@@ -129,6 +136,7 @@ object AnizmParser {
         return Card(title, url, largeCover(imageUrl(img)), year)
     }
 
+    private val detailLabelRe = Regex("""\s+anime detayları$""")
     private fun cards(els: Collection<Element>) = els.mapNotNull { card(it) }.distinctBy { it.url }
 
     private val cardSel = "article.v3-episode-card, article.v3-series-card, article.v3-catalog-card"
@@ -177,8 +185,9 @@ object AnizmParser {
     fun listing(doc: Document, page: Int): Listing {
         val els = doc.select(cardSel).ifEmpty { doc.selectFirst("main")?.let { looseCards(it) } ?: emptyList() }
         val list = cards(els)
+        val nextRe = Regex("""[?&]sayfa=${page + 1}(?:&|$)""")
         val hasNext = doc.selectFirst("a[rel=next]") != null ||
-            doc.select("a[href*=sayfa=${page + 1}]").any { Regex("""[?&]sayfa=${page + 1}(?:&|$)""").containsMatchIn(it.attr("href")) }
+            doc.select("a[href*=sayfa=${page + 1}]").any { nextRe.containsMatchIn(it.attr("href")) }
         return Listing(list, hasNext && list.isNotEmpty())
     }
 
@@ -265,10 +274,18 @@ object AnizmParser {
      */
     fun episodes(doc: Document, url: String): List<Episode> {
         val animeUrl = url.trimEnd('/')
-        val links = doc.select("[data-anime-episode-grid] > a[href]")
-            .ifEmpty { doc.select("#bolumler a[href]").filter { episodeHrefRe.containsMatchIn(it.attr("href")) } }
+        // 2026-11-10: the grid is <div class="v3-anime-episode-grid"> now; its data-anime-episode-grid
+        // attribute (and the links' data-episode-title) are gone. Both spellings are tried.
+        val links = doc.select(".v3-anime-episode-grid > a[href], [data-anime-episode-grid] > a[href]")
+            .ifEmpty {
+                doc.select("#bolumler a[href]").filter { episodeHrefRe.containsMatchIn(it.attr("href")) }
+                    .also { if (it.isNotEmpty()) fallback("episode list: the grid was not found, read ${it.size} links from #bolumler instead") }
+            }
             // Last resort: any link that is this anime's URL plus an episode suffix.
-            .ifEmpty { doc.select("a[href]").filter { it.href().startsWith("$animeUrl-") && episodeHrefRe.containsMatchIn(it.attr("href")) } }
+            .ifEmpty {
+                doc.select("a[href]").filter { it.href().startsWith("$animeUrl-") && episodeHrefRe.containsMatchIn(it.attr("href")) }
+                    .also { if (it.isNotEmpty()) fallback("episode list: no #bolumler section, read ${it.size} links by their address instead") }
+            }
             .distinctBy { it.href() }
 
         data class Raw(val href: String, val label: String, val special: Boolean)
@@ -311,7 +328,9 @@ object AnizmParser {
      * /bolum/<epId>/cevirmen/<trId> URL in the raw HTML.
      */
     fun translators(html: String, pageUrl: String): List<Translator> =
-        translatorsFromText(html, pageUrl).ifEmpty { translatorsFromDom(html, pageUrl) }
+        translatorsFromText(html, pageUrl).ifEmpty {
+            translatorsFromDom(html, pageUrl).also { if (it.isNotEmpty()) fallback("fansub buttons: not in their usual form, read ${it.size} through the page structure instead") }
+        }
 
     /** Every <button> with data-sources and a title; empty (so the DOM path runs) if any lacks either. */
     private fun translatorsFromText(html: String, pageUrl: String): List<Translator> {
@@ -365,6 +384,42 @@ object AnizmParser {
         val u = o.str("url") ?: return null
         val origin = o.str("playerOrigin")?.takeIf { it.startsWith("http") }
         return absUrl(origin ?: base, u)?.takeIf { it.startsWith("http") }
+    }
+
+    /** Who made one source, from the same /bolum/<epId>/video/<id> answer. */
+    data class VideoInfo(val translator: String?, val encoder: String?, val uploader: String?) {
+        /** One line to store: the three names, '|'-separated (empty where unknown). */
+        fun credits(): String = listOf(translator, encoder, uploader).joinToString("|") { it.orEmpty().replace('|', '/').replace('\t', ' ').trim() }
+    }
+
+    /**
+     * {"success":true,"url":…,"source":"Beta Player","translator":"Net-Rip","redaktor":"","encoder":"Rinrintan",
+     * "uploader":{"name":"Rinrintan","url":…,…}} (seen 2026-11-10). Null when none of the names is there.
+     */
+    fun videoInfo(text: String): VideoInfo? {
+        val o = try { JSONObject(text.trim()) } catch (_: Exception) { return null }
+        val up = o.opt("uploader")
+        val uploader = when (up) { is JSONObject -> up.str("name") ?: up.str("username"); is String -> up.trim().ifBlank { null }; else -> null }
+        val info = VideoInfo(o.str("translator"), o.str("encoder"), uploader)
+        return info.takeIf { it.translator != null || it.encoder != null || it.uploader != null }
+    }
+
+    /**
+     * What goes into a source's name from a stored [VideoInfo.credits] line: the translator unless it
+     * is the fansub the name already starts with, then encoder and uploader (one entry when they are
+     * the same person). "" when there is nothing to add.
+     */
+    fun creditsFor(stored: String, fansub: String): String {
+        val p = stored.split('|')
+        fun part(i: Int) = p.getOrNull(i)?.trim()?.takeIf { it.isNotEmpty() && it.length <= 40 }
+        val translator = part(0)?.takeIf { !it.equals(fansub.trim(), ignoreCase = true) }
+        val encoder = part(1); val uploader = part(2)
+        return listOfNotNull(
+            translator?.let { "Tr: $it" },
+            if (encoder != null && encoder.equals(uploader, ignoreCase = true)) "Enc/Up: $encoder" else null,
+            encoder?.takeIf { !it.equals(uploader, ignoreCase = true) }?.let { "Enc: $it" },
+            uploader?.takeIf { !it.equals(encoder, ignoreCase = true) }?.let { "Up: $it" },
+        ).joinToString(", ")
     }
 
     /** /bolum/<epId>/cevirmen/<trId> JSON: {"success":true,"videos":[{"id","name"}]}. */

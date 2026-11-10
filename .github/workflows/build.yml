@@ -67,12 +67,22 @@ jobs:
           # (repo Settings -> Secrets and variables -> Actions -> GRADLE_ENCRYPTION_KEY)
           cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
 
+      # Anizm's playlist parsing, timestamp-join search and page parsing, checked without Gradle
+      # (a standalone kotlinc). A failure here stops the build: a plugin that mis-reads playlists
+      # should not be published.
+      - name: Anizm unit checks
+        run: |
+          chmod +x $GITHUB_WORKSPACE/src/AnizmProvider/tools/*.sh
+          $GITHUB_WORKSPACE/src/AnizmProvider/tools/check-units.sh
+
       - name: Build Plugins
         run: |
           cd $GITHUB_WORKSPACE/src
           chmod +x gradlew
           ./gradlew make makePluginsJson
           ./gradlew ensureJarCompatibility
+          # A report, never a failure: methods ART would leave uncompiled (see the script).
+          for f in $(find . -path '*/build/AnizmProvider.cs3'); do AnizmProvider/tools/method-sizes.sh "$f" || true; done
           # find instead of `cp **/build/*.cs3`: that relies on bash's globstar option,
           # which isn't enabled by default — it happens to work today only because every
           # module's build output is exactly one directory deep. find is correct
