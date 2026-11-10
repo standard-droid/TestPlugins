@@ -2905,12 +2905,16 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // v45: some Beta Player uploads are separately encoded parts joined into one playlist with no
     // #EXT-X-DISCONTINUITY between them (2026-10-06, faa18cda… 1080p: three ~473.39 s parts; at
     // segment 237 the video PTS drops from 474.83 s back to 1.48 s). ExoPlayer then waits for ever
-    // at 7:53. Each part ends on a short segment, so the segment after each short one is checked:
-    // when its first PTS is far below where the playlist places it, the tag goes in before it and
-    // the playlist is served from the local server. Anything unclear leaves the variant as it was.
+    // at 7:53. When a segment's first PTS is far from where the playlist places it, the tag goes in
+    // before it and the playlist is served from the local server. Anything unclear leaves the
+    // variant as it was.
+    // v47: the join is searched for over the whole playlist. v45 only looked at the first 8
+    // segments that follow a short one, so an upload with many short segments (a keyframe at
+    // every scene cut), or a part that doesn't end on a short segment, still stalled at 7:54.
+    // A playlist that already has a discontinuity is no longer skipped: only the missing ones go in.
     private suspend fun markBetaJoins(variants: List<Variant>, headers: Map<String, String>): List<Variant> = coroutineScope {
         variants.map { v -> async {
-            val fixed = try { markJoins(v.url, headers) }
+            val fixed = try { markJoins(v.url, headers, "${v.height}p") }
                 catch (e: kotlinx.coroutines.CancellationException) { throw e }
                 catch (e: Exception) { log("beta: join check for ${v.height}p failed: ${e.message}"); null }
             val local = fixed?.let { localHls.register(v.url, "", headers, it) }
@@ -2918,41 +2922,88 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         } }.map { it.await() }
     }
 
-    /** The playlist with #EXT-X-DISCONTINUITY added where the timestamps restart, or null if none do. */
-    private suspend fun markJoins(playlistUrl: String, headers: Map<String, String>): String? {
+    /**
+     * The playlist with #EXT-X-DISCONTINUITY added where the timestamps jump, or null if none do.
+     *
+     * drift(k) = (first PTS of segment k) − (first PTS of segment 0 + where the playlist puts k). It is
+     * flat within a part and steps at each join (−473 s per part in the v45 case), so only ranges
+     * whose ends differ are split further, 7 points at a time in parallel: an 1,100-segment episode
+     * with two joins takes about 4 rounds of small (16 KB) reads, a clean one takes 2 reads.
+     */
+    private suspend fun markJoins(playlistUrl: String, headers: Map<String, String>, label: String): String? {
         val text = playlistText(playlistUrl, headers, 10L)
-        if (!text.trimStart().startsWith("#EXTM3U") || text.contains("#EXT-X-DISCONTINUITY")) return null
+        if (!text.trimStart().startsWith("#EXTM3U")) return null
+        // Byte-range or fMP4 segments: the head of the file is not the head of a segment / not TS.
+        if (text.contains("#EXT-X-BYTERANGE") || text.contains("#EXT-X-MAP")) return null
         val lines = text.lines()
-        class Seg(val dur: Double, val start: Double, val line: Int, val url: String)
+        class Seg(val dur: Double, val start: Double, val line: Int, val url: String, val marked: Boolean)
         val segs = ArrayList<Seg>()
         var dur: Double? = null
         var t = 0.0
+        var pendingDisc = false
         lines.forEachIndexed { i, raw ->
             val l = raw.trim()
             when {
                 l.startsWith("#EXTINF:") -> dur = extinfRe.find(l)?.groupValues?.get(1)?.toDoubleOrNull()
+                l.startsWith("#EXT-X-DISCONTINUITY") && !l.startsWith("#EXT-X-DISCONTINUITY-SEQUENCE") -> pendingDisc = true
                 l.isEmpty() || l.startsWith("#") -> {}
                 else -> {
                     val d = dur ?: return@forEachIndexed
                     val u = try { java.net.URI(playlistUrl).resolve(l).toString() } catch (_: Exception) { l }
-                    segs += Seg(d, t, i, u); t += d; dur = null
+                    segs += Seg(d, t, i, u, pendingDisc); t += d; dur = null; pendingDisc = false
                 }
             }
         }
         if (segs.size < 3) return null
-        val typical = segs.map { it.dur }.sorted()[segs.size / 2]
-        val candidates = (1 until segs.size).filter { segs[it - 1].dur < typical * 0.9 }.take(8)
-        if (candidates.isEmpty()) return null
-        val base = firstPtsOf(segs[0].url, headers) ?: return null
         val wrap = (1L shl 33) / 90_000.0
-        val joins = candidates.filter { k ->
-            val p = firstPtsOf(segs[k].url, headers) ?: return@filter false
-            val behind = ((base + segs[k].start - p) % wrap + wrap) % wrap // how far p is below where it should be
-            behind > 5.0 && behind < wrap / 2
+        val budget = java.util.concurrent.atomic.AtomicInteger(80) // segment reads, at most
+        val gate = Semaphore(6)
+        suspend fun ptsAt(k: Int): Double? {
+            if (budget.decrementAndGet() < 0) return null
+            return gate.withPermit {
+                try { firstPtsOf(segs[k].url, headers) }
+                catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (_: Exception) { null }
+            }
         }
-        if (joins.isEmpty()) return null
-        log("beta: timestamps restart at ${joins.joinToString { "segment $it (%.1f s)".format(segs[it].start) }}, marking them as discontinuities")
-        val after = joins.map { segs[it - 1].line }.toSet()
+        val base = ptsAt(0) ?: run { log("beta: join check for $label: no timestamp in the first segment"); return null }
+        // In (−wrap/2, wrap/2]: negative = behind where the playlist puts it (a restart).
+        fun drift(k: Int, p: Double): Double {
+            val x = ((p - base - segs[k].start) % wrap + wrap) % wrap
+            return if (x > wrap / 2) x - wrap else x
+        }
+        val last = segs.size - 1
+        val dLast = ptsAt(last)?.let { drift(last, it) }
+            ?: run { log("beta: join check for $label: no timestamp in the last segment"); return null }
+        val joins = java.util.concurrent.ConcurrentSkipListSet<Int>()
+        val unresolved = java.util.concurrent.atomic.AtomicBoolean(false)
+        val typical = segs.map { it.dur }.sorted()[segs.size / 2]
+        suspend fun search(lo: Int, dLo: Double, hi: Int, dHi: Double) {
+            if (kotlin.math.abs(dHi - dLo) <= 5.0) return
+            if (hi - lo == 1) { joins += hi; return }
+            val n = minOf(7, hi - lo - 1)
+            val points = (1..n).map { lo + ((hi - lo).toLong() * it / (n + 1)).toInt() }.distinct().filter { it in (lo + 1) until hi }
+            val ds = coroutineScope { points.map { k -> async { ptsAt(k)?.let { drift(k, it) } } }.map { it.await() } }
+            val known = points.zip(ds).filter { it.second != null }.map { it.first to it.second!! }
+            if (known.isEmpty()) {
+                // Nothing inside could be read. In a short range, a part's last segment is the short
+                // one (v45's rule), so the join goes after the shortest segment, if one is short.
+                val k = if (hi - lo <= 16) ((lo + 1)..hi).minByOrNull { segs[it - 1].dur } else null
+                if (k != null && segs[k - 1].dur < typical * 0.9) joins += k else unresolved.set(true)
+                return
+            }
+            val chain = listOf(lo to dLo) + known + listOf(hi to dHi)
+            coroutineScope { chain.zipWithNext().forEach { (a, b) -> launch { search(a.first, a.second, b.first, b.second) } } }
+        }
+        search(0, 0.0, last, dLast)
+        val missing = joins.filter { !segs[it].marked }
+        if (missing.isEmpty()) {
+            log("beta: $label timestamps " + (if (joins.isEmpty()) "continuous" else "jump only where already marked") +
+                " (drift at end %.1f s, ${80 - maxOf(budget.get(), 0)} reads${if (unresolved.get()) ", some ranges unreadable" else ""})".format(dLast))
+            return null
+        }
+        log("beta: $label timestamps jump at ${missing.joinToString { "segment $it (%.1f s)".format(segs[it].start) }}, marking them as discontinuities")
+        val after = missing.map { segs[it - 1].line }.toSet()
         return buildString {
             lines.forEachIndexed { i, l -> append(l).append('\n'); if (i in after) append("#EXT-X-DISCONTINUITY\n") }
         }
