@@ -2,7 +2,7 @@
     {
         "url": "https://raw.githubusercontent.com/standard-droid/TestPlugins/builds/AnizmProvider.cs3",
         "status": 1,
-        "version": 51,
+        "version": 52,
         "name": "AnizmProvider",
         "internalName": "AnizmProvider",
         "authors": [
@@ -17,9 +17,9 @@
             "AnimeMovie",
             "OVA"
         ],
-        "iconUrl": "https://anizm.net/favicon.ico",
+        "iconUrl": "https://www.google.com/s2/favicons?domain=anizm.net&sz=128",
         "apiVersion": 1,
-        "fileHash": "sha256-7df1288bc1aa5f95532d52e54beea3fc2db3ea7f6da5547ae1d978e7381afdc0"
+        "fileHash": "sha256-8100ce1d12d99947f6112f1039f40472913e93efa5c9026e6c43ae07675ba0f1"
     },
     {
         "url": "https://raw.githubusercontent.com/standard-droid/TestPlugins/builds/ReZeroIzleProvider.cs3",
