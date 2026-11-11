@@ -1,5 +1,5 @@
 // use an integer for version numbers
-version = 18
+version = 19
 
 cloudstream {
     // All of the following are optional, remove any line you don't need
@@ -20,4 +20,8 @@ cloudstream {
     iconUrl = "https://rezeroizle.com/images/icon.png"
 
     language = "tr"
+
+    // No Android imports (BasePlugin, com.lagradost.api.Log), so :make also builds a .jar for
+    // the cross-platform app; ensureJarCompatibility fails the build if an android.* import slips in.
+    isCrossPlatform = true
 }
