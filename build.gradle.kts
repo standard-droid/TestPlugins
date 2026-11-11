@@ -34,6 +34,8 @@ buildscript {
         // AGP 9 support.
         classpath("com.github.recloudstream:gradle:81b1d424d2")
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.20")
+        // kotlinx.serialization's compiler plugin (@Serializable), same Kotlin version as above.
+        classpath("org.jetbrains.kotlin:kotlin-serialization:2.3.20")
     }
 }
 
@@ -55,6 +57,8 @@ subprojects {
     // No "kotlin-android": AGP 9 compiles Kotlin itself (built-in Kotlin), and applying
     // the separate plugin on top of it is an error.
     apply(plugin = "com.lagradost.cloudstream3.gradle")
+    // @Serializable classes for parseJson/toJson (AppUtils), which the app decodes with kotlinx.serialization.
+    apply(plugin = "org.jetbrains.kotlin.plugin.serialization")
 
     cloudstream {
         // when running through github workflow, GITHUB_REPOSITORY should contain current repository name
@@ -122,7 +126,11 @@ subprojects {
         // My earlier assumption that the stub "already bundles coroutines directly" was
         // wrong. CSX (SaurabhKaperwan/CSX) — proof this stub system works — declares this
         // exact dependency itself; matching it exactly rather than guessing again.
-        implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+        // Cross-platform (KMP) artifacts only: the app supplies the Android parts at runtime
+        // (Dispatchers.Main among them), and only a plugin's own classes go into its .cs3/.jar,
+        // so these are compile-time references. Versions are the ones built for this Kotlin (2.3).
+        implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
+        implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.10.0")
 
         // These dependencies can include any of those which are added by the app,
         // but you don't need to include any of them if you don't need them.
@@ -132,8 +140,8 @@ subprojects {
         implementation("org.jsoup:jsoup:1.22.2") // HTML Parser
         // IMPORTANT: Do not bump Jackson above 2.13.1, as newer versions will
         // break compatibility on older Android devices.
-        // Jackson removed (3.3) — confirmed unused; both providers parse JSON with
-        // org.json (JSONObject/JSONArray) exclusively. One less dependency to track.
+        // No Jackson: JSON goes through AppUtils.parseJson/toJson with @Serializable classes,
+        // which current app versions decode with kotlinx.serialization.
     }
 }
 
