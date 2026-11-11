@@ -1,7 +1,12 @@
 package com.a.anizm
 
 import android.content.SharedPreferences
-import org.json.JSONObject
+import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.longOrNull
 
 /**
  * A small in-memory cache with a size cap and a time-to-live. Entries past the TTL read as absent;
@@ -48,12 +53,13 @@ internal class PersistentCache(private val prefs: SharedPreferences?, private va
         map?.let { return it }
         val m = LinkedHashMap<String, Item>()
         try {
-            val o = JSONObject(prefs?.getString(name, null) ?: "{}")
+            // Stored as {"key":[time,"value"],…}.
+            val o = tryParseJson<Map<String, JsonArray>>(prefs?.getString(name, null) ?: "{}") ?: emptyMap()
             val now = System.currentTimeMillis()
-            for (k in o.keys()) {
-                val a = o.optJSONArray(k) ?: continue
-                val t = a.optLong(0)
-                if (now - t <= ttlMs) m[k] = Item(a.optString(1), t)
+            for ((k, a) in o) {
+                val t = (a.getOrNull(0) as? JsonPrimitive)?.longOrNull ?: continue
+                val v = (a.getOrNull(1) as? JsonPrimitive)?.content ?: continue
+                if (now - t <= ttlMs) m[k] = Item(v, t)
             }
         } catch (_: Exception) {}
         map = m
@@ -61,8 +67,7 @@ internal class PersistentCache(private val prefs: SharedPreferences?, private va
     }
     private fun save(m: LinkedHashMap<String, Item>) {
         try {
-            val o = JSONObject()
-            for ((k, v) in m) o.put(k, org.json.JSONArray().put(v.time).put(v.value))
+            val o = buildJsonObject { for ((k, v) in m) put(k, buildJsonArray { add(JsonPrimitive(v.time)); add(JsonPrimitive(v.value)) }) }
             prefs?.edit()?.putString(name, o.toString())?.apply()
         } catch (_: Exception) {}
     }

@@ -212,6 +212,25 @@ fun main() {
     check("only an uploader", AnizmParser.creditsFor(AnizmParser.VideoInfo(null, null, "C").credits(), "X") == "Up: C")
     check("nothing known → no credits", AnizmParser.videoInfo("""{"success":true,"url":"x"}""") == null && AnizmParser.creditsFor("||", "X") == "")
 
+    section("Site JSON (kotlinx)")
+    val hits = AnizmParser.searchApi("""{"data":[{"info_slug":"yani-neko","info_title":"Yani Neko","info_poster":"abc.webp","info_year":2025,"info_titleenglish":"Chainsmoker Cat"},{"info_title":"no slug"},7],"has_more":false}""", "https://anizm.net")
+    check("search: wrapped list, numeric year, items without a slug skipped", hits.size == 1 && hits[0].slug == "yani-neko" && hits[0].year == 2025, hits)
+    check("search: poster made absolute", hits.firstOrNull()?.poster?.startsWith("https://anizm.net/storage/pcovers/") == true, hits.firstOrNull()?.poster)
+    check("search: other titles searchable", hits.firstOrNull()?.haystack?.contains("chainsmoker") == true, hits.firstOrNull()?.haystack)
+    check("search: bare array, year as a string", AnizmParser.searchApi("""[{"info_slug":"a","info_title":"A","info_year":"2019"}]""", "https://anizm.net").map { it.year } == listOf(2019))
+    check("search: not JSON → nothing", AnizmParser.searchApi("<html>blocked</html>", "https://anizm.net").isEmpty())
+    val sugg = AnizmParser.suggestions("""{"results":[{"title":"Frieren","year":"2023","url":"https://anizm.net/sousou-no-frieren"},{"title":"no url"}]}""")
+    check("suggestions", sugg.size == 1 && sugg[0].year == 2023 && sugg[0].url.endsWith("frieren"), sugg)
+    val vids = { t: String -> AnizmParser.videos(t).map { "${it.id}:${it.name}" } }
+    check("videos: {videos:[…]}, numeric ids, no name → source", vids("""{"success":true,"videos":[{"id":1877069,"name":"Sistenn"},{"video_id":"1877071","source":"Beta Player"},{"id":"x1"}]}""") == listOf("1877069:Sistenn", "1877071:Beta Player"),
+        vids("""{"success":true,"videos":[{"id":1877069,"name":"Sistenn"},{"video_id":"1877071","source":"Beta Player"},{"id":"x1"}]}"""))
+    check("videos: {data:{videos:[…]}} and {data:[…]} and a bare array", vids("""{"data":{"videos":[{"id":1}]}}""") == listOf("1:Player") &&
+        vids("""{"data":[{"id":2,"name":"GDrive"}]}""") == listOf("2:GDrive") && vids("""[{"id":3,"name":" Voe "}]""") == listOf("3:Voe"))
+    check("player url: relative, resolved against playerOrigin", AnizmParser.playerUrl("""{"success":true,"url":"/player/5","playerOrigin":"https://p.example"}""", "https://anizm.net") == "https://p.example/player/5",
+        AnizmParser.playerUrl("""{"success":true,"url":"/player/5","playerOrigin":"https://p.example"}""", "https://anizm.net"))
+    check("player url: success false → none", AnizmParser.playerUrl("""{"success":false,"url":"/player/5"}""", "https://anizm.net") == null)
+    check("video info: uploader as a plain name", AnizmParser.videoInfo("""{"translator":"LeoSubs","uploader":"leosubs1"}""")?.uploader == "leosubs1")
+
     section("Addresses")
     check("the site itself", onDomain("anizm.net", "anizm.net") && onDomain("www.anizm.net", "anizm.net"))
     check("a lookalike is not the site", !onDomain("evilanizm.net", "anizm.net") && !onDomain("anizm.net.evil.com", "anizm.net"))

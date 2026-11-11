@@ -3,8 +3,10 @@ package com.a.anizm
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.nicehttp.NiceResponse
-import org.json.JSONArray
-import org.json.JSONObject
+import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -73,17 +75,18 @@ internal suspend fun AnizmProvider.processAincrad(embed: String, label: String, 
         val streamText = streamResp.text
         // v31: these two exits used to be silent, so a changed answer from getVideo left
         // nothing in the log but a missing source. Say what came back instead.
-        val json = try { JSONObject(streamText) } catch (_: Exception) {
+        val raw = tryParseJson<JsonObject>(streamText) ?: run {
             log("aincrad: getVideo not JSON (http ${streamResp.code}, ${streamResp.headers["Content-Type"]}, server=${streamResp.headers["server"]}, " +
                 "cf-mitigated=${streamResp.headers["cf-mitigated"]}, final=${streamResp.url.take(80)}): ${oneLine(streamText, 200)}")
             return false
         }
-        securedLink = json.optString("securedLink", "")
-        videoSource = json.optString("videoSource", "")
-        log("aincrad: hls=${json.optBoolean("hls")} secured=${securedLink.isNotBlank()} source=${videoSource.isNotBlank()} same=${securedLink == videoSource} dl=${json.optJSONArray("downloadLinks")?.length() ?: 0} " +
-            "keys=${json.keys().asSequence().joinToString(",")} cookies=${cookieJar.keys.joinToString(",").ifEmpty { "none" }}")
+        val gv = raw.decodeAs<AincradVideo>() ?: AincradVideo()
+        securedLink = gv.securedLink.orEmpty()
+        videoSource = gv.videoSource.orEmpty()
+        log("aincrad: hls=${gv.hls} secured=${securedLink.isNotBlank()} source=${videoSource.isNotBlank()} same=${securedLink == videoSource} dl=${gv.downloadLinks?.size ?: 0} " +
+            "keys=${raw.keys.joinToString(",")} cookies=${cookieJar.keys.joinToString(",").ifEmpty { "none" }}")
         if (videoSource.isBlank() && securedLink.isBlank())
-            log("aincrad: getVideo gave no link (http ${streamResp.code}), keys=${json.keys().asSequence().joinToString()}: ${oneLine(streamText, 200)}")
+            log("aincrad: getVideo gave no link (http ${streamResp.code}), keys=${raw.keys.joinToString()}: ${oneLine(streamText, 200)}")
         else log("aincrad: link ${videoSource.ifBlank { securedLink }.substringBefore('?').take(120)}")
         // Valid until 2 min before the URL's own expiry (seconds or ms epoch), max 30 min;
         // 10 min if the URL doesn't say.
@@ -186,3 +189,12 @@ internal suspend fun AnizmProvider.processAincrad(embed: String, label: String, 
     }
     return resolved
 }
+
+/** FirePlayer's getVideo answer (only the fields read; the rest is ignored). */
+@Serializable
+internal data class AincradVideo(
+    val hls: Str? = null,
+    val videoSource: Str? = null,
+    val securedLink: Str? = null,
+    val downloadLinks: JsonArray? = null,
+)

@@ -2,6 +2,8 @@ package com.a.anizm
 
 import com.lagradost.cloudstream3.app
 import com.lagradost.nicehttp.NiceResponse
+import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import kotlinx.serialization.Serializable
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 /**
@@ -55,8 +57,8 @@ internal class LocalHlsServer(
                     if (idle > 30_000L) continue
                     val r = fetch(b.url, b.headers) ?: continue
                     beats++
-                    val o = try { org.json.JSONObject(r.text) } catch (_: Exception) { null }
-                    val k = o?.optString("k").orEmpty(); val kx = o?.optLong("kx") ?: 0L
+                    val o = tryParseJson<StreamToken>(r.text)
+                    val k = o?.k.orEmpty(); val kx = o?.kx?.toLongOrNull() ?: 0L
                     val t = b.token
                     if (t != null && r.code in 200..299 && k.isNotBlank() && kx > 0) { t.query = "k=$k&kx=$kx"; t.expiresAtMs = TokenState.expiry(t.query) }
                     if (beats == 1) log("hls-proxy: playing signal sent (every 10 s while playing)")
@@ -88,8 +90,8 @@ internal class LocalHlsServer(
             t.lastTryMs = now
             try {
                 val r = fetch(t.refreshUrl, t.headers) ?: throw java.io.IOException("no answer")
-                val o = org.json.JSONObject(r.text)
-                val k = o.optString("k"); val kx = o.optLong("kx")
+                val o = tryParseJson<StreamToken>(r.text) ?: throw java.io.IOException("answer not JSON")
+                val k = o.k.orEmpty(); val kx = o.kx?.toLongOrNull() ?: 0L
                 if (r.code in 200..299 && k.isNotBlank() && kx > 0) {
                     t.query = "k=$k&kx=$kx"; t.expiresAtMs = TokenState.expiry(t.query)
                     log("hls-proxy: stream token renewed, valid ${(t.expiresAtMs - System.currentTimeMillis()) / 60000} more min")
@@ -316,3 +318,7 @@ internal class LocalHlsServer(
         }
     }
 }
+
+/** Sistenn's /api/v1/player answer: a fresh stream token (k) and its expiry (kx, epoch seconds or ms). */
+@Serializable
+internal data class StreamToken(val k: Str? = null, val kx: Str? = null)

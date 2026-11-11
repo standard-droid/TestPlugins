@@ -3,8 +3,7 @@ package com.a.anizm
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.nicehttp.NiceResponse
-import org.json.JSONArray
-import org.json.JSONObject
+import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -368,11 +367,11 @@ internal suspend fun AnizmProvider.sniffHlsViaWebView(pageUrl: String, referer: 
                 var polls = 0
                 fun store(json: String, partial: Boolean) {
                     try {
-                        val o = JSONObject(json)
+                        val o = tryParseJson<Map<String, String>>(json) ?: throw IllegalArgumentException("not a map of playlists")
                         if (sniffedPlaylistTexts.size > 40) sniffedPlaylistTexts.clear()
-                        for (k in o.keys()) sniffedPlaylistTexts[k] = o.getString(k)
-                        log("sniff: page fetched ${o.length()} playlist(s) itself${if (partial) " (the rest did not answer in time)" else ""}: " +
-                            o.keys().asSequence().joinToString { it.substringAfterLast('/') })
+                        sniffedPlaylistTexts.putAll(o)
+                        log("sniff: page fetched ${o.size} playlist(s) itself${if (partial) " (the rest did not answer in time)" else ""}: " +
+                            o.keys.joinToString { it.substringAfterLast('/') })
                     } catch (e: Exception) { log("sniff: playlist capture unreadable: ${e.message}") }
                 }
                 fun poll() {
