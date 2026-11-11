@@ -2,14 +2,14 @@
     {
         "url": "https://raw.githubusercontent.com/standard-droid/TestPlugins/builds/AnizmProvider.cs3",
         "status": 1,
-        "version": 52,
+        "version": 54,
         "name": "AnizmProvider",
         "internalName": "AnizmProvider",
         "authors": [
             " "
         ],
         "description": "Anizm (anizm.net) - T\u00fcrk\u00e7e altyaz\u0131l\u0131 anime",
-        "fileSize": 361550,
+        "fileSize": 410094,
         "repositoryUrl": "https://github.com/standard-droid/TestPlugins",
         "language": "tr",
         "tvTypes": [
@@ -17,9 +17,9 @@
             "AnimeMovie",
             "OVA"
         ],
-        "iconUrl": "https://www.google.com/s2/favicons?domain=anizm.net&sz=128",
+        "iconUrl": "https://anizm.net/favicon.ico",
         "apiVersion": 1,
-        "fileHash": "sha256-8100ce1d12d99947f6112f1039f40472913e93efa5c9026e6c43ae07675ba0f1"
+        "fileHash": "sha256-4eb0992a006a3b99849a7774e0915715d2552ce05123f5420fe0c898787d7fa9"
     },
     {
         "url": "https://raw.githubusercontent.com/standard-droid/TestPlugins/builds/ReZeroIzleProvider.cs3",
@@ -31,7 +31,7 @@
             "a"
         ],
         "description": "Re:Zero kara Hajimeru Isekai Seikatsu \u2014 T\u00fcrk\u00e7e altyaz\u0131l\u0131, Google Drive \u00fczerinden.",
-        "fileSize": 33095,
+        "fileSize": 33460,
         "repositoryUrl": "https://github.com/standard-droid/TestPlugins",
         "language": "tr",
         "tvTypes": [
@@ -40,9 +40,9 @@
         ],
         "iconUrl": "https://rezeroizle.com/images/icon.png",
         "apiVersion": 1,
-        "fileHash": "sha256-e29588d22b56405d0c81feba2c3d8c0cef2616d958809fb0e22f1d470f2f369d",
-        "jarFileSize": 108902,
+        "fileHash": "sha256-266e965b380d4fc06249e0557aef9c807ade0366176aa80fd16f586594847aba",
+        "jarFileSize": 109643,
         "jarUrl": "https://raw.githubusercontent.com/standard-droid/TestPlugins/builds/ReZeroIzleProvider.jar",
-        "jarHash": "sha256-c5fffb8029019be529a7957e2f295b7b51006996d175e5d76b2f4368e0539b52"
+        "jarHash": "sha256-04281371752b26fc595f7c824b7bf8c6554d499d3c6c22fa013853c9bd55fb01"
     }
 ]
