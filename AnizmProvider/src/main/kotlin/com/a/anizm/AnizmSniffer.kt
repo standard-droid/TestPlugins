@@ -104,17 +104,22 @@ internal suspend fun AnizmProvider.processExtractorSource(
         val skip = cached == null && (sniffHostOnCooldown(exUrl) || overBudget)
         if (skip) log("step4: skipping sniff for $label (${if (overBudget) "episode sniff budget spent" else "host on cooldown"})")
         val sniffed = cached ?: if (skip) null else try {
-            val t0 = System.currentTimeMillis()
             sniffGate.withPermit {
                 // v33: another source (or load) may have sniffed this page while we waited.
                 sniffCache[exUrl]?.takeIf { System.currentTimeMillis() - it.second < sniffCacheTtlMs }?.first
                     ?.also { log("step4: $label was sniffed meanwhile — reusing it") }
-                    ?: sniffHlsViaWebView(exUrl, "$mainUrl/")
+                    // v50: only this sniff's own time counts against the episode's budget. It used to
+                    // include waiting at the gate for another load's sniff, so the second of two
+                    // overlapping loads skipped all of its own.
+                    // The Referer stays the site's origin, not the episode page: these players are on
+                    // other domains, and Chrome's default policy (strict-origin-when-cross-origin)
+                    // sends a cross-site frame only the origin — as Aincrad's document.referrer shows.
+                    ?: run {
+                        val t0 = System.currentTimeMillis()
+                        sniffHlsViaWebView(exUrl, "$mainUrl/").also { sniffSpent.addAndGet(System.currentTimeMillis() - t0) }
+                    }
             }
-                .also {
-                    sniffSpent.addAndGet(System.currentTimeMillis() - t0)
-                    noteSniffResult(exUrl, it != null)
-                }
+                .also { noteSniffResult(exUrl, it != null) }
         }
         catch (e: kotlinx.coroutines.CancellationException) { throw e }
         catch (e: Exception) { log("step4: sniff failed: ${e.message}"); noteSniffResult(exUrl, false); null }
@@ -463,12 +468,12 @@ internal suspend fun AnizmProvider.sniffHlsViaWebView(pageUrl: String, referer: 
                             sniffedHeaders[m0] = kept
                             sniffedVariantUrls[m0] = url
                             log("sniff: player opened variant ${url.take(260)}")
-                            log("sniff:   with headers: " + kept.entries.joinToString("; ") { "${it.key}=${it.value.take(60)}" })
+                            log("sniff:   with headers: " + headersForLog(kept))
                             handler.postDelayed({ if (!done) { log("sniff: no segment request within 4s"); finishCapturing(m0) } }, 4_000L)
                         } else if (!looksPlaylist) {
                             if (sniffedSegmentUrls.put(m0, url) == null) {
                                 log("sniff: player fetched segment ${url.take(260)}")
-                                if (kept != sniffedHeaders[m0]) log("sniff:   segment headers: " + kept.entries.joinToString("; ") { "${it.key}=${it.value.take(60)}" })
+                                if (kept != sniffedHeaders[m0]) log("sniff:   segment headers: " + headersForLog(kept))
                                 if (sniffedHeaders[m0] == null || variantRef.get() == null) sniffedHeaders[m0] = kept
                                 // v35: a second more lets the player load its other playlists and a few
                                 // more segments, which is what the variant filter below goes by.
@@ -513,7 +518,7 @@ internal suspend fun AnizmProvider.sniffHlsViaWebView(pageUrl: String, referer: 
                             val kept = cleanCapturedHeaders(reqHeaders)
                             sniffedHeaders[master] = kept
                             log("sniff: player opened variant ${url.substringBefore('?').takeLast(50)} with headers: " +
-                                kept.entries.joinToString("; ") { "${it.key}=${it.value.take(60)}" })
+                                headersForLog(kept))
                             handler.post { finishCapturing(master) }
                         }
                         return null

@@ -8,6 +8,8 @@ import com.a.anizm.Hls
 import com.a.anizm.onDomain
 import com.a.anizm.sameHost
 import com.a.anizm.withParams
+import com.a.anizm.redactForLog
+import com.a.anizm.headersForLog
 import kotlinx.coroutines.runBlocking
 import org.jsoup.Jsoup
 import kotlin.system.exitProcess
@@ -216,6 +218,15 @@ fun main() {
     check("withParams: replaces a key and keeps the others", withParams("https://h/p?a=1&k=old", mapOf("k" to "new")) == "https://h/p?a=1&k=new", withParams("https://h/p?a=1&k=old", mapOf("k" to "new")))
     check("withParams: a fragment stays at the end, once", withParams("https://h/p#id", mapOf("k" to "v")) == "https://h/p?k=v#id", withParams("https://h/p#id", mapOf("k" to "v")))
     check("withParams: query and fragment", withParams("https://h/p?a=1#id", mapOf("k" to "v")) == "https://h/p?a=1&k=v#id", withParams("https://h/p?a=1#id", mapOf("k" to "v")))
+
+    section("Log redaction")
+    val signed = "sniff: found https://cdn.h/p/v.m3u8?k=AbCdEfGhIjKlMnOpQrSt&kx=1763000000&q=1080"
+    check("a token is cut to 4 characters and its length", redactForLog(signed) == "sniff: found https://cdn.h/p/v.m3u8?k=AbCd…(20)&kx=1763000000&q=1080", redactForLog(signed))
+    check("short values and text without a query are untouched", redactForLog("http 404 for https://anizm.net/x?sayfa=2") == "http 404 for https://anizm.net/x?sayfa=2" &&
+        redactForLog("plain message") == "plain message")
+    val hdr = headersForLog(linkedMapOf("User-Agent" to "Mozilla/5.0", "Cookie" to "cf_clearance=SECRET1; __cf_bm=SECRET2", "Authorization" to "Bearer SECRET3"))
+    check("cookies by name only, credentials hidden", hdr == "User-Agent=Mozilla/5.0; Cookie=[cf_clearance,__cf_bm]; Authorization=[hidden]", hdr)
+    check("no secret survives", !hdr.contains("SECRET"))
 
     println("\n$passed passed, $failed failed")
     exitProcess(if (failed == 0) 0 else 1)
