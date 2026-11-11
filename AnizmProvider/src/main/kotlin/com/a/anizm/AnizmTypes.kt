@@ -127,3 +127,15 @@ internal sealed class Mp4Probe {
 // a file over its signed-out play limit → 429. The key is Drive's public web key: it is read
 // from the preview page (every AIza… string there is tried once) and then remembered.
 internal data class DriveStream(val height: Int, val url: String, val sizeBytes: Long?)
+
+/**
+ * v49: marks a loadLinks run made for casting. A Chromecast (or any cast receiver) fetches the
+ * stream itself, so an address on this phone's 127.0.0.1 means nothing to it: under this mark
+ * the players skip the local server where a direct address works too, and links that only work
+ * through it are left out. Carried in the coroutine context, so every step of the run sees it.
+ */
+internal object CastingLoad : kotlin.coroutines.AbstractCoroutineContextElement(CastingLoad), kotlin.coroutines.CoroutineContext.Key<CastingLoad>
+
+internal suspend fun isCastingLoad(): Boolean = kotlin.coroutines.coroutineContext[CastingLoad] != null
+
+internal fun isLocalLink(url: String): Boolean = url.startsWith("http://127.0.0.1:") || url.startsWith("http://localhost:")

@@ -66,7 +66,7 @@ internal suspend fun AnizmProvider.processAincrad(embed: String, label: String, 
             val gvData = mapOf("hash" to hash, "r" to "$mainUrl/")
             val viaCronet = chromeFetch(gvUrl, gvHeaders, 10L, formBody = gvData)
             viaChrome = viaCronet != null
-            (viaCronet ?: app.post(gvUrl, headers = gvHeaders, data = gvData, timeout = 10))
+            (viaCronet ?: app.post(gvUrl, headers = chromeOrderedMap(gvHeaders), data = gvData, timeout = 10))
                 .also { cookieJar.putAll(it.cookies) }
         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
           catch (e: Exception) { log("aincrad error: ${e.javaClass.simpleName}: ${e.message}"); return false }
@@ -127,7 +127,7 @@ internal suspend fun AnizmProvider.processAincrad(embed: String, label: String, 
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) { log("aincrad: probe failed: ${e.message}"); return@run }
-        val t = head.text.trimStart()
+        val t = cappedText(head).trimStart()
         log("aincrad: probe ($probedVia, getVideo via ${if (viaChrome) "chrome" else "okhttp"}) http ${head.code}, ${head.headers["Content-Type"]}, ${t.length}B, starts '${t.take(24).replace('\n', ' ')}'")
         when {
             t.startsWith("#EXTM3U") -> {
@@ -155,7 +155,8 @@ internal suspend fun AnizmProvider.processAincrad(embed: String, label: String, 
                     // and CloudStream de-duplicates it. Keyed by the master's text: its /m3/v1.<token> paths
                     // expire (same after 18 min, different and dead 2 days later), and a new text means new ones.
                     val lockKey = "$cand|${t.hashCode()}"
-                    val playUrl = if (settings.lockTopQuality && top != null && variants.size > 1)
+                    // v49: not when casting: the receiver can't reach this phone's local server (CastingLoad).
+                    val playUrl = if (settings.lockTopQuality && top != null && variants.size > 1 && !isCastingLoad())
                         (aincradLocked[lockKey]?.takeIf { now - it.second < 5 * 60 * 60_000L }?.first
                             ?: Hls.topOnlyMaster(t, cand, top)?.let { localHls.register(cand, "", hlsHeaders, it) }
                                 ?.also { aincradLocked[lockKey] = it to now; if (aincradLocked.size > 200) aincradLocked.entries.removeAll { e -> now - e.value.second > 5 * 60 * 60_000L } })
