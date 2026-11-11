@@ -1,4 +1,4 @@
-version = 53
+version = 54
 
 cloudstream {
     language    = "tr"
@@ -15,8 +15,5 @@ cloudstream {
     status  = 1
     tvTypes = listOf("Anime", "AnimeMovie", "OVA")
 
-    // PNG, not the site's favicon.ico: anizm.net answers non-browser requests with a Cloudflare
-    // 403, and an .ico is a risk for Android's image decoder. Google's favicon service serves the
-    // site's fox logo as a 128x128 PNG.
-    iconUrl = "https://www.google.com/s2/favicons?domain=anizm.net&sz=128"
+    iconUrl = "https://anizm.net/favicon.ico"
 }

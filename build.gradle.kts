@@ -79,14 +79,16 @@ subprojects {
         }
 
         compileOptions {
-            sourceCompatibility = JavaVersion.VERSION_1_8
-            targetCompatibility = JavaVersion.VERSION_1_8
+            // Java 11, as CloudStream's library is built: its inline helpers (AppUtils.parseJson,
+            // tryParseJson) can't be inlined into 1.8 bytecode. The .cs3 is still dexed for minSdk 21.
+            sourceCompatibility = JavaVersion.VERSION_11
+            targetCompatibility = JavaVersion.VERSION_11
         }
     }
 
     tasks.withType<KotlinJvmCompile>().configureEach {
         compilerOptions {
-            jvmTarget.set(JvmTarget.JVM_1_8) // Required
+            jvmTarget.set(JvmTarget.JVM_11) // Same as CloudStream's library (see compileOptions)
             freeCompilerArgs.addAll(
                 "-Xno-call-assertions",
                 "-Xno-param-assertions",
