@@ -3,8 +3,6 @@ package com.a.anizm
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.nicehttp.NiceResponse
-import org.json.JSONArray
-import org.json.JSONObject
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay

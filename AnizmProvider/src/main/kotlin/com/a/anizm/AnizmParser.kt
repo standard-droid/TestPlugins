@@ -1,14 +1,18 @@
 package com.a.anizm
 
-import org.json.JSONArray
-import org.json.JSONObject
+import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
 /**
- * Everything that reads anizm.net's HTML and JSON, with no network, Android or CloudStream
- * dependency — only jsoup and org.json. That keeps it checkable on its own against saved copies
+ * Everything that reads anizm.net's HTML and JSON, with no network or Android dependency and nothing
+ * from CloudStream but AppUtils' JSON helpers — jsoup and kotlinx.serialization. That keeps it checkable on its own against saved copies
  * of the site: AnizmProvider/tools/check-parser.sh compiles this file with a plain kotlinc and
  * runs it over AnizmProvider/tools/fixtures (no Gradle, no Android SDK).
  *
@@ -102,13 +106,55 @@ object AnizmParser {
 
     private fun Element.cleanText() = text().replace(cleanRe, "").trim()
 
-    private fun ldJson(doc: Document, vararg types: String): JSONObject? =
+    private fun ldJson(doc: Document, vararg types: String): JsonObject? =
         doc.select("script[type=application/ld+json]").asSequence().mapNotNull { s ->
-            try { JSONObject(s.data().trim()) } catch (_: Exception) { null }
-        }.firstOrNull { it.optString("@type") in types }
+            tryParseJson<JsonObject>(s.data().trim())
+        }.firstOrNull { it.str("@type") in types }
 
-    private fun JSONObject.str(key: String): String? =
-        opt(key)?.takeIf { it is String || it is Number }?.toString()?.trim()?.ifBlank { null }
+    // ── The site's JSON answers ─────────────────────────────────────────────
+    // Ids and years come as strings or numbers depending on the endpoint: [Str] reads either.
+
+    @Serializable
+    private data class SearchItem(
+        @SerialName("info_slug") val slug: Str? = null,
+        @SerialName("info_title") val title: Str? = null,
+        @SerialName("info_poster") val poster: Str? = null,
+        @SerialName("info_year") val year: Str? = null,
+        @SerialName("info_titleoriginal") val titleOriginal: Str? = null,
+        @SerialName("info_titleenglish") val titleEnglish: Str? = null,
+        @SerialName("info_othernames") val otherNames: Str? = null,
+    )
+
+    @Serializable
+    private data class Suggestions(val results: List<Suggestion> = emptyList())
+    @Serializable
+    private data class Suggestion(val title: Str? = null, val url: Str? = null, val year: Str? = null)
+
+    @Serializable
+    private data class VideoAnswer(
+        val success: Str? = null,
+        val url: Str? = null,
+        val playerOrigin: Str? = null,
+        val translator: Str? = null,
+        val encoder: Str? = null,
+        val uploader: JsonElement? = null, // {"name":…} or a plain name
+    )
+
+    @Serializable
+    private data class VideoItem(
+        val id: Str? = null,
+        @SerialName("video_id") val videoId: Str? = null,
+        val name: Str? = null,
+        val source: Str? = null,
+    )
+
+    /** The items of [root], or of the first of [paths] in it that is an array (a path: keys, outermost first). */
+    private fun itemsOf(root: JsonElement?, vararg paths: List<String>): List<JsonObject> {
+        val arr = root as? JsonArray ?: paths.firstNotNullOfOrNull { path ->
+            path.dropLast(1).fold(root) { e, k -> e.obj(k) }.arr(path.last())
+        }
+        return arr?.filterIsInstance<JsonObject>() ?: emptyList()
+    }
 
     /** "bungou-stray-dogs-wan-2-11-bolum-izle" → "bungou-stray-dogs-wan-2". [label] tells a
      *  double episode ("215-216. Bölüm") apart from a title that ends in a number. */
@@ -194,29 +240,21 @@ object AnizmParser {
     // ── Search ──────────────────────────────────────────────────────────────
 
     /** /searchAnime JSON: {"data":[…],"has_more":…} (older: a bare array). */
-    fun searchApi(text: String, base: String): List<SearchHit> {
-        val arr = try {
-            val t = text.trim()
-            if (t.startsWith("[")) JSONArray(t) else JSONObject(t).optJSONArray("data")
-        } catch (_: Exception) { null } ?: return emptyList()
-        return (0 until arr.length()).mapNotNull { i ->
-            val o = arr.optJSONObject(i) ?: return@mapNotNull null
-            val slug = o.str("info_slug") ?: return@mapNotNull null
-            val title = o.str("info_title") ?: return@mapNotNull null
-            val poster = largeCover(o.str("info_poster")?.let { if (it.startsWith("http") || it.startsWith("/")) absUrl(base, it) else absUrl(base, "/storage/pcovers/$it") })
-            val hay = squash(listOf("info_title", "info_titleoriginal", "info_titleenglish", "info_othernames").joinToString(" ") { o.str(it) ?: "" })
-            SearchHit(slug, title, poster, o.str("info_year")?.toIntOrNull(), hay)
+    fun searchApi(text: String, base: String): List<SearchHit> =
+        itemsOf(tryParseJson<JsonElement>(text.trim()), listOf("data")).mapNotNull { e ->
+            val o = e.decodeAs<SearchItem>() ?: return@mapNotNull null
+            val slug = o.slug.nb() ?: return@mapNotNull null
+            val title = o.title.nb() ?: return@mapNotNull null
+            val poster = largeCover(o.poster.nb()?.let { if (it.startsWith("http") || it.startsWith("/")) absUrl(base, it) else absUrl(base, "/storage/pcovers/$it") })
+            val hay = squash(listOf(o.title, o.titleOriginal, o.titleEnglish, o.otherNames).joinToString(" ") { it.orEmpty() })
+            SearchHit(slug, title, poster, o.year?.toIntOrNull(), hay)
         }
-    }
 
     /** /arama-onerileri JSON: {"results":[{"title","year","url"}]} — 3 results, no posters. */
-    fun suggestions(text: String): List<Card> {
-        val arr = try { JSONObject(text.trim()).optJSONArray("results") } catch (_: Exception) { null } ?: return emptyList()
-        return (0 until arr.length()).mapNotNull { i ->
-            val o = arr.optJSONObject(i) ?: return@mapNotNull null
-            Card(o.str("title") ?: return@mapNotNull null, o.str("url") ?: return@mapNotNull null, null, o.str("year")?.toIntOrNull())
+    fun suggestions(text: String): List<Card> =
+        tryParseJson<Suggestions>(text.trim())?.results.orEmpty().mapNotNull { o ->
+            Card(o.title.nb() ?: return@mapNotNull null, o.url.nb() ?: return@mapNotNull null, null, o.year?.toIntOrNull())
         }
-    }
 
     // ── Anime page ──────────────────────────────────────────────────────────
 
@@ -261,7 +299,7 @@ object AnizmParser {
             .firstOrNull { yearRe.matches(it) && it.toInt() in 1950..2100 }?.toIntOrNull()
 
         val tags = doc.select(".v3-anime-detail-tags a").map { it.text().trim() }
-            .ifEmpty { ld?.optJSONArray("genre")?.let { g -> (0 until g.length()).map { g.optString(it, "").trim() } } ?: emptyList() }
+            .ifEmpty { ld?.arr("genre")?.map { it.asText().trim() } ?: emptyList() }
             .filter { it.isNotBlank() && it.length < 30 }.distinct().take(10)
 
         return Anime(title, poster, plot, year, tags, cleanAliases, episodes(doc, url))
@@ -379,10 +417,10 @@ object AnizmParser {
      * playerOrigin when that is set, otherwise against [base]. Null when there is no usable url.
      */
     fun playerUrl(text: String, base: String): String? {
-        val o = try { JSONObject(text.trim()) } catch (_: Exception) { return null }
-        if (!o.optBoolean("success", true)) return null
-        val u = o.str("url") ?: return null
-        val origin = o.str("playerOrigin")?.takeIf { it.startsWith("http") }
+        val o = tryParseJson<VideoAnswer>(text.trim()) ?: return null
+        if (o.success == "false") return null
+        val u = o.url.nb() ?: return null
+        val origin = o.playerOrigin.nb()?.takeIf { it.startsWith("http") }
         return absUrl(origin ?: base, u)?.takeIf { it.startsWith("http") }
     }
 
@@ -397,10 +435,10 @@ object AnizmParser {
      * "uploader":{"name":"Rinrintan","url":…,…}} (seen 2026-11-10). Null when none of the names is there.
      */
     fun videoInfo(text: String): VideoInfo? {
-        val o = try { JSONObject(text.trim()) } catch (_: Exception) { return null }
-        val up = o.opt("uploader")
-        val uploader = when (up) { is JSONObject -> up.str("name") ?: up.str("username"); is String -> up.trim().ifBlank { null }; else -> null }
-        val info = VideoInfo(o.str("translator"), o.str("encoder"), uploader)
+        val o = tryParseJson<VideoAnswer>(text.trim()) ?: return null
+        val up = o.uploader
+        val uploader = if (up is JsonObject) up.str("name") ?: up.str("username") else up?.asText().nb()
+        val info = VideoInfo(o.translator.nb(), o.encoder.nb(), uploader)
         return info.takeIf { it.translator != null || it.encoder != null || it.uploader != null }
     }
 
@@ -423,18 +461,10 @@ object AnizmParser {
     }
 
     /** /bolum/<epId>/cevirmen/<trId> JSON: {"success":true,"videos":[{"id","name"}]}. */
-    fun videos(text: String): List<Video> {
-        val arr: JSONArray = try {
-            val t = text.trim()
-            if (t.startsWith("[")) JSONArray(t) else {
-                val o = JSONObject(t)
-                o.optJSONArray("videos") ?: o.optJSONObject("data")?.optJSONArray("videos") ?: o.optJSONArray("data")
-            }
-        } catch (_: Exception) { null } ?: return emptyList()
-        return (0 until arr.length()).mapNotNull { i ->
-            val v = arr.optJSONObject(i) ?: return@mapNotNull null
-            val id = (v.str("id") ?: v.str("video_id"))?.takeIf { it.all(Char::isDigit) } ?: return@mapNotNull null
-            Video(id, (v.str("name") ?: v.str("source"))?.trim() ?: "Player")
+    fun videos(text: String): List<Video> =
+        itemsOf(tryParseJson<JsonElement>(text.trim()), listOf("videos"), listOf("data", "videos"), listOf("data")).mapNotNull { e ->
+            val v = e.decodeAs<VideoItem>() ?: return@mapNotNull null
+            val id = (v.id.nb() ?: v.videoId.nb())?.takeIf { it.all(Char::isDigit) } ?: return@mapNotNull null
+            Video(id, v.name.nb() ?: v.source.nb() ?: "Player")
         }.distinctBy { it.id }
-    }
 }

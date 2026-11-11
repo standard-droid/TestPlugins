@@ -3,8 +3,8 @@ package com.a.anizm
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.nicehttp.NiceResponse
-import org.json.JSONArray
-import org.json.JSONObject
+import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import kotlinx.serialization.Serializable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -91,13 +91,13 @@ internal suspend fun AnizmProvider.resolveGDriveStreams(fileId: String): List<Dr
             }
         }
     }
-    val json = body?.let { try { JSONObject(it) } catch (_: Exception) { null } } ?: return emptyList()
-    val progressive = json.optJSONObject("mediaStreamingData")?.optJSONObject("formatStreamingData")?.optJSONArray("progressiveTranscodes")
-        ?: run { log("gdrive: playback answer has no progressive formats (state=${json.optJSONObject("mediaStreamingData")?.optJSONObject("transcodeAvailabilityState")?.optString("state")})"); return emptyList() }
-    val found = (0 until progressive.length()).mapNotNull { i ->
-        val o = progressive.optJSONObject(i) ?: return@mapNotNull null
-        val url = o.optString("url").ifBlank { return@mapNotNull null }
-        val h = o.optJSONObject("transcodeMetadata")?.optInt("height", 0)?.takeIf { it > 0 } ?: return@mapNotNull null
+    val playback = tryParseJson<DrivePlayback>(body) ?: return emptyList()
+    val media = playback.mediaStreamingData
+    val progressive = media?.formatStreamingData?.progressiveTranscodes
+        ?: run { log("gdrive: playback answer has no progressive formats (state=${media?.transcodeAvailabilityState?.state})"); return emptyList() }
+    val found = progressive.mapNotNull { o ->
+        val url = o.url.nb() ?: return@mapNotNull null
+        val h = o.transcodeMetadata?.height?.toIntOrNull()?.takeIf { it > 0 } ?: return@mapNotNull null
         h to url
     }.distinctBy { it.first }.sortedByDescending { it.first }
     // Check each link answers with media (one byte) and take its real size from Content-Range;
@@ -275,3 +275,20 @@ internal fun AnizmProvider.findVideoHeight(b: ByteArray, start: Int, end: Int): 
     }
     return null
 }
+
+// ── Drive's playback API answer (only the fields read) ──────────────────────
+@Serializable
+internal data class DrivePlayback(val mediaStreamingData: DriveMediaStreaming? = null)
+@Serializable
+internal data class DriveMediaStreaming(
+    val formatStreamingData: DriveFormats? = null,
+    val transcodeAvailabilityState: DriveState? = null,
+)
+@Serializable
+internal data class DriveFormats(val progressiveTranscodes: List<DriveTranscode>? = null)
+@Serializable
+internal data class DriveTranscode(val url: Str? = null, val transcodeMetadata: DriveTranscodeMeta? = null)
+@Serializable
+internal data class DriveTranscodeMeta(val height: Str? = null)
+@Serializable
+internal data class DriveState(val state: Str? = null)

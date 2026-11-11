@@ -19,8 +19,11 @@ import com.lagradost.cloudstream3.utils.*
 import com.lagradost.nicehttp.NiceResponse
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.ResponseBody.Companion.toResponseBody
-import org.json.JSONArray
-import org.json.JSONObject
+import com.lagradost.cloudstream3.utils.AppUtils.toJson
+import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonPrimitive
 import java.io.ByteArrayInputStream
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.coroutineScope
@@ -1316,7 +1319,7 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
             }));
           }).catch(function(e){ window.__anzPlErr = String(e); }).then(function(){ window.__anzPlDone = 1; });
           return 'started';
-        })(${JSONObject.quote(master)}, ${JSONObject.quote(query)})
+        })(${jsonQuote(master)}, ${jsonQuote(query)})
     """.trimIndent()
     internal val droppedCaptureHeaders = setOf("range", "accept-encoding", "host", "connection", "content-length", "if-none-match", "if-modified-since")
     internal fun cleanCapturedHeaders(h: Map<String, String>): Map<String, String> =
@@ -1336,7 +1339,8 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
     /** evaluateJavascript hands back a JSON value; unwrap a string result properly (escaped quotes, ampersands). */
     internal fun jsResult(r: String?): String {
         if (r.isNullOrEmpty() || r == "null") return ""
-        return try { JSONArray("[$r]").optString(0, "") } catch (_: Exception) { r.trim('"') }
+        val v = tryParseJson<JsonElement>(r) ?: return r.trim('"')
+        return (v as? JsonPrimitive)?.content ?: v.toString()
     }
 
     /** CloudStream's current Activity, if it exposes one. Reflection so a rename can't break the build. */
@@ -1671,21 +1675,18 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
     // as it never changes for a video.
     internal val mediaStore by lazy { PersistentCache(settings.prefs, "media_info", 300, 30L * 24 * 60 * 60 * 1000) }
     internal fun loadInfo(key: String): StreamInfo? = try {
-        mediaStore.get(key)?.let { JSONObject(it) }?.let { o ->
-            val s = o.optJSONObject("s"); val j = o.optJSONObject("j")
-            StreamInfo(s?.keys()?.asSequence()?.associate { it.toInt() to s.getLong(it) } ?: emptyMap(),
-                j?.keys()?.asSequence()?.associate { k -> k.toInt() to j.getJSONArray(k).let { a -> (0 until a.length()).map { a.getInt(it) } } } ?: emptyMap(),
-                joinsChecked = o.optBoolean("c"))
+        mediaStore.get(key)?.let { tryParseJson<StoredMediaInfo>(it) }?.let { o ->
+            StreamInfo(o.s.mapKeys { it.key.toInt() }, o.j.mapKeys { it.key.toInt() }, joinsChecked = o.c)
         }
     } catch (_: Exception) { null }
     internal fun saveInfo(key: String, info: StreamInfo) {
         if (info.declared || (info.sizes.isEmpty() && !info.joinsChecked)) return // never keep a fallback or a failure
         try {
-            mediaStore.put(key, JSONObject().apply {
-                put("s", JSONObject().also { s -> info.sizes.forEach { (h, b) -> s.put(h.toString(), b) } })
-                put("j", JSONObject().also { j -> info.joins.forEach { (h, at) -> j.put(h.toString(), JSONArray(at)) } })
-                put("c", info.joinsChecked)
-            }.toString())
+            mediaStore.put(key, StoredMediaInfo(
+                s = info.sizes.mapKeys { it.key.toString() },
+                j = info.joins.mapKeys { it.key.toString() },
+                c = info.joinsChecked,
+            ).toJson())
         } catch (_: Exception) {}
     }
     internal fun cachedSizes(key: String): Map<Int, Long>? = loadInfo(key)?.sizes?.takeIf { it.isNotEmpty() }
@@ -1769,3 +1770,14 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
     internal val gdriveQuotaBackoffMs = 3 * 60 * 60 * 1000L
 
 }
+
+/**
+ * What [AnizmProvider.saveInfo] keeps per video: sizes per height (s), segment indexes where timestamps
+ * restart per height (j), and whether joins were looked for (c). The same layout as before v53.
+ */
+@Serializable
+internal data class StoredMediaInfo(
+    val s: Map<String, Long> = emptyMap(),
+    val j: Map<String, List<Int>> = emptyMap(),
+    val c: Boolean = false,
+)

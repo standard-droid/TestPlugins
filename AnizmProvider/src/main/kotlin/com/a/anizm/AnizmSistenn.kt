@@ -3,8 +3,13 @@ package com.a.anizm
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.nicehttp.NiceResponse
-import org.json.JSONArray
-import org.json.JSONObject
+import com.lagradost.cloudstream3.utils.AppUtils.toJson
+import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -27,8 +32,8 @@ internal suspend fun AnizmProvider.sistennResolve(host: String, id: String): Sis
             "Sec-Fetch-Site" to "same-origin", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Dest" to "empty"), 8L)
     } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { return SistennResolved.NotOffered }
     val text = r.text
-    val o = try { JSONObject(text.trim()) } catch (_: Exception) { return SistennResolved.NotOffered }
-    val url = o.optString("url").takeIf { it.startsWith("http") || it.startsWith("/") }?.let { Hls.resolve("$origin/", it) }
+    val o = tryParseJson<SistennResolveAnswer>(text.trim()) ?: return SistennResolved.NotOffered
+    val url = o.url.orEmpty().takeIf { it.startsWith("http") || it.startsWith("/") }?.let { Hls.resolve("$origin/", it) }
     if (r.code in 200..299 && url != null) return SistennResolved.Url(url)
     log("sistenn: $host has no video for $id (http ${r.code}: ${oneLine(text, 80)})")
     sistennGone["$host#$id"] = true
@@ -56,7 +61,7 @@ internal suspend fun AnizmProvider.trySistennApi(exUrl: String, label: String, c
     // page's player caps quality to its own size, which this app's player doesn't.
     val (screenW, screenH) = deviceScreenCss()
     var capacity: Pair<String, String>? = null
-    var video: JSONObject? = null
+    var video: SistennVideo? = null
     var sources: List<SistennSource> = emptyList()
     // v39: one capacity retry, not two. rpmvid and strp2p stayed full through both (device
     // log 2026-09-26), which cost 9 s per host at the end of the episode's link loading.
@@ -73,35 +78,36 @@ internal suspend fun AnizmProvider.trySistennApi(exUrl: String, label: String, c
             return SistennResult.UNAVAILABLE
         }
         val plain = sistennDecrypt(body) ?: run { off("answer not decryptable: ${body.take(40)}"); return SistennResult.UNAVAILABLE }
-        val o = try { JSONObject(plain) } catch (_: Exception) { off("answer not JSON"); return SistennResult.UNAVAILABLE }
+        val raw = tryParseJson<JsonObject>(plain) ?: run { off("answer not JSON"); return SistennResult.UNAVAILABLE }
+        val o = raw.decodeAs<SistennVideo>() ?: run { off("answer not readable"); return SistennResult.UNAVAILABLE }
         sources = sistennSources(o, origin)
         if (sources.isNotEmpty()) { video = o; break }
-        val d = o.optJSONObject("delivery") ?: JSONObject()
-        val saturated = d.optString("inHouse") == "saturated"
-        val capToken = d.optString("capacityToken")
+        val d = o.delivery ?: SistennDelivery()
+        val saturated = d.inHouse == "saturated"
+        val capToken = d.capacityToken.orEmpty()
         if (saturated && capToken.isNotEmpty() && attempt < 1) {
-            val wait = d.optInt("retryAfter", 3).coerceIn(2, 4)
+            val wait = (d.retryAfter?.toIntOrNull() ?: 3).coerceIn(2, 4)
             log("sistenn-api: $host is at capacity — retrying once in ${wait}s")
-            capacity = capToken to d.optString("capacityTokenExpire")
+            capacity = capToken to d.capacityTokenExpire.orEmpty()
             delay(wait * 1000L)
             continue
         }
-        log("sistenn-api: $id has no stream${if (saturated) " — streaming capacity is full" else ""} (keys ${o.keys().asSequence().take(12).joinToString(",")})")
+        log("sistenn-api: $id has no stream${if (saturated) " — streaming capacity is full" else ""} (keys ${raw.keys.take(12).joinToString(",")})")
         return if (saturated) SistennResult.CAPACITY else SistennResult.UNAVAILABLE
     }
     val v = video ?: return SistennResult.UNAVAILABLE
-    val pk = v.optJSONObject("pk")
-    val pkQuery = pk?.optString("k")?.takeIf { it.isNotEmpty() }?.let { "k=$it&kx=${pk.optLong("kx")}" }.orEmpty()
+    val pk = v.pk
+    val pkQuery = pk?.k.nb()?.let { "k=$it&kx=${pk?.kx?.toLongOrNull() ?: 0L}" }.orEmpty()
     // Our own refresh call, the way the page builds it.
-    val metric = v.optJSONObject("metric")
+    val metric = v.metric
     // v41: built for every stream (it is also the playing signal), not only for pk tokens.
     val refreshUrl = try {
-        "$origin/api/v1/player?t=" + sistennEncrypt(JSONObject().apply {
-            put("website", mainHost); put("playing", true); put("sessionId", sistennSessionId)
-            for (k in listOf("userId", "playerId", "videoId", "country", "platform", "browser", "os")) put(k, metric?.optString(k) ?: "")
-        }.toString())
+        fun m(k: String) = metric.str(k).orEmpty()
+        "$origin/api/v1/player?t=" + sistennEncrypt(SistennPlaying(website = mainHost, playing = true, sessionId = sistennSessionId,
+            userId = m("userId"), playerId = m("playerId"), videoId = m("videoId"), country = m("country"),
+            platform = m("platform"), browser = m("browser"), os = m("os")).toJson())
     } catch (_: Exception) { null }
-    log("sistenn-api: ${v.optString("title").take(60)} — sources ${sources.joinToString { it.kind }}")
+    log("sistenn-api: ${v.title.orEmpty().take(60)} — sources ${sources.joinToString { it.kind }}")
     val streamHeaders = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin, "Accept" to "*/*")
     // Sources are checked in parallel: one after another, the backup search took 16 s
     // after Tiktok was already found (device log 2026-09-26, build 31), and held up the
@@ -132,7 +138,7 @@ internal suspend fun AnizmProvider.trySistennApi(exUrl: String, label: String, c
                 if (!job.isCompleted) log("sistenn-api: ${src.kind} still checking — not waiting for it as a backup")
                 continue
             }
-            val tokenState = if (c.tokenQuery.isNotEmpty() && c.tokenQuery.startsWith("k=${pk?.optString("k")}&") && refreshUrl != null)
+            val tokenState = if (c.tokenQuery.isNotEmpty() && c.tokenQuery.startsWith("k=${pk?.k.orEmpty()}&") && refreshUrl != null)
                 LocalHlsServer.TokenState(c.tokenQuery, refreshUrl, apiHeaders) else null
             val beat = refreshUrl?.let { LocalHlsServer.Heartbeat(it, apiHeaders, tokenState) }
             // v39: sizes, like Beta and Aincrad. Same episode, same length, so a bigger size
@@ -228,33 +234,91 @@ internal suspend fun AnizmProvider.sistennSizes(kind: String, c: SistennChecked,
 }
 
 /** The stream candidates, best first: cfNative, then the site's own order (streamingConfig). */
-internal fun AnizmProvider.sistennSources(o: JSONObject, origin: String): List<SistennSource> {
-    fun abs(u: String): String? = u.trim().takeIf { it.isNotEmpty() }?.let {
+internal fun AnizmProvider.sistennSources(o: SistennVideo, origin: String): List<SistennSource> {
+    fun abs(u: String?): String? = u?.trim()?.takeIf { it.isNotEmpty() }?.let {
         if (it.startsWith("//")) "https:$it" else try { java.net.URI("$origin/").resolve(it).toString() } catch (_: Exception) { null }
     }
-    val cfg = try { JSONObject(o.optString("streamingConfig", "")) } catch (_: Exception) { null }
-    val order = cfg?.optJSONArray("order")?.let { a -> (0 until a.length()).map { a.optString(it) } }
-        ?: listOf("Tiktok", "Google", "Cloudflare", "In-House")
-    val adjust = cfg?.optJSONObject("adjust")
-    val raw = mapOf("Cloudflare" to o.optString("cf"), "Tiktok" to o.optString("hlsVideoTiktok"),
-        "Google" to o.optString("hlsVideoGoogle"), "In-House" to o.optString("source"))
+    // streamingConfig arrives as JSON text inside the answer (an object is read too).
+    val cfg = when (val c = o.streamingConfig) {
+        is JsonPrimitive -> tryParseJson<SistennConfig>(c.content)
+        is JsonObject -> c.decodeAs<SistennConfig>()
+        else -> null
+    }
+    val order = cfg?.order?.map { it.asText() } ?: listOf("Tiktok", "Google", "Cloudflare", "In-House")
+    val adjust = cfg?.adjust
+    val raw = mapOf("Cloudflare" to o.cf, "Tiktok" to o.hlsVideoTiktok, "Google" to o.hlsVideoGoogle, "In-House" to o.source)
     val out = ArrayList<SistennSource>()
     // v38: the site's own order, with cfNative (Cloudflare for native players) just ahead of
     // Cloudflare. v37 tried cfNative first; its segments stalled for the app's player (device
     // log 2026-09-26: Cronet SocketTimeoutException for 70 s) while the site's own first choice,
     // Tiktok, is the source that already played in the app.
-    val cfNative = abs(o.optString("cfNative"))
+    val cfNative = abs(o.cfNative)
     var cfNativeAdded = false
     for (kind in order) {
         if (kind == "Cloudflare" && cfNative != null) { out += SistennSource("cfNative", cfNative, false); cfNativeAdded = true }
-        var url = abs(raw[kind] ?: "") ?: continue
-        val adj = adjust?.optJSONObject(kind)
-        if (adj?.optBoolean("disabled") == true) continue
-        adj?.optJSONObject("params")?.let { p -> url = withParams(url, p.keys().asSequence().associateWith { p.optString(it) }) }
-        val dom = adj?.optString("domain").orEmpty()
+        var url = abs(raw[kind]) ?: continue
+        val adj = adjust.obj(kind)?.decodeAs<SistennAdjust>()
+        if (adj?.disabled == "true") continue
+        adj?.params?.let { p -> url = withParams(url, p.mapValues { it.value.asText() }) }
+        val dom = adj?.domain.orEmpty()
         if (dom.isNotEmpty() && url.contains("/hls/")) url = url.replaceFirst("/hls/", "/hlsmod/$dom/")
         out += SistennSource(kind, url, kind == "Tiktok" || kind == "Google" || url.contains("/hlsmod/"))
     }
     if (cfNative != null && !cfNativeAdded) out += SistennSource("cfNative", cfNative, false)
     return out
 }
+
+// ── Sistenn API answers (only the fields read; the rest is ignored) ─────────
+
+/** /api/public/resolve: where a video id now lives. */
+@Serializable
+internal data class SistennResolveAnswer(val url: Str? = null)
+
+/** /api/v1/video, decrypted. */
+@Serializable
+internal data class SistennVideo(
+    val title: Str? = null,
+    val cf: Str? = null,
+    val cfNative: Str? = null,
+    val hlsVideoTiktok: Str? = null,
+    val hlsVideoGoogle: Str? = null,
+    val source: Str? = null,
+    /** {"order":[…],"adjust":{…}} as JSON text (an object is accepted too). */
+    val streamingConfig: JsonElement? = null,
+    val delivery: SistennDelivery? = null,
+    val pk: SistennToken? = null,
+    /** userId, playerId, videoId, country, platform, browser, os: sent back in the playing signal. */
+    val metric: JsonObject? = null,
+)
+
+@Serializable
+internal data class SistennDelivery(
+    val inHouse: Str? = null,
+    val capacityToken: Str? = null,
+    val capacityTokenExpire: Str? = null,
+    val retryAfter: Str? = null,
+)
+
+@Serializable
+internal data class SistennToken(val k: Str? = null, val kx: Str? = null)
+
+@Serializable
+internal data class SistennConfig(val order: JsonArray? = null, val adjust: JsonObject? = null)
+
+@Serializable
+internal data class SistennAdjust(val disabled: Str? = null, val params: JsonObject? = null, val domain: Str? = null)
+
+/** The page's playing signal / token refresh request, encrypted into /api/v1/player?t=…; fields in the page's order. */
+@Serializable
+internal data class SistennPlaying(
+    val website: String,
+    val playing: Boolean,
+    val sessionId: String,
+    val userId: String,
+    val playerId: String,
+    val videoId: String,
+    val country: String,
+    val platform: String,
+    val browser: String,
+    val os: String,
+)
