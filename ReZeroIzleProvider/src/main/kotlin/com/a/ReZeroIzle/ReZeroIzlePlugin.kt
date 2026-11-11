@@ -1,12 +1,13 @@
 package com.a.rezeroizle
 
-import android.content.Context
+import com.lagradost.cloudstream3.plugins.BasePlugin
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
-import com.lagradost.cloudstream3.plugins.Plugin
 
+// BasePlugin, not Plugin: no Android Context needed, so the plugin also builds as a
+// cross-platform .jar (isCrossPlatform in build.gradle.kts).
 @CloudstreamPlugin
-class ReZeroIzlePlugin : Plugin() {
-    override fun load(context: Context) {
+class ReZeroIzlePlugin : BasePlugin() {
+    override fun load() {
         registerMainAPI(ReZeroIzleProvider())
     }
 }

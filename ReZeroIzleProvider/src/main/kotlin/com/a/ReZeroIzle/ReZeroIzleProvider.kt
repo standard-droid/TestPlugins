@@ -2,6 +2,7 @@ package com.a.rezeroizle
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.api.Log
 
 /**
  * ReZero İzle CloudStream 3 Provider
@@ -168,12 +169,12 @@ class ReZeroIzleProvider : MainAPI() {
                 )
             }
         } catch (e: Exception) {
-            android.util.Log.e("ReZeroIzle", "Homepage fetch failed: ${e.message}")
+            Log.e("ReZeroIzle", "Homepage fetch failed: ${e.message}")
         }
 
         // Fallback: if homepage failed or returned nothing, use hardcoded entries
         if (results.isEmpty()) {
-            android.util.Log.w("ReZeroIzle", "Using hardcoded catalogue fallback")
+            Log.w("ReZeroIzle", "Using hardcoded catalogue fallback")
             val fallback = listOf(
                 Triple("Re:Zero 1. Sezon",           "$mainUrl/sezon/1/index.html",           TvType.Anime),
                 Triple("Re:Zero 2. Sezon",           "$mainUrl/sezon/2/index.html",           TvType.Anime),
@@ -244,7 +245,7 @@ class ReZeroIzleProvider : MainAPI() {
         val doc = try {
             fetchDocument(url)
         } catch (e: Exception) {
-            android.util.Log.e("ReZeroIzle", "Season $seasonNum fetch failed: ${e.message}")
+            Log.e("ReZeroIzle", "Season $seasonNum fetch failed: ${e.message}")
             return newAnimeLoadResponse(title, url, type) {
                 posterUrl = poster; this.plot = plot
                 addEpisodes(DubStatus.Subbed, emptyList())
@@ -291,7 +292,7 @@ class ReZeroIzleProvider : MainAPI() {
             )
         }
 
-        android.util.Log.d("ReZeroIzle", "Season $seasonNum: ${episodes.size} episodes loaded")
+        Log.d("ReZeroIzle", "Season $seasonNum: ${episodes.size} episodes loaded")
 
         return newAnimeLoadResponse(title, url, type) {
             posterUrl  = poster
@@ -308,14 +309,14 @@ class ReZeroIzleProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        android.util.Log.d("ReZeroIzle", "loadLinks url=$data")
+        Log.d("ReZeroIzle", "loadLinks url=$data")
 
         // The episode HTML ships with downloadBtn href="#"; the site's player.js fills it
         // in from seasons-data.js. Read the page only to find that script's URL.
         val doc = try {
             fetchDocument(data)
         } catch (e: Exception) {
-            android.util.Log.w("ReZeroIzle", "Episode fetch error: ${e.message}")
+            Log.w("ReZeroIzle", "Episode fetch error: ${e.message}")
             null
         }
         val dataJsUrl = doc?.select("script[src]")
@@ -337,7 +338,7 @@ class ReZeroIzleProvider : MainAPI() {
                 else -> emptyList()
             }
         } catch (e: Exception) {
-            android.util.Log.w("ReZeroIzle", "seasons-data.js failed: ${e.message}")
+            Log.w("ReZeroIzle", "seasons-data.js failed: ${e.message}")
             emptyList()
         }.toMutableList()
 
@@ -350,13 +351,13 @@ class ReZeroIzleProvider : MainAPI() {
         }
 
         if (ids.isEmpty()) {
-            android.util.Log.w("ReZeroIzle", "No GDrive ID for $data (episode not uploaded yet?)")
+            Log.w("ReZeroIzle", "No GDrive ID for $data (episode not uploaded yet?)")
             return false
         }
 
         ids.forEachIndexed { i, fileId ->
             val drive = resolveDrive(fileId)
-            android.util.Log.d("ReZeroIzle", "GDrive fileId[$i]=$fileId size=${drive.sizeBytes}")
+            Log.d("ReZeroIzle", "GDrive fileId[$i]=$fileId size=${drive.sizeBytes}")
             val label = if (i == 0) "Google Drive" else "Google Drive ${i + 1}"
             callback(
                 newExtractorLink(
@@ -410,13 +411,13 @@ class ReZeroIzleProvider : MainAPI() {
                 val playHeaders = mapOf("User-Agent" to ua) + (if (cookie.isNotBlank()) mapOf("Cookie" to cookie) else emptyMap())
                 val r2 = app.get(url, headers = h + playHeaders, timeout = 15)
                 if (!isHtml(r2)) return DriveLink(url, playHeaders, rangedSize(r2) ?: pageSize)
-                android.util.Log.w("ReZeroIzle", "GDrive $fileId: still HTML after the download form")
+                Log.w("ReZeroIzle", "GDrive $fileId: still HTML after the download form")
             }
             fallback.copy(sizeBytes = pageSize)
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
-            android.util.Log.w("ReZeroIzle", "GDrive $fileId probe failed: ${e.message}")
+            Log.w("ReZeroIzle", "GDrive $fileId probe failed: ${e.message}")
             fallback
         }
     }
