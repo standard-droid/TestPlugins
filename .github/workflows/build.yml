@@ -89,7 +89,9 @@ jobs:
           # regardless of nesting, so it can't silently stop copying files if a module's
           # structure ever changes.
           find . -path '*/build/*.cs3' -exec cp {} $GITHUB_WORKSPACE/builds \;
-          find . -path '*/build/*.jar' -exec cp {} $GITHUB_WORKSPACE/builds \; || true
+          # Only <Module>/build/<Module>.jar (isCrossPlatform plugins). find's * also matches '/', so
+          # '*/build/*.jar' copied Gradle's intermediate jars too (R.jar, classes.jar, full.jar).
+          for m in */build.gradle.kts; do m="${m%/build.gradle.kts}"; [ -f "$m/build/$m.jar" ] && cp "$m/build/$m.jar" $GITHUB_WORKSPACE/builds; done; true
           cp build/plugins.json $GITHUB_WORKSPACE/builds
 
       - name: Push builds
