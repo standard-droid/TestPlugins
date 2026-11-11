@@ -155,7 +155,7 @@ internal suspend fun AnizmProvider.siteGet(
 internal suspend fun AnizmProvider.siteText(url: String, headers: Map<String, String>,
                              params: Map<String, String> = emptyMap(), timeout: Long = 12L): String? {
     val r = siteGet(url, headers, params, timeout)
-    if (r.code !in 200..299) { log("http ${r.code} for ${url.substringBefore('?')}"); return null }
+    if (r.code !in 200..299) { log("http ${r.code} for ${url.substringBefore('?')}"); r.closeQuietly(); return null } // v50: closed, not left open
     return r.text
 }
 

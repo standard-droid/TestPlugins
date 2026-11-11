@@ -36,6 +36,8 @@ class AnizmSettings(internal val prefs: SharedPreferences) {
 
     companion object {
         const val PREFS_NAME = "anizm_settings"
+        /** Kept by "Defaults": state the extension learned, not choices the user made. */
+        val KEPT_ON_RESET = setOf("site_host", "site_warnings")
         const val OTHER = "other"
 
         /**
@@ -280,7 +282,13 @@ class AnizmSettings(internal val prefs: SharedPreferences) {
                     e.putBoolean("defer_browser_sources", deferBox.isChecked)
                     e.apply()
                 }
-                .setNeutralButton("Defaults") { _, _ -> settings.prefs.edit().clear().apply() }
+                // v50: settings only. The site's current domain and the site-change warnings are
+                // state, not settings; clearing them sent the app back to an old, possibly blocked domain.
+                .setNeutralButton("Defaults") { _, _ ->
+                    val e = settings.prefs.edit()
+                    settings.prefs.all.keys.filter { it !in AnizmSettings.KEPT_ON_RESET }.forEach { e.remove(it) }
+                    e.apply()
+                }
                 .setNegativeButton("Cancel", null)
                 .show()
         }

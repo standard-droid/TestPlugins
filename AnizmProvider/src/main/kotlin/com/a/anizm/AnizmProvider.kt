@@ -396,6 +396,8 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
     internal val emptyParenRe = Regex("""\(\s*\)""")
     internal val multiSpaceRe = Regex("""\s{2,}""")
     internal val asciiOnlyRe = Regex("^[\\x20-\\x7E]+$")
+    // Hiragana, katakana (incl. half-width) and CJK ideographs.
+    internal val japaneseScriptRe = Regex("[\\u3040-\\u30FF\\u31F0-\\u31FF\\u3400-\\u4DBF\\u4E00-\\u9FFF\\uFF66-\\uFF9F]")
     // gdriveConfirmRe/gdriveUuidRe removed (3.1) — same reasoning as the CSRF regexes:
     // Jsoup's input[name=...] selector doesn't care about attribute order, and is also
     // more tolerant of the deliberately-truncated HTML this fetch produces (Range-limited).
@@ -426,8 +428,9 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
         }
     }
     internal fun recentLogText(): String = synchronized(recentLog) { recentLog.joinToString("\n") }
-    internal fun log(msg: String) { android.util.Log.i("Anizm", msg); remember("I", msg) }
-    internal fun logW(msg: String) {
+    internal fun log(raw: String) { val msg = redactForLog(raw); android.util.Log.i("Anizm", msg); remember("I", msg) }
+    internal fun logW(raw: String) {
+        val msg = redactForLog(raw)
         android.util.Log.w("Anizm", msg); remember("W", msg)
         if (msg.startsWith("site-change")) try { settings.addWarning(msg.removePrefix("site-change warning: ")) } catch (_: Throwable) {}
     }
@@ -856,7 +859,9 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
         // Split aliases into eng/jap + synonyms for AniList/MAL sync matching
         val aliases = anime.aliases.ifEmpty { null }
         val eng = aliases?.firstOrNull { asciiOnlyRe.matches(it) }
-        val jap = aliases?.firstOrNull { !asciiOnlyRe.matches(it) }
+        // v50: Japanese by script (kana, kanji), not "anything non-ASCII": a Turkish alias (ğ, ü, ş)
+        // went to AniList/MAL as the Japanese title and the sync matched wrong or not at all.
+        val jap = aliases?.firstOrNull { japaneseScriptRe.containsMatchIn(it) }
         val syns = aliases?.filter { it != eng && it != jap }?.ifEmpty { null }
         log("load: '${anime.title}' poster=${anime.poster != null} plot=${(anime.plot?.length ?: 0) > 0} eps=${episodes.size} eng=$eng jap=$jap syns=${syns?.size ?: 0}")
         return newAnimeLoadResponse(anime.title, url, TvType.Anime) {
