@@ -270,10 +270,10 @@ internal suspend fun AnizmProvider.resolveEmbeds(
 
                     // Fast path: skip regex processing for our own site's sub-resources
                     // (CSS, JS, fonts etc.) — we only care about cross-domain embeds.
-                    // host.endsWith(mainHost), not a literal domain string, so this
+                    // onDomain(host, mainHost), not a literal domain string, so this
                     // still works correctly if the site is ever accessed via a mirror
                     // domain (e.g. CloudStream's "clone site" feature).
-                    if (host.endsWith(mainHost)) {
+                    if (onDomain(host, mainHost)) {
                         // Only process /player/ paths
                         if (url.contains("/player/")) {
                             val tgt = currentTarget.get()

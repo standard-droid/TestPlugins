@@ -27,8 +27,9 @@ import okhttp3.ResponseBody.Companion.toResponseBody
  * throws SocketTimeoutException, as OkHttp would. Redirects are followed here, hop by hop,
  * so the final URL is known. The body is read up to maxBytes.
  */
-internal suspend fun AnizmProvider.chromeFetch(url: String, headers: Map<String, String>, timeoutSec: Long, allowRedirects: Boolean = true,
+internal suspend fun AnizmProvider.chromeFetch(url: String, requestHeaders: Map<String, String>, timeoutSec: Long, allowRedirects: Boolean = true,
                                 formBody: Map<String, String>? = null, maxBytes: Int = 6_000_000): NiceResponse? {
+    var headers = requestHeaders
     if (System.currentTimeMillis() < cronetOffUntil) return null
     val engine = cronetEngine ?: return null
     val open = cronetOpen ?: return null
@@ -84,8 +85,13 @@ internal suspend fun AnizmProvider.chromeFetch(url: String, headers: Map<String,
         val loc = conn.getHeaderField("Location")
         if (allowRedirects && code in 300..399 && !loc.isNullOrBlank()) {
             try { conn.disconnect() } catch (_: Throwable) {}
+            val from = current
             current = try { java.net.URI(current).resolve(loc.trim()).toString() } catch (_: Exception) { return null }
             if (code == 303 || ((code == 301 || code == 302) && method == "POST")) { method = "GET"; body = null }
+            // v49: cookies and credentials stay with the host they were meant for. Every hop used to
+            // carry the same headers, so a site page that redirected elsewhere handed that host the
+            // anizm session and Cloudflare cookies. Chrome sends each host only its own cookies.
+            if (!sameHost(from, current)) headers = headers.filterKeys { !it.equals("Cookie", true) && !it.equals("Authorization", true) }
             continue
         }
         cronetFailures.set(0)
@@ -109,7 +115,7 @@ internal suspend fun AnizmProvider.chromeFetch(url: String, headers: Map<String,
 
 /** Chrome's network stack, or OkHttp when it is unavailable. */
 internal suspend fun AnizmProvider.browserGet(url: String, headers: Map<String, String>, timeoutSec: Long, allowRedirects: Boolean = true): NiceResponse =
-    chromeFetch(url, headers, timeoutSec, allowRedirects) ?: app.get(url, headers = headers, timeout = timeoutSec, allowRedirects = allowRedirects)
+    chromeFetch(url, headers, timeoutSec, allowRedirects) ?: app.get(url, headers = chromeOrderedMap(headers), timeout = timeoutSec, allowRedirects = allowRedirects)
 
 // 4.0: every anizm.net request goes through here. Replaces getSession() + the
 // 403/419 "refresh session and retry" loop, which had a real bug: the refresh ran the
@@ -130,7 +136,7 @@ internal suspend fun AnizmProvider.siteGet(
     val h = withSiteCookies(target, headers)
     // v41: Chrome's network stack first; OkHttp (with CloudflareKiller while a solve is fresh) otherwise.
     val first = (if (sticky) null else chromeFetch(withQuery(target, params), h, timeout, allowRedirects))
-        ?: app.get(target, headers = h, params = params, timeout = timeout,
+        ?: app.get(target, headers = chromeOrderedMap(h), params = params, timeout = timeout,
             allowRedirects = allowRedirects, interceptor = if (sticky) cfKiller else null)
     keepSiteCookies(first)
     if (sticky || !looksCfBlocked(first)) return first.also { if (allowRedirects) noteFinalHost(target, it) }
@@ -138,7 +144,7 @@ internal suspend fun AnizmProvider.siteGet(
     // v5: hard cap. CloudflareKiller's own WebView wait is 60s, which alone can eat half
     // of CloudStream's 120s loadLinks budget.
     val solved = withTimeoutOrNull(cfSolveBudgetMs) {
-        app.get(target, headers = h, params = params, timeout = timeout,
+        app.get(target, headers = chromeOrderedMap(h), params = params, timeout = timeout,
             allowRedirects = allowRedirects, interceptor = cfKiller)
     }?.also { keepSiteCookies(it) }
     if (solved == null || looksCfBlocked(solved)) { log("cf: solve failed/timed out for ${target.substringBefore('?')}"); return solved ?: first }

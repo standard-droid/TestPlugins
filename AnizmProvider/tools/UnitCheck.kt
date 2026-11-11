@@ -5,6 +5,9 @@
 
 import com.a.anizm.AnizmParser
 import com.a.anizm.Hls
+import com.a.anizm.onDomain
+import com.a.anizm.sameHost
+import com.a.anizm.withParams
 import kotlinx.coroutines.runBlocking
 import org.jsoup.Jsoup
 import kotlin.system.exitProcess
@@ -200,6 +203,19 @@ fun main() {
         AnizmParser.creditsFor(AnizmParser.VideoInfo("A|Subs", "B", "C").credits(), "Other"))
     check("only an uploader", AnizmParser.creditsFor(AnizmParser.VideoInfo(null, null, "C").credits(), "X") == "Up: C")
     check("nothing known → no credits", AnizmParser.videoInfo("""{"success":true,"url":"x"}""") == null && AnizmParser.creditsFor("||", "X") == "")
+
+    section("Addresses")
+    check("the site itself", onDomain("anizm.net", "anizm.net") && onDomain("www.anizm.net", "anizm.net"))
+    check("a lookalike is not the site", !onDomain("evilanizm.net", "anizm.net") && !onDomain("anizm.net.evil.com", "anizm.net"))
+    check("a whole address works too", onDomain("https://pl.puffytr.tr", "puffytr.tr") && !onDomain("https://evilpuffytr.tr/watch/x", "puffytr.tr"))
+    check("case does not matter", onDomain("WWW.Anizm.NET", "anizm.net"))
+    check("an unreadable address is not on any domain", !onDomain("https://", "anizm.net"))
+    check("same host", sameHost("https://anizm.net/a", "https://ANIZM.net/b?x=1"))
+    check("another host, even a subdomain, is not the same", !sameHost("https://anizm.net/a", "https://cdn.anizm.net/a") && !sameHost("https://anizm.net/", "https://evil.com/"))
+    check("withParams: added to a bare address", withParams("https://h/p", mapOf("k" to "a b")) == "https://h/p?k=a+b", withParams("https://h/p", mapOf("k" to "a b")))
+    check("withParams: replaces a key and keeps the others", withParams("https://h/p?a=1&k=old", mapOf("k" to "new")) == "https://h/p?a=1&k=new", withParams("https://h/p?a=1&k=old", mapOf("k" to "new")))
+    check("withParams: a fragment stays at the end, once", withParams("https://h/p#id", mapOf("k" to "v")) == "https://h/p?k=v#id", withParams("https://h/p#id", mapOf("k" to "v")))
+    check("withParams: query and fragment", withParams("https://h/p?a=1#id", mapOf("k" to "v")) == "https://h/p?a=1&k=v#id", withParams("https://h/p?a=1#id", mapOf("k" to "v")))
 
     println("\n$passed passed, $failed failed")
     exitProcess(if (failed == 0) 0 else 1)

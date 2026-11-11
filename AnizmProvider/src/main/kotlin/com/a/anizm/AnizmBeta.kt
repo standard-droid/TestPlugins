@@ -24,7 +24,7 @@ internal suspend fun AnizmProvider.processBeta(embed: String, label: String, cal
     val hash = embed.removePrefix("bp:")
     log("beta: hash=$hash for $label")
     val betaOrigin = betaOrigins[hash] ?: "https://pl.puffytr.tr"
-    val known = betaOrigin.endsWith("puffytr.tr")
+    val known = onDomain(betaOrigin, "puffytr.tr")
     // v48: what the watch page's own player sends. The page sets <meta name="referrer"
     // content="no-referrer"> (seen 2026-11-10), so a browser sends no Referer for the master, the
     // playlists or the segments; this used to send the watch URL as Referer and nothing but a
@@ -71,6 +71,9 @@ internal suspend fun AnizmProvider.processBeta(embed: String, label: String, cal
 }
 
 internal suspend fun AnizmProvider.withJoinsMarked(variants: List<Variant>, info: StreamInfo?, headers: Map<String, String>): List<Variant> = coroutineScope {
+    // v49: when casting, the playlists as the host serves them. The marked copies live on this phone's
+    // local server, which a cast receiver can't reach; unmarked, a join may stutter but it plays.
+    if (isCastingLoad()) return@coroutineScope variants
     variants.map { v -> async {
         val at = info?.joins?.get(v.height).orEmpty()
         if (at.isEmpty()) return@async v

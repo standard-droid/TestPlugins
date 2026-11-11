@@ -2,6 +2,7 @@ package com.a.anizm
 
 import com.lagradost.cloudstream3.app
 import com.lagradost.nicehttp.NiceResponse
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 /**
  * Serves rewritten HLS playlists to the app's own player on 127.0.0.1.
@@ -190,8 +191,11 @@ internal class LocalHlsServer(
                     if (!segUrl.startsWith("http")) { reply(400, "Bad Request", ByteArray(0), "text/plain"); return }
                     // v48: only addresses on the hosts this entry's own playlist named. The link's headers
                     // (cookies among them) go out with the request, so it must not be an arbitrary one.
-                    val segHost = try { java.net.URI(segUrl).host } catch (_: Exception) { null }
-                    if (entry.hosts.isNotEmpty() && segHost !in entry.hosts) { reply(403, "Forbidden", ByteArray(0), "text/plain"); return }
+                    // v49: fail closed. The hosts are learned when the playlist is rewritten, which always
+                    // happens before the player can know any /seg/ address; an entry with none yet has no
+                    // legitimate segment, so nothing is fetched for it (it used to fetch anything).
+                    val segHost = segUrl.toHttpUrlOrNull()?.host
+                    if (segHost == null || segHost !in entry.hosts) { reply(403, "Forbidden", ByteArray(0), "text/plain"); return }
                     // v35: tokenised streams: send the player straight to the host with the current token.
                     // v41: streams with a playing signal come through here too (so it knows they are
                     // playing) and are sent on unchanged.
@@ -207,11 +211,15 @@ internal class LocalHlsServer(
                     // "seeked 10 minutes forward and it didn't play"). Now only the head is read until
                     // the real media start is found, then the rest is piped through as it arrives.
                     // timeout = 0: no whole-call timeout, which would cut long transfers off.
+                    // v49: but a stalled host is given up on: the answer must start within
+                    // segmentStartTimeoutMs, and the body is closed when no bytes arrive for
+                    // segmentStallTimeoutMs (it used to wait forever, and 16 stalled segments took
+                    // every proxy thread, so no stream played until the app restarted).
                     // v40: one retry on a network error or a 5xx/429 from the CDN, so a single hiccup
                     // doesn't reach the player as a failed segment.
                     var r: NiceResponse? = null
                     for (attempt in 0 until 2) {
-                        r = try { kotlinx.coroutines.runBlocking { app.get(segUrl, headers = entry.headers, timeout = 0L) } } catch (e: Exception) { null }
+                        r = try { kotlinx.coroutines.runBlocking { kotlinx.coroutines.withTimeoutOrNull(segmentStartTimeoutMs) { app.get(segUrl, headers = entry.headers, timeout = 0L) } } } catch (e: Exception) { null }
                         val code = r?.code ?: 0
                         if (code in 200..299 || (code in 400..499 && code != 429) || attempt == 1) break
                         r?.closeQuietly()
@@ -223,12 +231,21 @@ internal class LocalHlsServer(
                         r?.closeQuietly()
                         reply(502, "Bad Gateway", ByteArray(0), "text/plain"); return
                     }
+                    val progress = java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
+                    val live: NiceResponse = r
+                    val stall = stallWatch.scheduleWithFixedDelay({
+                        if (System.currentTimeMillis() - progress.get() > segmentStallTimeoutMs) {
+                            log("hls-proxy: segment ${segUrl.substringBefore('?').takeLast(50)} stalled, closing it")
+                            live.closeQuietly()
+                        }
+                    }, 5, 5, java.util.concurrent.TimeUnit.SECONDS)
                     try {
                         val headBuf = java.io.ByteArrayOutputStream()
                         val buf = ByteArray(65_536)
                         var start: Int? = null
                         while (headBuf.size() < 262_144) {
                             val n = src.read(buf); if (n < 0) break
+                            progress.set(System.currentTimeMillis())
                             headBuf.write(buf, 0, n)
                             if (headBuf.size() >= 1_024) { start = Hls.findMediaStart(headBuf.toByteArray()); if (start != null) break }
                         }
@@ -242,10 +259,10 @@ internal class LocalHlsServer(
                             "Cache-Control: no-store\r\nConnection: close\r\n\r\n").toByteArray(Charsets.ISO_8859_1))
                         if (method != "HEAD") {
                             out.write(head, at, head.size - at)
-                            while (true) { val n = src.read(buf); if (n < 0) break; out.write(buf, 0, n) }
+                            while (true) { val n = src.read(buf); if (n < 0) break; progress.set(System.currentTimeMillis()); out.write(buf, 0, n) }
                         }
                         out.flush()
-                    } finally { r.closeQuietly() }
+                    } finally { stall.cancel(false); r.closeQuietly() }
                     return
                 }
                 // v33: VOD playlists (ENDLIST) don't change, so the copy the sniff page fetched
@@ -272,11 +289,18 @@ internal class LocalHlsServer(
 
     private fun tokenised(ref: String, entry: Entry): String {
         val abs = try { java.net.URI(entry.url).resolve(ref.trim()).toString() } catch (_: Exception) { ref.trim() }
-        try { java.net.URI(abs).host?.let { entry.hosts += it } } catch (_: Exception) {}
+        // v49: the same parser /seg/ checks with, so the two can't read a host differently.
+        abs.toHttpUrlOrNull()?.host?.let { entry.hosts += it }
         return if (abs.contains('?') || entry.query.isEmpty()) abs else "$abs?${entry.query}"
     }
 
     @Volatile private var loggedStrip = false
+
+    // v49: limits for a segment fetched through /seg/ (see there).
+    private val segmentStartTimeoutMs = 30_000L
+    private val segmentStallTimeoutMs = 45_000L
+    private val stallWatch = java.util.concurrent.ScheduledThreadPoolExecutor(1) { r -> Thread(r, "anizm-hls-stall").apply { isDaemon = true } }
+        .apply { removeOnCancelPolicy = true }
 
     private fun rewrite(playlist: String, entry: Entry, key: String, port: Int): String = playlist.lineSequence().joinToString("\n") { raw ->
         val line = raw.trimEnd('\r')

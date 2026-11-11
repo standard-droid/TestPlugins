@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Compiles Hls.kt and AnizmParser.kt with a standalone kotlinc and runs tools/UnitCheck.kt over them:
-# playlist parsing, the timestamp-join search, MPEG-TS timestamps, size arithmetic, source credits.
+# Compiles Hls.kt, AnizmParser.kt and AnizmUrls.kt with a standalone kotlinc and runs tools/UnitCheck.kt over them:
+# playlist parsing, the timestamp-join search, MPEG-TS timestamps, size arithmetic, source credits, address helpers.
 # Needs only a JDK and network access to github.com + repo1.maven.org (first run); no Gradle, no
 # Android SDK and no saved pages, so it runs anywhere, CI included.
 #   AnizmProvider/tools/check-units.sh
@@ -23,7 +23,7 @@ cp="$cache/jsoup.jar$sep$cache/json.jar$sep$cache/coroutines.jar"
 out="$cache/out-units"; rm -rf "$out"; mkdir -p "$out"
 src="$here/../src/main/kotlin/com/a/anizm"
 "$cache/kotlinc/bin/kotlinc" -nowarn -cp "$cp" -d "$out" \
-  "$src/AnizmParser.kt" "$src/Hls.kt" "$here/UnitCheck.kt" 2>&1 | grep -v '^Picked up JAVA_TOOL_OPTIONS' || true
+  "$src/AnizmParser.kt" "$src/Hls.kt" "$src/AnizmUrls.kt" "$here/UnitCheck.kt" 2>&1 | grep -v '^Picked up JAVA_TOOL_OPTIONS' || true
 [ -f "$out/UnitCheckKt.class" ] || { echo "compile failed"; exit 1; }
 exec java -Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 \
   -cp "$out$sep$cp$sep$cache/kotlinc/lib/kotlin-stdlib.jar" UnitCheckKt

@@ -274,7 +274,7 @@ internal suspend fun AnizmProvider.emitVariants(
                         app.get(v.url, headers = if (probeWhole) headers else headers + mapOf("Range" to "bytes=0-4095"), timeout = 8L)
                     } catch (e: kotlinx.coroutines.CancellationException) { throw e }
                     catch (e: Exception) { log("$tag: variant ${v.height}p probe failed: ${e.message}"); return@withPermit }
-                    val pt = probe.text.trimStart()
+                    val pt = cappedText(probe).trimStart()
                     when {
                         // A refusal is a refusal, whatever its body looks like.
                         probe.code !in 200..299 ->

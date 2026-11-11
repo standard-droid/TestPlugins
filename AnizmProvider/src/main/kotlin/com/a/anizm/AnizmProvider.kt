@@ -144,6 +144,30 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
                     "${embed.substringBefore(':')} → " + (if (links.isEmpty()) (if (ok == null) "timed out" else "no links") else links.joinToString())
             }
         }
+        // v49: Sistenn too, the way loadLinks reads it (the hosts' resolver, then their API), but
+        // without the WebView fallback after it: that fallback would still find a playlist and hide
+        // the API breaking (a new key, a changed endpoint), which is what this step is for.
+        allVideos.firstOrNull { settings.groupOf(it.second.name).key == "sistenn" }?.let { v ->
+            step("Links · ${v.second.name} (${v.first})") {
+                delay(600)
+                val embed = getCached(v.second.id) ?: resolveViaRedirect(v.second.id, ep)
+                    ?: return@step false to "no redirect target"
+                val exUrl = embed.removePrefix("ex:")
+                val m = sistennPageRe.find(exUrl) ?: return@step null to "not a Sistenn page: ${exUrl.take(80)}"
+                when (val res = sistennResolve(m.groupValues[1], m.groupValues[2])) {
+                    is SistennResolved.Url -> return@step true to "resolver → ${res.url.substringBefore('?').take(80)}"
+                    SistennResolved.Gone -> return@step null to "the host says this video is gone"
+                    SistennResolved.NotOffered -> {}
+                }
+                val links = java.util.Collections.synchronizedList(ArrayList<String>())
+                when (withTimeoutOrNull(30_000L) { trySistennApi(exUrl, v.second.name) { links += it.name } }) {
+                    SistennResult.EMITTED -> true to "api → ${links.joinToString()}"
+                    SistennResult.CAPACITY -> null to "api: host busy (capacity), try later"
+                    SistennResult.UNAVAILABLE -> false to "api not usable (key or endpoint changed?) — see the log"
+                    null -> false to "timed out"
+                }
+            }
+        }
         settings.recentWarnings().takeIf { it.isNotEmpty() }?.let { w -> out += "Recent site warnings:"; out += w.takeLast(8).map { "⚠ $it" } }
         return out
     }
@@ -236,12 +260,13 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
     // Old stub system: CloudflareKiller is directly on the compile classpath again
     // (it's part of the full pre-release APK), no reflection needed.
     internal val cfKiller = CloudflareKiller()
-    // 4.0: CSRF/session machinery removed. Verified on the live site (2026-09-17):
-    // /searchAnime answers identically with or without _token, and nothing else used the
-    // token — so every getSession() was a full homepage download (every 5 min, before
-    // search/load/loadLinks) for nothing, and search leaked the token into a query string.
+    // 4.0: the getSession() machinery is gone. Verified on the live site (2026-09-17):
+    // /searchAnime answers identically with or without _token, so every getSession() was a
+    // full homepage download (every 5 min, before search/load/loadLinks) for nothing.
     // What replaced it: siteGet() below, which handles the one thing that matters —
     // Cloudflare — and does it on the actual request instead of on the homepage.
+    // (v46 sends the page's CSRF token again on the episode XHRs, read from pages already
+    // loaded rather than fetched for it: see csrfToken below.)
     @Volatile internal var cfUntil = 0L
     internal val cfStickyMs = 10 * 60 * 1000L
     internal val cfSolveBudgetMs = 20_000L
@@ -490,6 +515,16 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
         return h.entries.map { it.key to it.value }.sortedBy { (k, _) -> order.indexOf(k.lowercase()).let { i -> if (i < 0) order.size else i } }
     }
 
+    /**
+     * v49: the same order as a map, for the OkHttp fallback. That path used to send headers in
+     * whatever order the maps were joined (User-Agent after the client hints, Referer before
+     * Accept…), unlike Chrome — and it is the path used exactly when Cloudflare is already
+     * suspicious (sticky mode, Chrome's stack switched off). OkHttp still adds its own Host,
+     * Connection and Accept-Encoding, and its TLS handshake is not Chrome's; only Cronet fixes those.
+     */
+    internal fun chromeOrderedMap(h: Map<String, String>): Map<String, String> =
+        LinkedHashMap<String, String>().apply { for ((k, v) in chromeOrdered(h)) put(k, v) }
+
     internal fun readUpTo(input: java.io.InputStream, max: Int): ByteArray {
         val out = java.io.ByteArrayOutputStream(); val buf = ByteArray(16_384)
         while (out.size() < max) { val n = input.read(buf, 0, minOf(buf.size, max - out.size())); if (n < 0) break; out.write(buf, 0, n) }
@@ -631,7 +666,7 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
 
     internal fun classifyEmbedUrl(url: String): String? {
         val host = try { java.net.URI(url).host ?: "" } catch (_: Exception) { "" }
-        if (host.isBlank() || host.endsWith(mainHost)) return null // self-redirect = not an embed
+        if (host.isBlank() || onDomain(host, mainHost)) return null // self-redirect = not an embed
         puffytrRe.find(url)?.let { return "bp:${noteBetaMatch(it)}" }
         apRe.find(url)?.let { return "ap:${noteApMatch(it)}" }
         gdRe.find(url)?.let { return "gd:${it.groupValues[1]}" }
@@ -810,8 +845,10 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
 
     // ── Load ──────────────────────────────────────────────────────────────────
     override suspend fun load(url: String): LoadResponse {
+        // v49: a page that didn't load is an error the app shows with a retry, not an anime with
+        // no episodes (which looked like the site had removed it).
         val doc = siteDocument(url, pageHeaders, timeout = 12L)
-            ?: return newAnimeLoadResponse(name = url.substringAfterLast('/'), url = url, type = TvType.Anime) { addEpisodes(DubStatus.Subbed, emptyList()) }
+            ?: throw ErrorLoadingException("Anizm page did not load (site down or blocking). Try again.")
         val anime = AnizmParser.anime(doc, url)
         if (anime.episodes.isEmpty()) logW("site-change warning: no episodes found on ${url.substringAfterLast('/')}")
         // number 0 = preview or joined episode ("215-216. Bölüm"): watchable, never shifts the real numbers
@@ -923,8 +960,18 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
     internal val linkRuns = java.util.concurrent.ConcurrentHashMap<String, LinkRun>()
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+        // v49: a run for casting is its own run (it must not join one whose links point at this
+        // phone's local server) and drops any link that still does: see CastingLoad.
+        if (isCasting && !isCastingLoad()) {
+            val dropped = java.util.concurrent.atomic.AtomicInteger(0)
+            val castable: (ExtractorLink) -> Unit = { link -> if (isLocalLink(link.url)) dropped.incrementAndGet() else callback(link) }
+            return kotlinx.coroutines.withContext(CastingLoad) { loadLinks(data, true, subtitleCallback, castable) }.also {
+                if (dropped.get() > 0) log("loadLinks: casting — left out ${dropped.get()} link(s) that only play through this phone's local server")
+            }
+        }
+        val runKey = if (isCasting) "cast|$data" else data
         val mine = LinkRun()
-        val running = linkRuns.putIfAbsent(data, mine)
+        val running = linkRuns.putIfAbsent(runKey, mine)
         if (running != null) {
             val replay = synchronized(running) { running.subscribers.add(callback); running.links.toList() }
             log("loadLinks: $data is already loading — joining that run (${replay.size} link(s) so far)")
@@ -942,7 +989,7 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
         return try {
             loadLinksWork(data, isCasting, subtitleCallback, fanOut).also { mine.done.complete(it) }
         } finally {
-            linkRuns.remove(data, mine)
+            linkRuns.remove(runKey, mine)
             mine.done.complete(null) // no-op if already completed with a result
         }
     }
@@ -1536,7 +1583,7 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
             // A /watch/<hash> address on a host that isn't Beta Player after all (see betaShapeRe).
             val hash = embed.removePrefix("bp:")
             val origin = betaOrigins[hash] ?: return false
-            return if (hops == 0 && !origin.endsWith("puffytr.tr"))
+            return if (hops == 0 && !onDomain(origin, "puffytr.tr"))
                 processExtractorSource(vi, "ex:$origin/watch/$hash", data, label, callback, subtitleCallback, deferSniff, sniffSpent, 1)
             else false
         }
@@ -1581,14 +1628,6 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
         sistennCipher(javax.crypto.Cipher.ENCRYPT_MODE).doFinal(plain.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
 
     /** Set (replace) query parameters on a URL. */
-    internal fun withParams(url: String, params: Map<String, String>): String {
-        if (params.isEmpty()) return url
-        val base = url.substringBefore('?'); val frag = url.substringAfter('#', "")
-        val q = LinkedHashMap<String, String>()
-        url.substringAfter('?', "").substringBefore('#').split('&').filter { it.isNotEmpty() }.forEach { q[it.substringBefore('=')] = it.substringAfter('=', "") }
-        params.forEach { (k, v) -> q[k] = java.net.URLEncoder.encode(v, "UTF-8") }
-        return base + "?" + q.entries.joinToString("&") { "${it.key}=${it.value}" } + (if (frag.isNotEmpty()) "#$frag" else "")
-    }
 
     // v41: the phone's screen as window.screen reports it (CSS pixels, current orientation).
     internal fun deviceScreenCss(): Pair<Int, Int> = try {
@@ -1696,6 +1735,14 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
     }
     internal fun bodyBytes(r: NiceResponse): ByteArray? =
         try { r.okhttpResponse.body?.bytes() } catch (_: Exception) { null }
+    /**
+     * v49: a probe's body as text, read up to [max] bytes. A probe asks for a playlist or the first
+     * 4 KB of a file; a host that ignores Range and answers 200 with the whole video would otherwise
+     * be decoded into one String (gigabytes: the app runs out of memory). Playlists are far smaller.
+     */
+    internal fun cappedText(r: NiceResponse, max: Int = 8_000_000): String =
+        try { r.okhttpResponse.body?.byteStream()?.use { String(readUpTo(it, max), Charsets.UTF_8) } ?: "" }
+        catch (_: Exception) { "" } finally { try { r.okhttpResponse.close() } catch (_: Exception) {} }
 
     internal fun be32(b: ByteArray, o: Int): Long =
         ((b[o].toLong() and 0xff) shl 24) or ((b[o + 1].toLong() and 0xff) shl 16) or
