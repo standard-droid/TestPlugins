@@ -970,7 +970,7 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
         if (isCasting && !isCastingLoad()) {
             val dropped = java.util.concurrent.atomic.AtomicInteger(0)
             val castable: (ExtractorLink) -> Unit = { link -> if (isLocalLink(link.url)) dropped.incrementAndGet() else callback(link) }
-            return kotlinx.coroutines.withContext(CastingLoad) { loadLinks(data, true, subtitleCallback, castable) }.also {
+            return kotlinx.coroutines.withContext(CastingLoad()) { loadLinks(data, true, subtitleCallback, castable) }.also {
                 if (dropped.get() > 0) log("loadLinks: casting — left out ${dropped.get()} link(s) that only play through this phone's local server")
             }
         }

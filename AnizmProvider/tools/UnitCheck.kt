@@ -10,7 +10,13 @@ import com.a.anizm.sameHost
 import com.a.anizm.withParams
 import com.a.anizm.redactForLog
 import com.a.anizm.headersForLog
+import com.a.anizm.CastingLoad
+import com.a.anizm.isCastingLoad
+import com.a.anizm.isLocalLink
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import org.jsoup.Jsoup
 import kotlin.system.exitProcess
 
@@ -227,6 +233,14 @@ fun main() {
     val hdr = headersForLog(linkedMapOf("User-Agent" to "Mozilla/5.0", "Cookie" to "cf_clearance=SECRET1; __cf_bm=SECRET2", "Authorization" to "Bearer SECRET3"))
     check("cookies by name only, credentials hidden", hdr == "User-Agent=Mozilla/5.0; Cookie=[cf_clearance,__cf_bm]; Authorization=[hidden]", hdr)
     check("no secret survives", !hdr.contains("SECRET"))
+
+    section("Casting mark")
+    val outside = runBlocking { isCastingLoad() }
+    val inside = runBlocking { withContext(CastingLoad()) { isCastingLoad() } }
+    val inChild = runBlocking { withContext(CastingLoad()) { coroutineScope { async { isCastingLoad() }.await() } } }
+    check("not marked outside a casting run", !outside)
+    check("marked inside one, and in its child coroutines", inside && inChild, "$inside $inChild")
+    check("local addresses recognised", isLocalLink("http://127.0.0.1:41234/hls/abc.m3u8") && !isLocalLink("https://anizmplayer.com/cdn/hls/x/master.txt"))
 
     println("\n$passed passed, $failed failed")
     exitProcess(if (failed == 0) 0 else 1)
