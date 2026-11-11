@@ -24,14 +24,14 @@
     {
         "url": "https://raw.githubusercontent.com/standard-droid/TestPlugins/builds/ReZeroIzleProvider.cs3",
         "status": 1,
-        "version": 18,
+        "version": 19,
         "name": "ReZeroIzleProvider",
         "internalName": "ReZeroIzleProvider",
         "authors": [
             "a"
         ],
         "description": "Re:Zero kara Hajimeru Isekai Seikatsu \u2014 T\u00fcrk\u00e7e altyaz\u0131l\u0131, Google Drive \u00fczerinden.",
-        "fileSize": 33110,
+        "fileSize": 33095,
         "repositoryUrl": "https://github.com/standard-droid/TestPlugins",
         "language": "tr",
         "tvTypes": [
@@ -40,6 +40,9 @@
         ],
         "iconUrl": "https://rezeroizle.com/images/icon.png",
         "apiVersion": 1,
-        "fileHash": "sha256-0515a3110c3f9d212715d308307bd0f6bd6dbac44cc810a899bb23e8a691a44f"
+        "fileHash": "sha256-e29588d22b56405d0c81feba2c3d8c0cef2616d958809fb0e22f1d470f2f369d",
+        "jarFileSize": 108902,
+        "jarUrl": "https://raw.githubusercontent.com/standard-droid/TestPlugins/builds/ReZeroIzleProvider.jar",
+        "jarHash": "sha256-c5fffb8029019be529a7957e2f295b7b51006996d175e5d76b2f4368e0539b52"
     }
 ]
