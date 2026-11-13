@@ -990,8 +990,14 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
             return loadLinks(data, isCasting, subtitleCallback, callback)
         }
         synchronized(mine) { mine.subscribers.add(callback) }
+        // v55: newest caller first. CloudStream keeps one link cache per episode for all its loadLinks
+        // calls (RepoLinkGenerator.cache) and passes on only links that cache hasn't seen. It cancels
+        // its older call before making a new one (a reload, the player rebuilt on rotation), so the
+        // newest caller is the one the player listens to. Oldest first, the cancelled call put every
+        // link in that cache and dropped it, and the live call then got only duplicates: all links
+        // loaded and the player said "no links found" (device log 2026-11-13).
         val fanOut: (ExtractorLink) -> Unit = { link ->
-            val subs = synchronized(mine) { mine.links.add(link); mine.subscribers.toList() }
+            val subs = synchronized(mine) { mine.links.add(link); mine.subscribers.asReversed().toList() }
             subs.forEach { it(link) }
         }
         return try {
