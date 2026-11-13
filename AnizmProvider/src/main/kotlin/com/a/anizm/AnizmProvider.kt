@@ -59,7 +59,7 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
     internal fun clearSavedData() {
         embedCache.clear(); embedStore.clear(); videoCredits.clear(); mediaStore.clear(); sniffDeadHosts.clear()
         sourceListCache.clear(); aincradCache.clear(); aincradLocked.clear(); playlistTexts.clear(); sniffCache.clear()
-        driveStreamCache.clear(); sistennGone.clear(); sniffHostFails.clear(); sniffHostBlockedUntil.clear()
+        driveStreamCache.clear(); driveOriginalCache.clear(); sistennGone.clear(); sniffHostFails.clear(); sniffHostBlockedUntil.clear()
         log("settings: saved data cleared")
     }
 
@@ -1767,6 +1767,11 @@ class AnizmProvider(internal val settings: AnizmSettings) : MainAPI() {
     @Volatile internal var driveApiKey: String? = null
     internal val driveKeyRe = Regex("""AIza[0-9A-Za-z_\-]{35}""")
     internal val driveStreamCache = java.util.concurrent.ConcurrentHashMap<String, Pair<List<DriveStream>, Long>>()
+    // v56: the original file's download link per Drive file (null = not available), and how long it is kept.
+    internal val driveOriginalCache = java.util.concurrent.ConcurrentHashMap<String, Pair<GDriveResolution?, Long>>()
+    internal val driveOriginalTtlMs = 30 * 60 * 1000L
+    internal val driveOriginalMissTtlMs = 10 * 60 * 1000L
+    internal val driveOriginalBudgetMs = 12_000L
     internal val driveStreamTtlMs = 2 * 60 * 60 * 1000L // links live 3 h
     internal val driveStreamQuotaUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
