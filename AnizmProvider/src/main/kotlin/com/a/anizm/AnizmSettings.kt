@@ -256,6 +256,8 @@ class AnizmSettings(internal val prefs: SharedPreferences) {
             note("On: about 35 small reads per video (once), usually within 3 % of the real size. Off: about half as many, usually within 5 %.")
             val creditsBox = check("Show who made each source (translator, encoder, uploader)", settings.showCredits)
             note("Added to the source's name, e.g. \"Net-Rip - Beta Player · Enc/Up: Rinrintan\". Costs one small request per source, the same one the site makes when a player button is pressed.")
+            val driveOriginalBox = check("Google Drive: also list the original uploaded file", settings.driveOriginal)
+            note("Google's own streams (1080p, 720p, 360p) are re-encodes, often a third of the upload's size. On: the uploaded file is listed too, as \"… Original\", with its real size. Costs a few small requests per Drive source, and Google blocks it for a few hours when the file's download quota runs out (the streams still play).")
             val lockBox = check("Aincrad: always play the best quality (no automatic switching)", settings.lockTopQuality)
             note("On: Aincrad plays only its top quality (usually 1080p), so the player never drops to a lower one; on a slow connection it buffers instead. Off: the player switches by connection speed, using Aincrad's quality labels, which are often wrong for 1080p.")
 
@@ -278,6 +280,7 @@ class AnizmSettings(internal val prefs: SharedPreferences) {
                     e.putBoolean("lock_top_quality", lockBox.isChecked)
                     e.putBoolean("accurate_sizes", accurateBox.isChecked)
                     e.putBoolean("show_credits", creditsBox.isChecked)
+                    e.putBoolean("drive_original", driveOriginalBox.isChecked)
                     e.putBoolean("browser_sniff", sniffBox.isChecked)
                     e.putBoolean("defer_browser_sources", deferBox.isChecked)
                     e.apply()
@@ -324,6 +327,7 @@ class AnizmSettings(internal val prefs: SharedPreferences) {
     val accurateSizes get() = prefs.getBoolean("accurate_sizes", true)
     /** v48: translator, encoder and uploader in each source's name. */
     val showCredits get() = prefs.getBoolean("show_credits", true)
+    val driveOriginal get() = prefs.getBoolean("drive_original", true)
 
     /** v48: the last 20 "the site changed" warnings, newest last, each with its date. */
     fun recentWarnings(): List<String> = prefs.getString("site_warnings", null)?.split('\n')?.filter { it.isNotBlank() } ?: emptyList()

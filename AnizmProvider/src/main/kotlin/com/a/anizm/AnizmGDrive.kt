@@ -27,33 +27,53 @@ internal suspend fun AnizmProvider.processGDrive(embed: String, label: String, c
     val streams = try { gdriveGate.withPermit { resolveGDriveStreams(fileId) } }
         catch (e: kotlinx.coroutines.CancellationException) { throw e }
         catch (e: Exception) { log("gdrive: stream lookup error: ${e.message}"); emptyList() }
+    val cleanLabel = cleanDisplayName(label)
+    // v56: the uploaded file itself, as "<label> Original <height>p [size]". Google's streams are its own
+    // re-encodes, far smaller than the upload (Kusuriya S3 E7: 1080p stream 184 MB, about 1 Mbps).
+    suspend fun emitOriginal(res: GDriveResolution) =
+        callback(newExtractorLink(source = cleanLabel, name = "$cleanLabel Original" + (res.height?.let { " ${it}p" } ?: "") + formatSize(res.sizeBytes),
+            url = res.url, type = ExtractorLinkType.VIDEO) {
+            quality = res.height ?: Qualities.Unknown.value; referer = "https://drive.google.com/"; headers = res.headers })
     if (streams.isNotEmpty()) {
-        val cleanLabel = cleanDisplayName(label)
         for (st in streams) callback(newExtractorLink(source = cleanLabel, name = "$cleanLabel ${st.height}p" + formatSize(st.sizeBytes),
             url = st.url, type = ExtractorLinkType.VIDEO) {
             quality = st.height; referer = "https://drive.google.com/"; headers = mapOf("User-Agent" to ua) })
+        // Next to the streams, when the setting is on: the streams are listed first and stay whatever
+        // happens here, and the lookup is capped so a slow download route can't hold the episode up.
+        if (settings.driveOriginal) withTimeoutOrNull(driveOriginalBudgetMs) { driveOriginal(fileId) }
+            ?.let { emitOriginal(it) } ?: log("gdrive: no original-file link for $fileId this time")
         return true
     }
+    // No streams: the original is the only way left (whatever the setting says).
+    val resolved = driveOriginal(fileId) ?: run { log("gdrive: could not resolve a playable link for $fileId"); return false }
+    emitOriginal(resolved)
+    return true
+}
+
+/**
+ * The uploaded file through Drive's download route, checked with a second small read (see
+ * [gdriveReusable]). Kept [driveOriginalTtlMs] (a miss for a shorter while), so CloudStream's double
+ * call and the next few loads ask Google once. Null when the file's download quota is used up.
+ */
+internal suspend fun AnizmProvider.driveOriginal(fileId: String): GDriveResolution? {
+    val now = System.currentTimeMillis()
+    driveOriginalCache[fileId]?.let { (res, at) ->
+        if (now - at < (if (res != null) driveOriginalTtlMs else driveOriginalMissTtlMs)) { log("gdrive: reusing original-file lookup for $fileId"); return res }
+    }
     gdriveQuotaUntil[fileId]?.let { until ->
-        if (System.currentTimeMillis() < until) {
-            log("gdrive: $fileId hit its download quota recently — not asking Google again for ${(until - System.currentTimeMillis()) / 60000} min")
-            return false
+        if (now < until) {
+            log("gdrive: $fileId hit its download quota recently — not asking Google again for ${(until - now) / 60000} min")
+            return null
         }
     }
     val resolved = try {
         gdriveGate.withPermit { resolveGDrive(fileId) }
     } catch (e: kotlinx.coroutines.CancellationException) { throw e }
       catch (e: Exception) { log("gdrive: resolve error: ${e.message}"); null }
-    if (resolved != null && !gdriveReusable(resolved, fileId)) return false
-    if (resolved != null) {
-        val cleanLabel = cleanDisplayName(label)
-        val displayName = cleanLabel + formatSize(resolved.sizeBytes)
-        callback(newExtractorLink(source = cleanLabel, name = displayName, url = resolved.url, type = ExtractorLinkType.VIDEO) {
-            quality = resolved.height ?: Qualities.Unknown.value; referer = "https://drive.google.com/"; headers = resolved.headers })
-        return true
-    }
-    log("gdrive: could not resolve a playable link for $fileId")
-    return false
+    val ok = resolved?.takeIf { gdriveReusable(it, fileId) }
+    driveOriginalCache[fileId] = ok to System.currentTimeMillis()
+    if (driveOriginalCache.size > 100) driveOriginalCache.entries.removeAll { now - it.value.second > driveOriginalTtlMs }
+    return ok
 }
 
 internal suspend fun AnizmProvider.resolveGDriveStreams(fileId: String): List<DriveStream> {
